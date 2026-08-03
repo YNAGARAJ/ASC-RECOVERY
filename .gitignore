@@ -1,0 +1,32 @@
+# PHI and secrets — never commit
+data/real/
+phi/
+secrets/
+*.pem
+*.key
+*.835
+*.edi
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
