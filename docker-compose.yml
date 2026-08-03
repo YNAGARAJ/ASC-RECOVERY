@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: asc_recovery
+      POSTGRES_USER: asc_owner
+      POSTGRES_PASSWORD: asc_owner_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - asc_pg_data:/var/lib/postgresql/data
+      - ./scripts/db/init_roles.sql:/docker-entrypoint-initdb.d/01_init_roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asc_owner -d asc_recovery"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  asc_pg_data:
