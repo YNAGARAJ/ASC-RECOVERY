@@ -29,6 +29,7 @@ files = ["src", "tests"]
 target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
+extend-exclude = ["evals/golden/cases.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "N"]
