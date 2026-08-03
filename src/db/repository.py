@@ -284,7 +284,11 @@ def record_remittance_if_new(
     inserted_id = session.execute(stmt).scalar_one_or_none()
     if inserted_id is not None:
         row = session.get(RemittanceModel, inserted_id)
-        assert row is not None
+        if row is None:
+            raise RuntimeError(
+                f"remittance {inserted_id} was just inserted but cannot be re-read "
+                "in the same transaction -- this should never happen"
+            )
         return row, True
 
     existing = session.execute(

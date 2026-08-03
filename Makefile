@@ -13,6 +13,6 @@ eval:
 	python -m evals.run
 
 security:
-	bandit -r . -x tests,evals
+	bandit -r . -x ./tests,./evals
 	pip-audit
 	gitleaks detect --no-banner
