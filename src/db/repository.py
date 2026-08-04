@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,7 @@ from db.models import Finding as FindingModel
 from db.models import Remittance as RemittanceModel
 from db.models import ServiceLine as ServiceLineModel
 from db.models import Tenant as TenantModel
+from db.models import User as UserModel
 from db.rules_version import RULES_VERSION
 from domain.contract import (
     AssistantSurgeonRule,
@@ -186,6 +188,25 @@ def create_tenant(session: Session, name: str) -> TenantModel:
     return tenant
 
 
+# --- Users (ungated, like tenants -- see db.models.User's docstring) -----------
+
+
+def get_user_by_subject(session: Session, subject: str) -> UserModel | None:
+    """Plain, non-tenant-scoped lookup -- this is how a request's tenant
+    context gets bootstrapped in the first place (src/api/auth.py), so it
+    must run outside `tenant_session` rather than inside it."""
+    return session.execute(
+        select(UserModel).where(UserModel.subject == subject, UserModel.deleted_at.is_(None))
+    ).scalar_one_or_none()
+
+
+def create_user(session: Session, tenant_id: uuid.UUID, *, subject: str, role: str) -> UserModel:
+    user = UserModel(tenant_id=tenant_id, subject=subject, role=role)
+    session.add(user)
+    session.flush()
+    return user
+
+
 # --- Effective-dated contracts --------------------------------------------------
 
 
@@ -280,6 +301,30 @@ def list_contract_versions(
         .all()
     )
     return [(row.id, _contract_version_to_domain(session, row, payer_id)) for row in rows]
+
+
+def list_contracts(
+    session: Session, tenant_id: uuid.UUID, *, limit: int = 20, offset: int = 0
+) -> tuple[list[ContractModel], int]:
+    """All contracts for this tenant across every payer -- unlike
+    `list_contract_versions`/`get_effective_contract_version`, which are
+    scoped to one payer at a time for pricing lookups. For contract
+    management's list view."""
+    total = session.execute(
+        select(func.count()).select_from(ContractModel).where(ContractModel.tenant_id == tenant_id)
+    ).scalar_one()
+    rows = (
+        session.execute(
+            select(ContractModel)
+            .where(ContractModel.tenant_id == tenant_id)
+            .order_by(ContractModel.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows), total
 
 
 # --- Idempotent remittances -----------------------------------------------------
@@ -483,6 +528,103 @@ def list_findings_by_payer_claim_control_number(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class FindingDetail:
+    """Full evidence chain for a single finding -- Finding joined with its
+    Claim, ServiceLine, and every Adjustment on that claim (claim-level and
+    line-level). Repository functions elsewhere in this module return bare
+    ORM rows; this one is a small dataclass because a finding detail
+    response is inherently a join of four tables, not one row."""
+
+    finding: FindingModel
+    claim: ClaimModel
+    service_line: ServiceLineModel
+    adjustments: list[AdjustmentModel]
+
+
+def list_findings(
+    session: Session,
+    tenant_id: uuid.UUID,
+    *,
+    root_cause: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    min_shortfall: Decimal | None = None,
+    remittance_id: uuid.UUID | None = None,
+    claim_id: uuid.UUID | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[FindingModel], int]:
+    """Filters never include a patient identifier -- callers (the API
+    layer) must not expose one as a query parameter, since query strings
+    land in access logs (CLAUDE.md rule 6)."""
+    conditions = [FindingModel.tenant_id == tenant_id]
+    if root_cause is not None:
+        conditions.append(FindingModel.root_cause == root_cause)
+    if min_shortfall is not None:
+        conditions.append(FindingModel.shortfall >= min_shortfall)
+    if claim_id is not None:
+        conditions.append(FindingModel.claim_id == claim_id)
+    if date_from is not None or date_to is not None or remittance_id is not None:
+        query_base = select(FindingModel).join(ClaimModel, FindingModel.claim_id == ClaimModel.id)
+        count_base = (
+            select(func.count())
+            .select_from(FindingModel)
+            .join(ClaimModel, FindingModel.claim_id == ClaimModel.id)
+        )
+        if date_from is not None:
+            conditions.append(ClaimModel.date_of_service >= date_from)
+        if date_to is not None:
+            conditions.append(ClaimModel.date_of_service <= date_to)
+        if remittance_id is not None:
+            conditions.append(ClaimModel.remittance_id == remittance_id)
+    else:
+        query_base = select(FindingModel)
+        count_base = select(func.count()).select_from(FindingModel)
+
+    total = session.execute(count_base.where(*conditions)).scalar_one()
+    rows = (
+        session.execute(
+            query_base.where(*conditions)
+            .order_by(FindingModel.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows), total
+
+
+def get_finding_detail(
+    session: Session, tenant_id: uuid.UUID, finding_id: uuid.UUID
+) -> FindingDetail | None:
+    finding = session.execute(
+        select(FindingModel).where(
+            FindingModel.tenant_id == tenant_id, FindingModel.id == finding_id
+        )
+    ).scalar_one_or_none()
+    if finding is None:
+        return None
+    claim = session.get(ClaimModel, finding.claim_id)
+    service_line = session.get(ServiceLineModel, finding.service_line_id)
+    if claim is None or service_line is None:
+        raise RuntimeError(
+            f"finding {finding_id} references a claim or service_line that no "
+            "longer exists -- FK constraints should make this impossible"
+        )
+    adjustments = list(
+        session.execute(
+            select(AdjustmentModel).where(AdjustmentModel.claim_id == finding.claim_id)
+        )
+        .scalars()
+        .all()
+    )
+    return FindingDetail(
+        finding=finding, claim=claim, service_line=service_line, adjustments=adjustments
+    )
+
+
 # --- Audit log -------------------------------------------------------------------
 
 
@@ -496,6 +638,7 @@ def write_audit_log(
     resource_id: str,
     phi_accessed: bool = False,
     source_ip: str | None = None,
+    request_id: str | None = None,
 ) -> AuditLogModel:
     entry = AuditLogModel(
         tenant_id=tenant_id,
@@ -505,7 +648,49 @@ def write_audit_log(
         resource_id=resource_id,
         phi_accessed=phi_accessed,
         source_ip=source_ip,
+        request_id=request_id,
     )
     session.add(entry)
     session.flush()
     return entry
+
+
+def list_audit_log(
+    session: Session,
+    tenant_id: uuid.UUID,
+    *,
+    actor: str | None = None,
+    action: str | None = None,
+    resource_type: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[AuditLogModel], int]:
+    conditions = [AuditLogModel.tenant_id == tenant_id]
+    if actor is not None:
+        conditions.append(AuditLogModel.actor == actor)
+    if action is not None:
+        conditions.append(AuditLogModel.action == action)
+    if resource_type is not None:
+        conditions.append(AuditLogModel.resource_type == resource_type)
+    if date_from is not None:
+        conditions.append(AuditLogModel.occurred_at >= date_from)
+    if date_to is not None:
+        conditions.append(AuditLogModel.occurred_at <= date_to)
+
+    total = session.execute(
+        select(func.count()).select_from(AuditLogModel).where(*conditions)
+    ).scalar_one()
+    rows = (
+        session.execute(
+            select(AuditLogModel)
+            .where(*conditions)
+            .order_by(AuditLogModel.occurred_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows), total

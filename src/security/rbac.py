@@ -31,6 +31,7 @@ class Action(enum.Enum):
     READ_WORKLIST = "read_worklist"
     EXPORT_WORKLIST = "export_worklist"
     UPLOAD_REMITTANCE = "upload_remittance"
+    READ_CONTRACT = "read_contract"
     MANAGE_CONTRACT = "manage_contract"
     APPROVE_RECOVERY_PACKET = "approve_recovery_packet"
     MANAGE_USERS = "manage_users"
@@ -44,6 +45,7 @@ _PERMISSIONS: dict[Role, frozenset[Action]] = {
             Action.READ_CLAIM,
             Action.READ_FINDING,
             Action.READ_WORKLIST,
+            Action.READ_CONTRACT,
         }
     ),
     Role.BILLER: frozenset(
@@ -53,6 +55,7 @@ _PERMISSIONS: dict[Role, frozenset[Action]] = {
             Action.READ_WORKLIST,
             Action.EXPORT_WORKLIST,
             Action.UPLOAD_REMITTANCE,
+            Action.READ_CONTRACT,
             Action.APPROVE_RECOVERY_PACKET,
         }
     ),
@@ -61,6 +64,7 @@ _PERMISSIONS: dict[Role, frozenset[Action]] = {
         {
             Action.READ_CLAIM,
             Action.READ_FINDING,
+            Action.READ_CONTRACT,
             Action.READ_AUDIT_LOG,
             Action.READ_PHI_ACCESS_LOG,
         }

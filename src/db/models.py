@@ -55,6 +55,29 @@ class Tenant(Base):
     )
 
 
+class User(Base):
+    """Deliberately ungated like Tenant, not tenant-scoped/RLS-protected --
+    resolving `subject` (a bearer token's `sub` claim) to a `tenant_id` is
+    how a tenant-scoped session gets bootstrapped in the first place
+    (src/api/auth.py), so this lookup can't itself require `app.tenant_id`
+    to already be set. See alembic/versions/0003_users_and_audit_request_id.py."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    subject: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Contract(Base):
     __tablename__ = "contracts"
 
@@ -273,6 +296,7 @@ class AuditLog(Base):
     phi_accessed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    request_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class PHIAccessLog(Base):

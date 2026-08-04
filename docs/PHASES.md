@@ -1,11 +1,11 @@
 # Build Phases
 
-**Current phase: Phase 5 — Ingestion pipeline**
+**Current phase: Phase 6 — API layer**
 
 Phase 3's gate is still unverified pending a live Postgres — see below.
-Phase 4 is fully verified and checked off. Phase 5's pure logic (planning,
-reconciliation, sources, virus scan) is fully verified; its DB-writing half
-is code-complete but unverified for the same reason as Phase 3 — see below.
+Phase 4 is fully verified and checked off. Phases 5 and 6 both split their
+work into a pure half (fully verified here) and a DB-writing half
+(code-complete, unverified for the same reason as Phase 3) — see below.
 
 One phase per session. `/clear` between phases. Never advance past a failing
 gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
@@ -61,7 +61,48 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       `src/db/repository.py`. **Do not check this phase off until the
       three DB-backed tests above are run against a live Postgres**, same
       standard as Phase 3.
-- [ ] Phase 6 — API layer
+- [ ] Phase 6 — API layer — **code complete, DB-writing half unverified
+      for the same reason as Phases 3 and 5.** FastAPI service exposing
+      upload remittance, list/detail findings, export worklist CSV,
+      contract management, and audit log query. Same pure/DB split as
+      Phase 5: route handlers depend on an `api.repository.Repository`
+      port (`src/api/repository.py`), never on SQLAlchemy directly, with
+      two adapters — `PostgresRepository` (real) and `FakeRepository`
+      (test-only, in-memory, tenant-partitioned, `tests/api/fakes.py`).
+      This is what let the **full authorization matrix** (every one of 4
+      roles x 8 endpoints x own-tenant/other-tenant) run as real, passing
+      tests without Postgres — not a subset, not skipped
+      (`tests/api/test_authz_matrix.py`, 32 cases, all passing). Also
+      fully verified without a live DB: no route anywhere accepts a
+      client-supplied tenant identifier — proven both by inspecting every
+      route's actual parameters and by inspecting the generated OpenAPI
+      schema (`test_tenant_param_absence.py`) — which is what makes
+      "no endpoint returns another tenant's data under any parameter
+      manipulation" true by construction, not by defensive checking.
+      OpenAPI spec generates and validates via `openapi-spec-validator`
+      (`test_openapi.py`). Structured errors never echo PHI, proven by
+      forcing an unhandled exception containing PHI-shaped text and
+      asserting none of it reaches the response
+      (`test_error_redaction.py`). Pagination and CSV export also covered
+      (`test_pagination.py`, `test_csv_export.py`). **Not yet verified**:
+      two representative endpoints (findings list, finding detail) run
+      against real `PostgresRepository` + real RLS in
+      `test_endpoints_live_db.py` — written, skips cleanly without
+      `TEST_DATABASE_URL`, never executed; this is what would confirm
+      `FakeRepository`'s tenant-isolation guarantee matches reality.
+      Added a `users` table (ungated like `tenants`, for resolving a
+      bearer token's subject to a tenant_id — ADR-style rationale in
+      `src/db/models.py`'s `User` docstring) and an `audit_log.request_id`
+      column via `alembic/versions/0003_users_and_audit_request_id.py`
+      (offline-verified only, same ceiling as 0001/0002). Added
+      `Action.READ_CONTRACT` to `security/rbac.py` (additive; Phase 4's
+      full role x action matrix test updated and still green — now 47
+      cases). No login/credential/OIDC endpoint was built — Phase 4 never
+      built real credential verification to wire one to; tests mint
+      tokens directly via the already-gated `issue_session()`. No
+      user-management HTTP endpoint either — out of this phase's explicit
+      scope. **Do not check this phase off until the live-DB tests above
+      are run against a real Postgres**, same standard as Phases 3 and 5.
 - [ ] Phase 7 — Recovery packet generation (the only place an LLM appears)
 - [ ] Phase 8 — Observability and audit
 - [ ] Phase 9 — Cloud-agnostic deployment

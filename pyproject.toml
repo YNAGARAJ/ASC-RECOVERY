@@ -16,6 +16,12 @@ dev = [
     "cryptography>=42",
     "pyjwt>=2.9",
     "pyotp>=2.9",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "openapi-spec-validator>=0.7",
 ]
 
 [build-system]
@@ -44,6 +50,21 @@ extend-exclude = ["evals/golden/cases.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "N"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom requires calling Depends()/Header()/
+# Query() etc. as argument defaults -- that's the mechanism, not a mutable-
+# default bug B008 is meant to catch.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Header",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.File",
+    "fastapi.Form",
+    "api.auth.require_permission",
+]
 
 [tool.coverage.run]
 branch = true

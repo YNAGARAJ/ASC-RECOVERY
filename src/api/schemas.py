@@ -1,0 +1,241 @@
+"""Pydantic v2 request/response models. Every money field is `str`, never
+`float` (CLAUDE.md rule 2) -- `api.repository`'s dataclasses already carry
+money as `str(Decimal)`, so these models just mirror that shape without
+ever routing a dollar amount through a float-capable type.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+
+from pydantic import BaseModel, Field
+
+from api.repository import (
+    AuditLogEntry,
+    ContractSummary,
+    FindingDetail,
+    FindingSummary,
+    PagedResult,
+)
+
+
+class PageMeta(BaseModel):
+    total: int
+    limit: int
+    offset: int
+
+
+class FindingSummaryOut(BaseModel):
+    id: uuid.UUID
+    claim_id: uuid.UUID
+    line_index: int
+    procedure_code: str
+    expected_allowed: str | None
+    actual_allowed: str
+    shortfall: str
+    root_cause: str
+    rule_version: str
+    created_at: datetime
+
+    @classmethod
+    def from_domain(cls, row: FindingSummary) -> FindingSummaryOut:
+        return cls(
+            id=row.id,
+            claim_id=row.claim_id,
+            line_index=row.line_index,
+            procedure_code=row.procedure_code,
+            expected_allowed=row.expected_allowed,
+            actual_allowed=row.actual_allowed,
+            shortfall=row.shortfall,
+            root_cause=row.root_cause,
+            rule_version=row.rule_version,
+            created_at=row.created_at,
+        )
+
+
+class FindingListOut(BaseModel):
+    items: list[FindingSummaryOut]
+    page: PageMeta
+
+    @classmethod
+    def from_domain(cls, result: PagedResult[FindingSummary]) -> FindingListOut:
+        return cls(
+            items=[FindingSummaryOut.from_domain(item) for item in result.items],
+            page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
+
+
+class ServiceLineOut(BaseModel):
+    line_index: int
+    procedure_code: str
+    modifiers: list[str]
+    charge: str
+    allowed: str
+    paid_computed: str
+    service_date: date | None
+
+
+class AdjustmentOut(BaseModel):
+    group_code: str
+    reason_code: str
+    amount: str
+
+
+class FindingDetailOut(BaseModel):
+    finding: FindingSummaryOut
+    evidence: str
+    patient_control_number: str
+    payer_claim_control_number: str
+    date_of_service: date
+    patient_name: str | None
+    patient_member_id: str | None
+    service_line: ServiceLineOut
+    adjustments: list[AdjustmentOut]
+
+    @classmethod
+    def from_domain(cls, detail: FindingDetail) -> FindingDetailOut:
+        return cls(
+            finding=FindingSummaryOut.from_domain(detail.summary),
+            evidence=detail.evidence,
+            patient_control_number=detail.patient_control_number,
+            payer_claim_control_number=detail.payer_claim_control_number,
+            date_of_service=detail.date_of_service,
+            patient_name=detail.patient_name,
+            patient_member_id=detail.patient_member_id,
+            service_line=ServiceLineOut(
+                line_index=detail.service_line.line_index,
+                procedure_code=detail.service_line.procedure_code,
+                modifiers=detail.service_line.modifiers,
+                charge=detail.service_line.charge,
+                allowed=detail.service_line.allowed,
+                paid_computed=detail.service_line.paid_computed,
+                service_date=detail.service_line.service_date,
+            ),
+            adjustments=[
+                AdjustmentOut(
+                    group_code=a.group_code, reason_code=a.reason_code, amount=a.amount
+                )
+                for a in detail.adjustments
+            ],
+        )
+
+
+class IngestionOutcomeOut(BaseModel):
+    remittance_id: uuid.UUID
+    status: str
+    claims_created: int
+    findings_created: int
+    reconciliation_mismatches: int
+
+
+class ContractSummaryOut(BaseModel):
+    id: uuid.UUID
+    payer_id: str
+    name: str
+    created_at: datetime
+
+    @classmethod
+    def from_domain(cls, row: ContractSummary) -> ContractSummaryOut:
+        return cls(id=row.id, payer_id=row.payer_id, name=row.name, created_at=row.created_at)
+
+
+class ContractListOut(BaseModel):
+    items: list[ContractSummaryOut]
+    page: PageMeta
+
+    @classmethod
+    def from_domain(cls, result: PagedResult[ContractSummary]) -> ContractListOut:
+        return cls(
+            items=[ContractSummaryOut.from_domain(item) for item in result.items],
+            page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
+
+
+class CreateContractIn(BaseModel):
+    payer_id: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=200)
+
+
+class MPPRRuleIn(BaseModel):
+    enabled: bool = False
+    second_procedure_rate_percent: str = "50"
+    third_and_subsequent_rate_percent: str = "25"
+    exempt_codes: list[str] = Field(default_factory=list)
+
+
+class BilateralRuleIn(BaseModel):
+    enabled: bool = False
+    total_rate_percent: str = "150"
+
+
+class AssistantSurgeonRuleIn(BaseModel):
+    enabled: bool = False
+    rate_percent: str = "16"
+    applicable_modifiers: list[str] = Field(default_factory=list)
+
+
+class ImplantCarveoutRuleIn(BaseModel):
+    enabled: bool = False
+    procedure_codes: list[str] = Field(default_factory=list)
+    revenue_codes: list[str] = Field(default_factory=list)
+
+
+class CreateContractVersionIn(BaseModel):
+    effective_from: date
+    effective_to: date | None = None
+    default_pricing_method: str = "fee_schedule"
+    fee_schedule: dict[str, str] = Field(default_factory=dict)
+    percent_of_charge_rate_percent: str | None = None
+    mppr_rule: MPPRRuleIn = Field(default_factory=MPPRRuleIn)
+    bilateral_rule: BilateralRuleIn = Field(default_factory=BilateralRuleIn)
+    assistant_surgeon_rule: AssistantSurgeonRuleIn = Field(default_factory=AssistantSurgeonRuleIn)
+    implant_carveout_rule: ImplantCarveoutRuleIn = Field(default_factory=ImplantCarveoutRuleIn)
+
+
+class ContractVersionOut(BaseModel):
+    id: uuid.UUID
+
+
+class AuditLogEntryOut(BaseModel):
+    id: uuid.UUID
+    actor: str
+    action: str
+    resource_type: str
+    resource_id: str
+    occurred_at: datetime
+    source_ip: str | None
+    phi_accessed: bool
+    request_id: str | None
+
+    @classmethod
+    def from_domain(cls, row: AuditLogEntry) -> AuditLogEntryOut:
+        return cls(
+            id=row.id,
+            actor=row.actor,
+            action=row.action,
+            resource_type=row.resource_type,
+            resource_id=row.resource_id,
+            occurred_at=row.occurred_at,
+            source_ip=row.source_ip,
+            phi_accessed=row.phi_accessed,
+            request_id=row.request_id,
+        )
+
+
+class AuditLogListOut(BaseModel):
+    items: list[AuditLogEntryOut]
+    page: PageMeta
+
+    @classmethod
+    def from_domain(cls, result: PagedResult[AuditLogEntry]) -> AuditLogListOut:
+        return cls(
+            items=[AuditLogEntryOut.from_domain(item) for item in result.items],
+            page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
+
+
+class ErrorOut(BaseModel):
+    error: str
+    message: str
+    request_id: str
