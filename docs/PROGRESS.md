@@ -1,217 +1,209 @@
 # Progress checkpoint
 
 Written for a fresh session with no memory of prior conversation. Repo is
-at a clean commit (`git status` empty) as of this checkpoint: `1521f23`
-"Phase 4: security and PHI controls". Read `docs/PHASES.md` first for the
-phase checklist — this file adds the texture that isn't in that summary.
+at a clean commit as of this checkpoint (about to commit "Phase 5:
+ingestion pipeline"). Read `docs/PHASES.md` first for the phase checklist —
+this file adds the texture that isn't in that summary.
 
-## Phase: 4 done and verified. 3 is code-complete but its gate is unverified.
+## Phase: 5 code-complete, DB-writing half unverified. 3 is the same story.
 
 Phases 0–2 and 4 are fully done: code written, gate criteria genuinely
-checked, nothing hand-waved. **Phase 3 is the exception** — it is code
-complete (schema, migrations, tenancy, repository layer, all four gate
-tests written) but its actual hard gate (Row-Level Security blocking a
-cross-tenant read, proven against a *live* Postgres) has never been run.
-This machine has no Docker, no WSL, and no local Postgres — only `pip`
-works. The user explicitly chose "write it now, verify later" and later
-chose to continue past it rather than block. **Do not treat Phase 3 as
-passed.** `docs/PHASES.md` reflects this correctly (Phase 3 unchecked,
-Phase 4 checked).
+checked, nothing hand-waved. **Phases 3 and 5 both have an honest gap**:
+this machine has no Docker, no WSL, and no local Postgres — only `pip`
+works (re-checked again this session; unchanged). Everything checkable
+without a live database is green for both phases. The DB-writing parts are
+written, tested where a test can exist without Postgres, and explicitly
+**not** claimed as passed.
 
-Current phase per `docs/PHASES.md`: **Phase 5 — Ingestion pipeline**, not
-yet started.
+Current phase per `docs/PHASES.md`: **Phase 5 — Ingestion pipeline**,
+code-complete, pure half verified, DB half unverified.
 
-## Done (this session, Phases 2–4)
+## Done (this session, Phase 5)
 
-**Phase 2 — eval harness** (`evals/`, `tests/evals/`):
-- `evals/generator.py` — synthetic X12 835 generator, 9 defect categories
-  (implant carve-out ignored, MPPR applied to primary, bilateral modifier
-  dropped, stale fee schedule, duplicate line, reversal after payment,
-  secondary-payer underpayment, unpriced code, correct-payment control),
-  56 cases each. Ground truth is derived independently of
-  `domain.variance.evaluate_claim` — see the module docstring for why that
-  matters (it's what makes the regression gate meaningful, not tautological).
-- `evals/golden/cases.py` — **generated, frozen, committed.** 504 cases as
-  literal Python (not JSON). Never hand-edit; regenerate via
-  `python -m evals.generator` only if the generator itself changes.
-- `evals/run.py` — runs parse→price→evaluate against the golden set,
-  reports recall/precision/root-cause/dollar accuracy. `make eval` fails
-  the build below 100% recall / 98% precision.
+**Key architectural decision**: split ingestion into a pure planning layer
+and a thin DB-apply layer, specifically so most of Phase 5's logic could
+get *real, running* tests in this Postgres-less environment instead of
+inheriting Phase 3's all-or-nothing skip status.
 
-**Phase 3 — persistence** (`src/db/`, `alembic/`, `tests/db/`,
-`docker-compose.yml`, `scripts/db/init_roles.sql`, `docs/DB_SETUP.md`):
-- `src/db/models.py` — SQLAlchemy 2.0 ORM models: tenants, contracts,
-  contract_versions (rule sub-structures as JSONB), fee_schedule_lines,
-  remittances (unique on tenant_id+file_hash), claims, service_lines,
-  adjustments, findings (carries `rule_version`), audit_log,
-  phi_access_log.
-- `alembic/versions/0001_initial_schema.py` — creates tables via
-  `Base.metadata.create_all`, then hand-written RLS: `ENABLE` + `FORCE ROW
-  LEVEL SECURITY` and a `tenant_isolation` policy on every tenant-scoped
-  table, plus grants scoped to a non-superuser `asc_app` role and an
-  explicit `REVOKE UPDATE, DELETE` on `audit_log`/`phi_access_log`.
-  Verified via `alembic upgrade head --sql` (offline SQL generation) —
-  this is NOT the same as running it against real Postgres.
-- `src/db/tenancy.py` — `tenant_session()`: sets `app.tenant_id` via
-  `SELECT set_config(..., true)` (transaction-local) as the first
-  statement of every transaction. Deliberately not `SET LOCAL` directly —
-  see Decisions below.
-- `src/db/repository.py` — thin persistence functions bridging Postgres
-  and the Phase 1 domain layer (JSONB↔dataclass serialization for contract
-  rules, idempotent remittance recording, effective-dated contract lookup
-  that hands off to the already-tested `domain.contract.find_effective_contract`).
-- `tests/db/` — four gate-proving test files + `conftest.py`. All skip
-  with an explicit message (not silently pass) unless `TEST_DATABASE_URL`
-  is set. **Never actually run against a live database in this session.**
+- `src/ingestion/reconcile.py` — pure `reconcile_bpr(transaction)`: BPR
+  total paid vs sum(claim totals) + sum(PLB amounts), `Money("0.01")`
+  tolerance. Fully tested (`tests/ingestion/test_reconcile.py`, 3 tests,
+  all pass).
+- `src/ingestion/virus_scan.py` — `VirusScanner` Protocol (same port shape
+  as `security/kms.py`) + `EicarAwareScanner`, a dev adapter that flags
+  only the industry-standard EICAR test string. Real AV engine integration
+  deferred, same pattern as Phase 4 deferring real cloud KMS to Phase 9.
+  Fully tested.
+- `src/ingestion/sources.py` — `IngestionSource` Protocol + `UploadSource`
+  (trivial, wraps one in-memory file) + `SFTPPollSource` / `S3PollSource`,
+  both typed against minimal structural Protocols (`SFTPClient`,
+  `S3Client`) rather than depending on `paramiko`/`boto3` — a real client
+  satisfies them without this project taking on either dependency. Fully
+  tested against fake in-memory clients, no real network needed.
+- `src/ingestion/plan.py` — the core of this phase, **pure, no I/O**:
+  `build_ingestion_plan(parse_result, *, contract_versions_by_payer,
+  prior_findings_by_control_number) -> FileIngestionPlan`. Takes an
+  already-parsed `domain.x835.ParseResult` plus pre-fetched contract/prior-
+  finding data (both supplied by the caller — real DB fetches in
+  `pipeline.py`, hand-built fixtures in tests), and decides: quarantine
+  (zero usable claims parsed), per-claim pricing (`domain.contract.
+  price_claim` + `domain.variance.evaluate_claim`, both Phase 1, untouched),
+  and reversal netting. **Reversal netting deliberately does not add a new
+  `RootCause` enum value to `domain/variance.py`** — a reversal (CLP02=22)
+  produces one offsetting `Finding` per prior finding it reverses, same
+  `root_cause` and `procedure_code`, `shortfall` negated, with the
+  free-text `evidence` field explaining what it reverses. This keeps
+  Phase 1's already-gated files untouched; reversal-netting is treated as
+  an ingestion-time event, not a new classification. Fully tested: 6 tests
+  covering quarantine (both "no transactions" and "transactions but zero
+  claims"), partial-batch, reversal-netting-to-exactly-zero, determinism
+  (same content -> equal plan, the pure proxy for "same file 3x -> identical
+  totals"), and "no effective contract skips the claim, doesn't fail the
+  batch."
+- `src/ingestion/apply.py` — thin: `apply_ingestion_plan(session, tenant_id,
+  plan, *, remittance_id, actor, contract_version_ids)`. Turns a
+  `FileIngestionPlan` into DB writes via `db.repository` (below). Findings
+  referencing a line index the claim doesn't actually have (e.g. a reversal
+  reporting fewer lines than what it reverses) are dropped rather than
+  raising — one bad correlation must not fail the batch. `contract_version_ids:
+  Mapping[tuple[payer_id, effective_from], UUID]` exists because the pure
+  domain `ContractVersion` dataclass deliberately carries no DB identity;
+  `pipeline.py` builds this map from `repository.list_contract_versions`'s
+  now-paired return value when it fetches contract data.
+- `src/ingestion/pipeline.py` — `ingest_file(session, tenant_id, *, content,
+  source, uploaded_by, scanner) -> IngestionOutcome | DuplicateOutcome`, the
+  only place in `ingestion/` doing DB I/O orchestration: hash -> dedupe
+  (`record_remittance_if_new` first, before any parsing work) -> virus scan
+  -> UTF-8 decode -> `parse_835` (Phase 1) -> fetch contract versions and
+  prior findings for referenced payers/control numbers -> `build_ingestion_plan`
+  (pure) -> `apply_ingestion_plan`.
+- `src/db/repository.py` additions (Phase 3 file, additive only — these
+  functions genuinely didn't exist before, confirmed by grep before writing
+  them): `create_service_line`, `create_adjustment`,
+  `update_remittance_status`, `list_contract_versions` (now returns
+  `list[tuple[UUID, ContractVersion]]`, paired with row id for the
+  `contract_version_ids` map above), `list_findings_by_payer_claim_control_number`.
+- `src/db/models.py` / `alembic/versions/0002_remittance_quarantine_reason.py`
+  — added `remittances.quarantine_reason: Text NULLABLE` so "quarantined
+  with a useful message" is actually queryable, not just implied by
+  `status="quarantined"`. Verified via `alembic upgrade head --sql`
+  (offline), same ceiling as migration 0001.
+- `tests/ingestion/` — `fixtures.py` (contract-version builder + a
+  BPR-total-parameterized 835 envelope, both built on top of
+  `tests/domain/fixtures_x835.py`'s existing builders rather than
+  duplicating them) and `conftest.py` (DB-backed test skip pattern, copied
+  from `tests/db/conftest.py` since conftest discovery doesn't cross
+  sibling directories, plus a `seed_tenant_with_contract` helper).
+  `test_apply_idempotency.py`, `test_apply_quarantine.py`,
+  `test_apply_audit_entry.py` exercise `pipeline.ingest_file` end to end
+  against Postgres — written, skip cleanly without `TEST_DATABASE_URL`,
+  **never executed**, same honest status as `tests/db/`.
 
-**Phase 4 — security** (`src/security/`, `tests/security/`,
-`docs/SECURITY.md`):
-- `src/security/kms.py` + `kms_local.py` — `KeyManagementService` port +
-  in-memory dev/test adapter. No real cloud KMS adapter exists yet
-  (Phase 9 scope).
-- `src/security/encryption.py` — `EnvelopeEncryptor`, AES-256-GCM.
-  `rotate_kek()` re-wraps only the DEK, proven not to touch ciphertext.
-- `src/security/secrets.py` — `SecretStore` port + `EnvSecretStore` dev
-  adapter (env vars only, never a committed file).
-- `src/security/rbac.py` — `Role`/`Action` enums, deny-by-default
-  `can(role, action)` lookup table.
-- `src/security/mfa.py` — TOTP enrollment/verification via `pyotp`.
-- `src/security/session.py` — JWT access+refresh issuance.
-  `issue_session()` is the only function that can mint a session from a
-  bare role, and refuses without `mfa_verified=True`. Refresh rotates the
-  token id and carries the original `auth_time` forward.
-- `src/security/rate_limit.py` — token-bucket rate limiter +
-  `AccountLockoutTracker`, both in-memory/single-process for now.
-- `src/security/redaction.py` — `PHIRedactionFilter` (logging.Filter):
-  redacts denylisted structured fields, regex-scrubs SSN/MBI-shaped text
-  in messages, args, and exception text.
-- `docs/SECURITY.md` — every control mapped to its HIPAA citation, plus an
-  honest "not yet built" section.
-
-Also this session: fixed the `Makefile`'s `bandit` exclude (`-x
-tests,evals` was excluding nothing on this platform; now `-x
-./tests,./evals`), added `sqlalchemy`, `alembic`, `psycopg[binary]`,
-`cryptography`, `pyjwt`, `pyotp` to `pyproject.toml`'s `dev` extra.
-
-## In progress
-
-Nothing is half-written. The working tree is clean and every file
-committed is in a finished state for its phase's scope. Phase 5
-(ingestion pipeline) has not been started — no files, no plan.
+RBAC note (deliberate, not a gap): `security.rbac.Action.UPLOAD_REMITTANCE`
+already exists but enforcing it is endpoint-level — there's no API yet
+(Phase 6). `pipeline.ingest_file()` does not check roles itself.
 
 ## Failing
 
-Nothing is currently failing. `pytest -q` → 219 passed, 11 skipped (the 11
-are `tests/db/`, skipped by design, not broken). `mypy --strict .` and
-`ruff check .` both clean across 53 source files. `python -m evals.run` →
-100% recall/precision/root-cause/dollar accuracy, gate passed.
-
-`make security`: `bandit -r . -x ./tests,./evals` clean; `pip-audit`
-reports 14 findings but every one is in `dulwich`/`msgpack` (transitive
-deps of `poetry`/`CacheControl` — unrelated global tools sharing this
-machine's Python install) or in `pip` itself, none in this project's
-actual dependencies — see the note in `docs/SECURITY.md`'s control table.
-`gitleaks` was never run (binary not installed, not pip-installable).
+Nothing. `pytest -q` → 234 passed, 14 skipped (11 from `tests/db/`, 3 new
+from `tests/ingestion/`'s DB-backed tests — same honest skip, not broken).
+`mypy --strict .` and `ruff check .` clean across 71 source files.
+`python -m evals.run` → still 100%/100%/100%/100%, gate passed, unaffected
+by this phase. `bandit -r . -x ./tests,./evals` clean (one `B101
+assert_used` finding was raised and fixed during this session — see
+Decisions below, not a leftover). Branch coverage on `domain/variance.py`
+still 100% (Phase 5 didn't touch domain files).
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **Phase 3's gate was left unverified rather than faked or skipped.**
-  Both explicitly discussed with the user, who chose to continue rather
-  than block. If you're picking this up cold: don't "fix" this by writing
-  a mock Postgres or an in-memory RLS simulation — that would prove
-  nothing about real RLS enforcement and would be actively misleading.
-  The only real fix is running `docs/DB_SETUP.md`'s steps against an
-  actual Postgres 16.
-- **`tenant_session()` uses `set_config(..., true)`, not `SET LOCAL`
-  directly.** `SET LOCAL app.tenant_id = :param` does not reliably accept
-  a bind parameter for its value (Postgres's `SET` grammar doesn't support
-  placeholders the way normal DML does) — `set_config()` is a real
-  function call that does. Don't "simplify" this back to `SET LOCAL`.
-- **Migration uses `Base.metadata.create_all(bind=op.get_bind())`
-  instead of per-table `op.create_table()` calls.** Deliberate: avoids
-  duplicating every column definition between `models.py` and the
-  migration. The security-critical parts (RLS, grants, policies) are
-  still hand-written explicitly in the migration, which is where control
-  actually matters.
-- **`asc_app` (the app runtime role) is not a superuser and has no
-  `BYPASSRLS`**, created by `scripts/db/init_roles.sql` (mounted into
-  Postgres's `docker-entrypoint-initdb.d`) before Alembic runs. This is
-  what makes the RLS test a genuine proof rather than a superuser
-  false-pass. Table grants (including `tenants`: `SELECT, INSERT`) are set
-  in the migration, not the init script, since tables don't exist yet at
-  initdb time.
-- **Golden eval dataset (`evals/golden/cases.py`) ground truth is
-  deliberately NOT computed by calling `domain.variance.evaluate_claim`.**
-  It's computed independently (expected side via `price_claim`, actual
-  side via hand-written injection arithmetic). If you ever see someone
-  "simplify" the generator to just call `evaluate_claim` and snapshot its
-  output — don't. That makes recall/precision trivially 100% forever and
-  defeats the entire harness. This was caught and fixed once already this
-  session (a scoring-logic bug, not the generator, but same principle: see
-  next point).
-- **`evals/run.py`'s `score_cases` checks BOTH `shortfall > tolerance` AND
-  `root_cause != CORRECT_NO_VARIANCE`** for a line to count as "detected."
-  Originally it only checked shortfall magnitude, which meant a
-  classifier bug that computed the right dollar amount but mislabeled the
-  root cause `CORRECT_NO_VARIANCE` would NOT have been caught by the
-  eval. Found this by literally breaking `variance.py` on purpose to prove
-  the gate works, per the Phase 2 gate requirement — don't remove the
-  root_cause check thinking it's redundant with the shortfall check; it
-  isn't, they catch different bug classes.
-- **`session.py`'s MFA-bypass proof is a structural/introspection test**
-  (`inspect.signature` — no other public function accepts a `role`
-  parameter), not just a happy-path assertion. It proves the module has no
-  second door, not that a future Phase 6 login endpoint will always pass
-  an honest `mfa_verified` value — that's a Phase 6 concern.
+- **Bandit caught a real bug during this session, not just a style
+  complaint.** `apply.py`'s claim-persistence helper originally used
+  `assert claim_plan.date_of_service is not None` to satisfy mypy after
+  `plan.py` already filtered out claims with no derivable date. Bandit's
+  `B101` flagged it: `assert` is stripped under `python -O`, so a
+  production run with optimization enabled could have silently passed
+  `None` into `claims.date_of_service`, a `NOT NULL` column. Replaced with
+  an explicit `if ... is None: raise ValueError(...)`. If you see a bare
+  `assert` guarding a DB write anywhere else in this codebase, it's
+  probably the same class of bug — check whether `-O` would strip
+  something load-bearing.
+- **Reversal/takeback netting does not add a new `domain.variance.RootCause`
+  value.** See `src/ingestion/plan.py`'s `_reverse_finding` — reuses the
+  original finding's `root_cause`, negates the `shortfall`, and explains
+  itself in `evidence`. Reopening `domain/variance.py` (Phase 1, already
+  gated) for a one-phase-later feature felt like the wrong tradeoff; the
+  free-text `evidence` field exists for exactly this. If a future phase
+  needs to query "how many findings were reversals" cheaply without
+  parsing `evidence` text, that's the point to revisit this, not before.
+- **Payer identification falls back from `Entity.id_code` to `Entity.name`.**
+  `src/ingestion/plan.py`'s `payer_key()`. Real 835s carry a payer id in
+  N1*PR's fourth element (N104), but it's genuinely optional in the X12
+  spec and every fixture in `tests/domain/fixtures_x835.py` omits it
+  (`N1*PR*TEST PAYER` only — two elements). Discovered this by reading the
+  parser's N1 handling directly before writing `_payer_key`, not by
+  guessing. If real payer feeds are inconsistent about supplying N104,
+  this fallback is required, not optional; don't remove it as
+  "simplification."
+- **`domain.contract.ContractVersion` carries no DB identity, on purpose**
+  (Phase 1 stays pure). Ingestion needs the DB id anyway, to stamp
+  `findings.contract_version_id` for traceability ("which contract were we
+  paid against" matters for appeals). Solved with a `(payer_id,
+  effective_from)` natural-key map built in `pipeline.py` from
+  `repository.list_contract_versions`'s now-paired
+  `list[tuple[UUID, ContractVersion]]` return value, threaded through
+  `apply.py` as `contract_version_ids`. If a payer ever has two contract
+  versions with the same `effective_from` (shouldn't happen, but not
+  enforced by a DB constraint), this map silently keeps the last one seen
+  — not currently guarded against.
+- **Implant invoice cost is always `None` in ingestion-built
+  `ClaimLineInput`s.** The 835 doesn't carry invoice cost — that comes from
+  a separate purchasing/AP feed this phase doesn't have. Implant lines will
+  price as `UNPRICED` until a future phase wires that feed in. This is
+  existing Phase 1 behavior (`_is_implant` + no `invoice_cost` -> UNPRICED),
+  not a new gap introduced here — just flagging it stays true through
+  ingestion.
+- **`tests/ingestion/conftest.py` duplicates `tests/db/conftest.py`'s
+  skip-guard fixture rather than sharing it.** pytest conftest discovery
+  only walks up the directory tree (a test file sees its own directory's
+  conftest plus every ancestor's, never a sibling's), so `tests/ingestion/`
+  can't use fixtures defined in `tests/db/conftest.py` without either a
+  shared `tests/conftest.py` (didn't exist, chose not to introduce one
+  mid-phase touching Phase 3's test setup) or duplication. Chose
+  duplication, matching how Phase 3 itself was self-contained.
 
 ## Traps for someone resuming cold
 
-- **`evals/golden/cases.py` is excluded from ruff via
-  `pyproject.toml`'s `[tool.ruff] extend-exclude`** — it's generated,
-  ~650KB, one case per line. Don't hand-edit it, don't be alarmed that it
-  fails a normal line-length lint if you check it manually outside `ruff
-  check .`.
-- **No project-local virtualenv.** Everything (`sqlalchemy`, `alembic`,
-  `psycopg`, `cryptography`, `pyjwt`, `pyotp`, `bandit`, `pip-audit`, ...)
-  was installed into the global user Python 3.12 install
-  (`C:\Users\523na\AppData\Local\Programs\Python\Python312`). This is why
-  `pip-audit` picks up unrelated tools (`poetry`, `CacheControl`). Worth
-  fixing with a real venv before this matters more, but wasn't done this
-  session — don't assume isolation that doesn't exist.
-- **`git add -A` on Windows will warn about LF→CRLF on every file** —
-  harmless, not a sign anything is wrong, don't try to "fix" line endings
-  mid-session.
-- **`tests/db/` fixtures depend on fixture *scope* ordering, not
-  declaration order or `autouse`.** `app_session_factory` and
-  `owner_engine` are session-scoped and do the `TEST_DATABASE_URL` check
-  themselves — a separate function-scoped `autouse` skip-guard fixture was
-  tried first and silently ran *after* the session-scoped fixtures had
-  already failed, because pytest sets up broader-scoped fixtures first
-  regardless of `autouse`. If you add new fixtures to that conftest, keep
-  the skip check inside every fixture that's actually depended on, not in
-  a separate guard.
-- **`docker-compose.yml` and `scripts/db/init_roles.sql` use fixed local
-  dev passwords** (`asc_owner_dev_password`, `asc_app_dev_password`).
-  These are fine for a local-only container never exposed beyond
-  localhost — don't mistake them for something needing rotation, and
-  don't reuse them anywhere real.
+- Everything from the Phase 3/4 checkpoint still applies: no
+  project-local virtualenv (global Python 3.12 install), `git add -A` on
+  Windows warns about LF→CRLF (harmless), `evals/golden/cases.py` is
+  ruff-excluded and generated (never hand-edit).
+- **`src/db/repository.list_contract_versions`'s return type changed** from
+  `list[ContractVersion]` to `list[tuple[uuid.UUID, ContractVersion]]` this
+  session — it had exactly zero callers before Phase 5 (grep-confirmed), so
+  this wasn't a breaking change to anything real, but if a stale mental
+  model of its old signature shows up anywhere, that's why.
+- **`tests/ingestion/fixtures.py`'s `reconciling_835()` is not one of
+  `tests/domain/fixtures_x835.py`'s builders** — it's a Phase 5 fixture
+  that reuses those builders' pieces (`claim_segments`, `plb_segment`,
+  `envelope_tail`, `seg`) but assembles its own envelope head, because none
+  of the existing fixtures parameterize the BPR total (it's hardcoded
+  `"500.00"` in `envelope_head()`), and BPR reconciliation testing needs to
+  control that value directly.
 
 ## Next 3 steps
 
-1. **If Postgres becomes available:** follow `docs/DB_SETUP.md` exactly
-   (`docker compose up -d`, `alembic upgrade head` as `asc_owner`, then
-   `TEST_DATABASE_URL=... pytest tests/db/ -v` as `asc_app`). If all four
-   gate tests pass, check off Phase 3 in `docs/PHASES.md` — don't check it
-   off for any lesser reason.
-2. **Otherwise, start Phase 5 (ingestion pipeline)** per
-   `docs/MASTER-BUILD-PROMPT.md`: file/SFTP/S3 upload adapters behind a
-   port (same pattern as `security.kms`/`security.secrets` — one
-   interface, swappable adapters), idempotency by content hash (reuse
-   `db.repository.record_remittance_if_new`, already built in Phase 3),
-   quarantine for invalid files, partial-batch handling, BPR
-   reconciliation, reversal/takeback netting against prior findings. Enter
-   plan mode first, same as every prior phase this session — don't skip
-   the plan step even though the pattern is now familiar.
-3. Either way, **do not skip `/clear`-equivalent context hygiene** if this
-   checkpoint is being read at the start of a fresh session — that's the
-   point of this file existing at all.
+1. **If Postgres becomes available:** run `docs/DB_SETUP.md`'s steps, then
+   `TEST_DATABASE_URL=... pytest tests/db/ tests/ingestion/ -v`. If all of
+   Phase 3's four gate tests AND Phase 5's three (`test_apply_idempotency`,
+   `test_apply_quarantine`, `test_apply_audit_entry`) pass, check off both
+   phases in `docs/PHASES.md` — don't check off either for any lesser
+   reason.
+2. **Otherwise, start Phase 6 (API layer)** per
+   `docs/MASTER-BUILD-PROMPT.md`: FastAPI endpoints for upload/list
+   findings/finding detail/export/contract management/audit query, full
+   authz test matrix (every role x every endpoint x own-tenant/other-tenant).
+   This is where `security.rbac.Action.UPLOAD_REMITTANCE` finally gets
+   wired in front of `ingestion.pipeline.ingest_file`. Enter plan mode
+   first, same as every prior phase.
+3. Either way, keep this checkpoint current — don't let a future session
+   inherit a stale picture of what's verified vs. just written.

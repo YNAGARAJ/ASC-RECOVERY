@@ -3,7 +3,9 @@
 **Current phase: Phase 5 — Ingestion pipeline**
 
 Phase 3's gate is still unverified pending a live Postgres — see below.
-Phase 4 is fully verified and checked off.
+Phase 4 is fully verified and checked off. Phase 5's pure logic (planning,
+reconciliation, sources, virus scan) is fully verified; its DB-writing half
+is code-complete but unverified for the same reason as Phase 3 — see below.
 
 One phase per session. `/clear` between phases. Never advance past a failing
 gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
@@ -37,7 +39,28 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       and the two explicitly out-of-scope items (real cloud KMS adapters,
       deferred to Phase 9; `gitleaks` full-history scan, unavailable in
       this environment).
-- [ ] Phase 5 — Ingestion pipeline
+- [ ] Phase 5 — Ingestion pipeline — **code complete, DB-writing half
+      unverified for the same reason as Phase 3.** Split into a pure
+      planning layer (`src/ingestion/reconcile.py`, `plan.py`, `sources.py`,
+      `virus_scan.py`) and a thin DB-apply layer (`apply.py`,
+      `pipeline.py`), specifically so most of this phase's logic could
+      actually run in this Postgres-less environment instead of joining
+      Phase 3 in permanent-skip limbo. Fully verified without a live DB:
+      quarantine decisions (unparseable file, all-claims-malformed file),
+      partial-batch handling (one bad claim doesn't fail the file), BPR
+      reconciliation math, reversal/takeback netting (sums to exactly
+      zero), source adapters (SFTP/S3 against fake clients implementing
+      minimal Protocols), and the EICAR-based virus-scan path — all real,
+      passing tests, not skips. **Not yet verified**: the three tests that
+      exercise `ingestion.pipeline.ingest_file` end to end against
+      Postgres (`tests/ingestion/test_apply_idempotency.py`,
+      `test_apply_quarantine.py`, `test_apply_audit_entry.py`) — written,
+      skip cleanly without `TEST_DATABASE_URL`, never executed. Added
+      `alembic/versions/0002_remittance_quarantine_reason.py` (verified
+      offline only, same ceiling as 0001) and five additive functions to
+      `src/db/repository.py`. **Do not check this phase off until the
+      three DB-backed tests above are run against a live Postgres**, same
+      standard as Phase 3.
 - [ ] Phase 6 — API layer
 - [ ] Phase 7 — Recovery packet generation (the only place an LLM appears)
 - [ ] Phase 8 — Observability and audit

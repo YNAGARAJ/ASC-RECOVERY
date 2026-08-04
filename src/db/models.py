@@ -137,6 +137,7 @@ class Remittance(Base):
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
     status: Mapped[str] = mapped_column(String(30), nullable=False)
+    quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

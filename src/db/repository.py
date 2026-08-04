@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from db.models import Adjustment as AdjustmentModel
 from db.models import AuditLog as AuditLogModel
 from db.models import Claim as ClaimModel
 from db.models import Contract as ContractModel
@@ -33,6 +34,7 @@ from db.models import ContractVersion as ContractVersionModel
 from db.models import FeeScheduleLine as FeeScheduleLineModel
 from db.models import Finding as FindingModel
 from db.models import Remittance as RemittanceModel
+from db.models import ServiceLine as ServiceLineModel
 from db.models import Tenant as TenantModel
 from db.rules_version import RULES_VERSION
 from domain.contract import (
@@ -255,6 +257,31 @@ def get_effective_contract_version(
     return find_effective_contract(payer_id, date_of_service, versions)
 
 
+def list_contract_versions(
+    session: Session, tenant_id: uuid.UUID, payer_id: str
+) -> list[tuple[uuid.UUID, ContractVersion]]:
+    """Every version of `payer_id`'s contract for this tenant, undated --
+    callers that need to price several claims against possibly-different
+    dates of service (ingestion) load once and pick per-claim via
+    domain.contract.find_effective_contract themselves, rather than paying
+    for a fresh query per claim. Returned paired with each version's row id
+    since findings need to record which contract_version priced them
+    (CLAUDE.md rule 8 / docs/PHASES.md: reproducible after a rules change),
+    and the domain ContractVersion dataclass itself deliberately carries no
+    DB identity."""
+    rows = (
+        session.execute(
+            select(ContractVersionModel)
+            .join(ContractModel, ContractVersionModel.contract_id == ContractModel.id)
+            .where(ContractModel.tenant_id == tenant_id, ContractModel.payer_id == payer_id)
+            .order_by(ContractVersionModel.effective_from.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [(row.id, _contract_version_to_domain(session, row, payer_id)) for row in rows]
+
+
 # --- Idempotent remittances -----------------------------------------------------
 
 
@@ -331,6 +358,79 @@ def create_claim(
     return claim
 
 
+def create_service_line(
+    session: Session,
+    tenant_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    *,
+    line_index: int,
+    procedure_code: str,
+    modifiers: Sequence[str],
+    revenue_code: str | None,
+    charge: Decimal,
+    allowed: Decimal,
+    paid_computed: Decimal,
+    service_date: date | None,
+) -> ServiceLineModel:
+    line = ServiceLineModel(
+        tenant_id=tenant_id,
+        claim_id=claim_id,
+        line_index=line_index,
+        procedure_code=procedure_code,
+        modifiers=list(modifiers),
+        revenue_code=revenue_code,
+        charge=charge,
+        allowed=allowed,
+        paid_computed=paid_computed,
+        service_date=service_date,
+    )
+    session.add(line)
+    session.flush()
+    return line
+
+
+def create_adjustment(
+    session: Session,
+    tenant_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    service_line_id: uuid.UUID | None,
+    *,
+    group_code: str,
+    reason_code: str,
+    amount: Decimal,
+) -> AdjustmentModel:
+    adjustment = AdjustmentModel(
+        tenant_id=tenant_id,
+        claim_id=claim_id,
+        service_line_id=service_line_id,
+        group_code=group_code,
+        reason_code=reason_code,
+        amount=amount,
+    )
+    session.add(adjustment)
+    session.flush()
+    return adjustment
+
+
+def update_remittance_status(
+    session: Session,
+    tenant_id: uuid.UUID,
+    remittance_id: uuid.UUID,
+    *,
+    status: str,
+    quarantine_reason: str | None = None,
+) -> RemittanceModel:
+    row = session.execute(
+        select(RemittanceModel).where(
+            RemittanceModel.tenant_id == tenant_id, RemittanceModel.id == remittance_id
+        )
+    ).scalar_one()
+    row.status = status
+    row.quarantine_reason = quarantine_reason
+    session.flush()
+    return row
+
+
 def save_findings(
     session: Session,
     tenant_id: uuid.UUID,
@@ -363,6 +463,24 @@ def save_findings(
         rows.append(row)
     session.flush()
     return rows
+
+
+def list_findings_by_payer_claim_control_number(
+    session: Session, tenant_id: uuid.UUID, payer_claim_control_number: str
+) -> list[FindingModel]:
+    """Findings belonging to any claim previously ingested under this payer
+    claim control number -- used by ingestion to net a reversal (CLP02=22)
+    against what it's reversing. Not scoped by remittance_id: a reversal
+    typically arrives in a different file than the original payment."""
+    return list(
+        session.execute(
+            select(FindingModel)
+            .join(ClaimModel, FindingModel.claim_id == ClaimModel.id)
+            .where(ClaimModel.payer_claim_control_number == payer_claim_control_number)
+        )
+        .scalars()
+        .all()
+    )
 
 
 # --- Audit log -------------------------------------------------------------------
