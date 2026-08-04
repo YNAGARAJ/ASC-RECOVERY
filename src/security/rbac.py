@@ -33,6 +33,7 @@ class Action(enum.Enum):
     UPLOAD_REMITTANCE = "upload_remittance"
     READ_CONTRACT = "read_contract"
     MANAGE_CONTRACT = "manage_contract"
+    DRAFT_RECOVERY_PACKET = "draft_recovery_packet"
     APPROVE_RECOVERY_PACKET = "approve_recovery_packet"
     MANAGE_USERS = "manage_users"
     READ_AUDIT_LOG = "read_audit_log"
@@ -56,6 +57,7 @@ _PERMISSIONS: dict[Role, frozenset[Action]] = {
             Action.EXPORT_WORKLIST,
             Action.UPLOAD_REMITTANCE,
             Action.READ_CONTRACT,
+            Action.DRAFT_RECOVERY_PACKET,
             Action.APPROVE_RECOVERY_PACKET,
         }
     ),

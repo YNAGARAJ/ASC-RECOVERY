@@ -16,7 +16,9 @@ from api.repository import (
     ContractSummary,
     FindingDetail,
     FindingSummary,
+    PacketGenerationFailed,
     PagedResult,
+    RecoveryPacketSummary,
 )
 
 
@@ -232,6 +234,48 @@ class AuditLogListOut(BaseModel):
         return cls(
             items=[AuditLogEntryOut.from_domain(item) for item in result.items],
             page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
+
+
+class RecoveryPacketOut(BaseModel):
+    id: uuid.UUID
+    finding_id: uuid.UUID
+    status: str
+    draft_text: str
+    deadline: date
+    generated_by: str
+    generated_at: datetime
+    decided_by: str | None
+    decided_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, row: RecoveryPacketSummary) -> RecoveryPacketOut:
+        return cls(
+            id=row.id,
+            finding_id=row.finding_id,
+            status=row.status,
+            draft_text=row.draft_text,
+            deadline=row.deadline,
+            generated_by=row.generated_by,
+            generated_at=row.generated_at,
+            decided_by=row.decided_by,
+            decided_at=row.decided_at,
+        )
+
+
+class PacketListOut(BaseModel):
+    items: list[RecoveryPacketOut]
+
+
+class PacketGenerationFailedOut(BaseModel):
+    finding_id: uuid.UUID
+    attempts: int
+    reasons: list[str]
+
+    @classmethod
+    def from_domain(cls, failure: PacketGenerationFailed) -> PacketGenerationFailedOut:
+        return cls(
+            finding_id=failure.finding_id, attempts=failure.attempts, reasons=list(failure.reasons)
         )
 
 

@@ -23,7 +23,10 @@ from typing import Protocol
 from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository as db_repository
+from db.models import Contract as ContractORM
+from db.models import ContractVersion as ContractVersionORM
 from db.models import Finding as FindingModel
+from db.models import RecoveryPacket as RecoveryPacketModel
 from db.tenancy import tenant_session
 from domain.contract import (
     AssistantSurgeonRule,
@@ -34,10 +37,17 @@ from domain.contract import (
     MPPRRule,
     PricingMethod,
 )
+from domain.deadlines import calculate_appeal_deadline
 from domain.money import Money, Rate
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.virus_scan import VirusScanner
+from packets.drafter import PacketDrafter
+from packets.prompt import PromptInput
+from packets.service import generate_packet_draft
+from packets.templates import PacketTemplate, select_template
+
+_DEFAULT_TIMELY_FILING_DAYS = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +154,26 @@ class AuditLogFilters:
     resource_type: str | None = None
     date_from: date | None = None
     date_to: date | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPacketSummary:
+    id: uuid.UUID
+    finding_id: uuid.UUID
+    status: str
+    draft_text: str
+    deadline: date
+    generated_by: str
+    generated_at: datetime
+    decided_by: str | None
+    decided_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class PacketGenerationFailed:
+    finding_id: uuid.UUID
+    attempts: int
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +297,43 @@ class Repository(Protocol):
         request_id: str | None,
     ) -> None: ...
 
+    def generate_packet(
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, generated_by: str
+    ) -> RecoveryPacketSummary | PacketGenerationFailed | None: ...
+
+    def list_packets(
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+    ) -> list[RecoveryPacketSummary]: ...
+
+    def decide_packet(
+        self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
+    ) -> RecoveryPacketSummary | None: ...
+
+
+def _packet_to_summary(row: RecoveryPacketModel) -> RecoveryPacketSummary:
+    return RecoveryPacketSummary(
+        id=row.id,
+        finding_id=row.finding_id,
+        status=row.status,
+        draft_text=row.draft_text,
+        deadline=row.deadline,
+        generated_by=row.generated_by,
+        generated_at=row.generated_at,
+        decided_by=row.decided_by,
+        decided_at=row.decided_at,
+    )
+
+
+def _template_from_json(data: dict[str, object] | None) -> PacketTemplate | None:
+    if data is None:
+        return None
+    return PacketTemplate(
+        salutation=str(data["salutation"]),
+        letterhead=str(data["letterhead"]),
+        closing=str(data["closing"]),
+        footer_legal_text=str(data["footer_legal_text"]),
+    )
+
 
 def _finding_to_summary(row: FindingModel) -> FindingSummary:
     return FindingSummary(
@@ -290,8 +357,9 @@ class PostgresRepository:
     caller-supplied tenant_id (never a client-supplied one -- see
     api/auth.py)."""
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(self, session_factory: sessionmaker[Session], *, drafter: PacketDrafter) -> None:
         self._session_factory = session_factory
+        self._drafter = drafter
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None:
         with self._session_factory() as session:
@@ -457,3 +525,117 @@ class PostgresRepository:
                 phi_accessed=phi_accessed,
                 request_id=request_id,
             )
+
+    def generate_packet(
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, generated_by: str
+    ) -> RecoveryPacketSummary | PacketGenerationFailed | None:
+        with tenant_session(self._session_factory, tenant_id) as session:
+            detail = db_repository.get_finding_detail(session, tenant_id, finding_id)
+            if detail is None:
+                return None
+
+            timely_filing_days = _DEFAULT_TIMELY_FILING_DAYS
+            template_override: PacketTemplate | None = None
+            if detail.finding.contract_version_id is not None:
+                version = session.get(ContractVersionORM, detail.finding.contract_version_id)
+                contract = (
+                    session.get(ContractORM, version.contract_id) if version is not None else None
+                )
+                if contract is not None:
+                    timely_filing_days = contract.timely_filing_days
+                    template_override = _template_from_json(contract.packet_template)
+            template = select_template(template_override)
+            deadline = calculate_appeal_deadline(detail.claim.date_of_service, timely_filing_days)
+
+            prompt_input = PromptInput(
+                payer_claim_control_number=detail.claim.payer_claim_control_number,
+                procedure_code=detail.finding.procedure_code,
+                date_of_service=detail.claim.date_of_service,
+                expected_allowed=(
+                    "0.00"
+                    if detail.finding.expected_allowed is None
+                    else str(detail.finding.expected_allowed)
+                ),
+                actual_allowed=str(detail.finding.actual_allowed),
+                shortfall=str(detail.finding.shortfall),
+                root_cause=detail.finding.root_cause,
+                evidence=detail.finding.evidence,
+                patient_name=detail.claim.patient_name,
+                patient_member_id=detail.claim.patient_member_id,
+            )
+
+            result = generate_packet_draft(prompt_input, template, self._drafter)
+
+            for _rejection in result.rejections:
+                db_repository.write_audit_log(
+                    session,
+                    tenant_id,
+                    actor=generated_by,
+                    action="packet_draft_rejected",
+                    resource_type="finding",
+                    resource_id=str(finding_id),
+                    phi_accessed=False,
+                )
+
+            if not result.success or result.final_text is None:
+                db_repository.write_audit_log(
+                    session,
+                    tenant_id,
+                    actor=generated_by,
+                    action="packet_generation_failed",
+                    resource_type="finding",
+                    resource_id=str(finding_id),
+                    phi_accessed=False,
+                )
+                return PacketGenerationFailed(
+                    finding_id=finding_id,
+                    attempts=result.attempts,
+                    reasons=tuple(r.reason for r in result.rejections),
+                )
+
+            row = db_repository.create_recovery_packet(
+                session,
+                tenant_id,
+                finding_id,
+                draft_text=result.final_text,
+                deadline=deadline,
+                generated_by=generated_by,
+            )
+            db_repository.write_audit_log(
+                session,
+                tenant_id,
+                actor=generated_by,
+                action="packet_generated",
+                resource_type="recovery_packet",
+                resource_id=str(row.id),
+                phi_accessed=True,
+            )
+            return _packet_to_summary(row)
+
+    def list_packets(
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+    ) -> list[RecoveryPacketSummary]:
+        with tenant_session(self._session_factory, tenant_id) as session:
+            rows = db_repository.list_recovery_packets_for_finding(session, tenant_id, finding_id)
+            return [_packet_to_summary(row) for row in rows]
+
+    def decide_packet(
+        self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
+    ) -> RecoveryPacketSummary | None:
+        with tenant_session(self._session_factory, tenant_id) as session:
+            existing = session.get(RecoveryPacketModel, packet_id)
+            if existing is None or existing.tenant_id != tenant_id:
+                return None
+            row = db_repository.decide_recovery_packet(
+                session, tenant_id, packet_id, approve=approve, decided_by=decided_by
+            )
+            db_repository.write_audit_log(
+                session,
+                tenant_id,
+                actor=decided_by,
+                action="packet_approved" if approve else "packet_rejected",
+                resource_type="recovery_packet",
+                resource_id=str(packet_id),
+                phi_accessed=False,
+            )
+            return _packet_to_summary(row)

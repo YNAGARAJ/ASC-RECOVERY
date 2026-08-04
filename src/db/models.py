@@ -89,6 +89,17 @@ class Contract(Base):
     )
     payer_id: Mapped[str] = mapped_column(String(100), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # A timely-filing window and letter boilerplate are payer-relationship
+    # attributes, not effective-dated pricing rules -- they live here
+    # rather than on ContractVersion (domain.contract.ContractVersion is a
+    # frozen dataclass with factories across tests/domain, tests/ingestion,
+    # tests/api; adding a field there ripples everywhere for no benefit,
+    # since neither of these needs to vary by contract version the way a
+    # fee schedule does).
+    timely_filing_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("90")
+    )
+    packet_template: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
@@ -319,3 +330,37 @@ class PHIAccessLog(Base):
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
     purpose: Mapped[str] = mapped_column(String(100), nullable=False)
+
+
+class RecoveryPacket(Base):
+    """The human-approval state machine for Phase 7's LLM-drafted appeal
+    letters: draft -> approved | rejected. `draft_text` is the fully
+    rendered letter with the patient's identifying details substituted
+    back in after generation (an appeal letter the payer can act on needs
+    them) -- the LLM itself only ever saw placeholder tokens, never those
+    details; see packets.prompt. There is deliberately no "sent" status
+    or transmission mechanism here -- out of Phase 7's scope."""
+
+    __tablename__ = "recovery_packets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    finding_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("findings.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    draft_text: Mapped[str] = mapped_column(Text, nullable=False)
+    deadline: Mapped[date] = mapped_column(Date, nullable=False)
+    generated_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    # Holds whoever made the approve-or-reject call, and when -- not named
+    # "approved_by" since status can land on either "approved" or
+    # "rejected".
+    decided_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

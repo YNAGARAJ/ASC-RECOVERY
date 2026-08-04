@@ -19,7 +19,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -34,6 +34,7 @@ from db.models import Contract as ContractModel
 from db.models import ContractVersion as ContractVersionModel
 from db.models import FeeScheduleLine as FeeScheduleLineModel
 from db.models import Finding as FindingModel
+from db.models import RecoveryPacket as RecoveryPacketModel
 from db.models import Remittance as RemittanceModel
 from db.models import ServiceLine as ServiceLineModel
 from db.models import Tenant as TenantModel
@@ -217,6 +218,18 @@ def create_contract(
     session.add(contract)
     session.flush()
     return contract
+
+
+def get_contract_by_payer_id(
+    session: Session, tenant_id: uuid.UUID, payer_id: str
+) -> ContractModel | None:
+    """For Phase 7's `timely_filing_days`/`packet_template` -- both live on
+    `Contract`, not `ContractVersion` (see that model's docstring)."""
+    return session.execute(
+        select(ContractModel).where(
+            ContractModel.tenant_id == tenant_id, ContractModel.payer_id == payer_id
+        )
+    ).scalar_one_or_none()
 
 
 def create_contract_version(
@@ -694,3 +707,68 @@ def list_audit_log(
         .all()
     )
     return list(rows), total
+
+
+# --- Recovery packets (Phase 7) --------------------------------------------------
+
+
+def create_recovery_packet(
+    session: Session,
+    tenant_id: uuid.UUID,
+    finding_id: uuid.UUID,
+    *,
+    draft_text: str,
+    deadline: date,
+    generated_by: str,
+) -> RecoveryPacketModel:
+    packet = RecoveryPacketModel(
+        tenant_id=tenant_id,
+        finding_id=finding_id,
+        status="draft",
+        draft_text=draft_text,
+        deadline=deadline,
+        generated_by=generated_by,
+    )
+    session.add(packet)
+    session.flush()
+    return packet
+
+
+def decide_recovery_packet(
+    session: Session,
+    tenant_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    *,
+    approve: bool,
+    decided_by: str,
+) -> RecoveryPacketModel:
+    """The human-approval step -- never automatic. `approve=False` records
+    a rejection, not a deletion; the draft and who declined it stay on
+    the record."""
+    packet = session.execute(
+        select(RecoveryPacketModel).where(
+            RecoveryPacketModel.tenant_id == tenant_id, RecoveryPacketModel.id == packet_id
+        )
+    ).scalar_one()
+    packet.status = "approved" if approve else "rejected"
+    packet.decided_by = decided_by
+    packet.decided_at = datetime.now(UTC)
+    session.flush()
+    return packet
+
+
+def list_recovery_packets_for_finding(
+    session: Session, tenant_id: uuid.UUID, finding_id: uuid.UUID
+) -> list[RecoveryPacketModel]:
+    return list(
+        session.execute(
+            select(RecoveryPacketModel)
+            .where(
+                RecoveryPacketModel.tenant_id == tenant_id,
+                RecoveryPacketModel.finding_id == finding_id,
+            )
+            .order_by(RecoveryPacketModel.generated_at.desc())
+        )
+        .scalars()
+        .all()
+    )

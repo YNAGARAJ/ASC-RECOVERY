@@ -8,7 +8,7 @@ run as real, passing tests without a live Postgres (the same trick
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from api.repository import (
@@ -21,11 +21,15 @@ from api.repository import (
     FindingSummary,
     Page,
     PagedResult,
+    RecoveryPacketSummary,
     UserRecord,
 )
+from domain.deadlines import calculate_appeal_deadline
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome
 from ingestion.virus_scan import VirusScanner
+
+_DEFAULT_TIMELY_FILING_DAYS = 90
 
 
 def now() -> datetime:
@@ -38,6 +42,7 @@ class FakeRepository:
     findings: dict[uuid.UUID, tuple[uuid.UUID, FindingDetail]] = field(default_factory=dict)
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
+    packets: dict[uuid.UUID, tuple[uuid.UUID, RecoveryPacketSummary]] = field(default_factory=dict)
     ingest_calls: list[tuple[uuid.UUID, bytes, str, str]] = field(default_factory=list)
     next_ingest_outcome: IngestionOutcome | DuplicateOutcome | None = None
 
@@ -171,3 +176,52 @@ class FakeRepository:
             request_id=request_id,
         )
         self.audit_entries[entry.id] = (tenant_id, entry)
+
+    def generate_packet(
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, generated_by: str
+    ) -> RecoveryPacketSummary | None:
+        """Only proves tenant-scoping/state-machine plumbing through the
+        API layer -- the actual currency/PHI-safety logic this stands in
+        for is proven directly against `packets.service` in
+        tests/packets/, not re-tested redundantly here."""
+        entry = self.findings.get(finding_id)
+        if entry is None or entry[0] != tenant_id:
+            return None
+        packet = RecoveryPacketSummary(
+            id=uuid.uuid4(),
+            finding_id=finding_id,
+            status="draft",
+            draft_text=f"Draft appeal letter for finding {finding_id}.",
+            deadline=calculate_appeal_deadline(now().date(), _DEFAULT_TIMELY_FILING_DAYS),
+            generated_by=generated_by,
+            generated_at=now(),
+            decided_by=None,
+            decided_at=None,
+        )
+        self.packets[packet.id] = (tenant_id, packet)
+        return packet
+
+    def list_packets(
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+    ) -> list[RecoveryPacketSummary]:
+        return [
+            packet
+            for tid, packet in self.packets.values()
+            if tid == tenant_id and packet.finding_id == finding_id
+        ]
+
+    def decide_packet(
+        self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
+    ) -> RecoveryPacketSummary | None:
+        entry = self.packets.get(packet_id)
+        if entry is None or entry[0] != tenant_id:
+            return None
+        _, packet = entry
+        updated = replace(
+            packet,
+            status="approved" if approve else "rejected",
+            decided_by=decided_by,
+            decided_at=now(),
+        )
+        self.packets[packet_id] = (tenant_id, updated)
+        return updated

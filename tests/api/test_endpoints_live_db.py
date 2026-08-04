@@ -27,6 +27,13 @@ from db.base import make_engine, make_session_factory
 from db.tenancy import tenant_session
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
+from packets.drafter import ScriptedPacketDrafter
+from packets.prompt import (
+    ACTUAL_ALLOWED_TOKEN,
+    EXPECTED_ALLOWED_TOKEN,
+    PATIENT_TOKEN,
+    SHORTFALL_TOKEN,
+)
 from security.rbac import Role
 from security.session import issue_session
 from tests.domain.fixtures_x835 import minimal_valid_835
@@ -84,7 +91,7 @@ def _seed_tenant(session_factory: sessionmaker[Session], label: str) -> tuple[uu
 
 @pytest.fixture
 def live_client(app_session_factory: sessionmaker[Session]) -> TestClient:
-    repository = PostgresRepository(app_session_factory)
+    repository = PostgresRepository(app_session_factory, drafter=ScriptedPacketDrafter([]))
     app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
     return TestClient(app)
 
@@ -121,3 +128,48 @@ def test_finding_detail_cross_tenant_lookup_is_404_against_real_rls(
 
     assert own_list.json()["page"]["total"] == 1
     assert cross_tenant_response.status_code == 404
+
+
+_VALID_SCRIPTED_DRAFT = (
+    f"Dear Sir/Madam, {PATIENT_TOKEN} was underpaid on this claim. Expected "
+    f"{EXPECTED_ALLOWED_TOKEN}, paid {ACTUAL_ALLOWED_TOKEN}, shortfall "
+    f"{SHORTFALL_TOKEN}. Sincerely,"
+)
+
+
+def test_generate_and_approve_packet_round_trip_against_real_postgres(
+    app_session_factory: sessionmaker[Session],
+) -> None:
+    """The Phase 7 human-approval state machine, end to end: generate a
+    draft (real currency validation against a real ingested finding, real
+    RLS-scoped persistence) -> approve it -> confirm both steps left an
+    audit trail."""
+    tenant_id, subject = _seed_tenant(app_session_factory, "packet-a")
+    repository = PostgresRepository(
+        app_session_factory, drafter=ScriptedPacketDrafter([_VALID_SCRIPTED_DRAFT])
+    )
+    app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
+    client = TestClient(app)
+
+    findings = client.get("/findings", headers=_auth_headers(subject))
+    finding_id = findings.json()["items"][0]["id"]
+
+    generated = client.post(f"/findings/{finding_id}/packets", headers=_auth_headers(subject))
+    assert generated.status_code == 201
+    assert generated.json()["status"] == "draft"
+    packet_id = generated.json()["id"]
+
+    approved = client.post(f"/packets/{packet_id}/approve", headers=_auth_headers(subject))
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["decided_by"] == subject
+
+    with tenant_session(app_session_factory, tenant_id) as session:
+        _, generated_count = db_repository.list_audit_log(
+            session, tenant_id, action="packet_generated", limit=10, offset=0
+        )
+        _, approved_count = db_repository.list_audit_log(
+            session, tenant_id, action="packet_approved", limit=10, offset=0
+        )
+    assert generated_count == 1
+    assert approved_count == 1

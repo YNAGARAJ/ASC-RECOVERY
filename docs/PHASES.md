@@ -1,10 +1,10 @@
 # Build Phases
 
-**Current phase: Phase 6 — API layer**
+**Current phase: Phase 7 — Recovery packet generation**
 
 Phase 3's gate is still unverified pending a live Postgres — see below.
-Phase 4 is fully verified and checked off. Phases 5 and 6 both split their
-work into a pure half (fully verified here) and a DB-writing half
+Phase 4 is fully verified and checked off. Phases 5, 6, and 7 each split
+their work into a pure half (fully verified here) and a DB-writing half
 (code-complete, unverified for the same reason as Phase 3) — see below.
 
 One phase per session. `/clear` between phases. Never advance past a failing
@@ -104,6 +104,48 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       scope. **Do not check this phase off until the live-DB tests above
       are run against a real Postgres**, same standard as Phases 3 and 5.
 - [ ] Phase 7 — Recovery packet generation (the only place an LLM appears)
+      — **code complete, DB-writing half unverified for the same reason as
+      Phases 3, 5, and 6.** New `src/packets/` package (pure): `currency.py`
+      (extracts every currency-shaped figure from LLM output, parses as
+      `Decimal`, rejects if any value isn't in the finding record's known
+      amounts), `prompt.py` (patient name/member id and every dollar
+      figure are placeholder tokens in the text sent to the LLM — never
+      the real values — substituted back in only after generation),
+      `drafter.py` (`PacketDrafter` port: `ScriptedPacketDrafter` for
+      every test, `AnthropicPacketDrafter` real adapter untested by
+      design, same deferral as real cloud KMS), `templates.py`
+      (per-payer letter boilerplate), `worklist.py` (deadline-proximity-
+      then-dollar-value ranking), `service.py` (orchestrates draft ->
+      reject-if-raw-figure -> substitute -> validate -> retry, up to a
+      small cap; never returns an unvalidated draft). New
+      `src/domain/deadlines.py` (pure `date` arithmetic, no timezone
+      concept to get wrong by construction; leap-year-correct because
+      Python's `date` already is). All of the above fully verified
+      without a live DB — this **is** the phase's actual gate:
+      `tests/packets/test_currency.py` proves a deliberately corrupted
+      draft is rejected, `tests/packets/test_prompt.py` proves patient
+      identifiers never reach the captured LLM prompt text (across
+      distinctive names chosen so a false negative can't happen by
+      luck), `tests/domain/test_deadlines.py` proves the deadline math
+      across a leap-day-spanning window and a year rollover. New
+      `Action.DRAFT_RECOVERY_PACKET` in `security/rbac.py` (additive;
+      Phase 4's matrix test updated, now 51 cases). New `recovery_packets`
+      table (tenant-scoped, RLS) plus `contracts.timely_filing_days` /
+      `contracts.packet_template` via
+      `alembic/versions/0004_recovery_packets_and_timely_filing.py`
+      (offline-verified only) — deliberately **not** on
+      `domain.contract.ContractVersion`, to avoid rippling through every
+      test file that constructs one. Three new API routes
+      (`POST/GET /findings/{id}/packets`, `POST /packets/{id}/approve`,
+      `POST /packets/{id}/reject` — the human-approval step, never
+      automatic) added to the same authz matrix discipline as Phase 6
+      (`tests/api/test_authz_matrix.py`, now 44 cases). **Not yet
+      verified**: one round-trip test (generate a packet against a real
+      ingested finding, approve it, confirm both audit entries) in
+      `tests/api/test_endpoints_live_db.py` — written, skips cleanly
+      without `TEST_DATABASE_URL`, never executed. **Do not check this
+      phase off until that test is run against a live Postgres**, same
+      standard as Phases 3, 5, and 6.
 - [ ] Phase 8 — Observability and audit
 - [ ] Phase 9 — Cloud-agnostic deployment
 - [ ] Phase 10 — CI/CD and pre-production hardening

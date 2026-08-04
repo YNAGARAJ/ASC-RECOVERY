@@ -142,3 +142,66 @@ def test_create_contract_version_matrix(
         return
     assert response.status_code == 201
     assert "id" in response.json()
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_generate_packet_matrix(client: TestClient, seed_ids: SeedIds, role: Role) -> None:
+    """Same cross-tenant shape as finding detail: generating against
+    another tenant's finding id must 404, never draft against it."""
+    action = Action.DRAFT_RECOVERY_PACKET
+
+    own = client.post(f"/findings/{seed_ids.finding_a}/packets", headers=auth_headers(role, "a"))
+    other = client.post(f"/findings/{seed_ids.finding_b}/packets", headers=auth_headers(role, "a"))
+
+    if not can(role, action):
+        assert own.status_code == 403
+        assert other.status_code == 403
+        return
+
+    assert own.status_code == 201
+    assert own.json()["status"] == "draft"
+    assert other.status_code == 404
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_list_packets_matrix(client: TestClient, seed_ids: SeedIds, role: Role) -> None:
+    action = Action.READ_FINDING
+    response = client.get(
+        f"/findings/{seed_ids.finding_a}/packets", headers=auth_headers(role, "a")
+    )
+    if not can(role, action):
+        assert response.status_code == 403
+        return
+    assert response.status_code == 200
+    assert "items" in response.json()
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_decide_packet_matrix(client: TestClient, seed_ids: SeedIds, role: Role) -> None:
+    """Cross-tenant proof for the human-approval step: a packet generated
+    under tenant B must not be approvable/rejectable by a tenant-A user
+    under any role."""
+    action = Action.APPROVE_RECOVERY_PACKET
+
+    own_packet = client.post(
+        f"/findings/{seed_ids.finding_a}/packets", headers=auth_headers(Role.BILLER, "a")
+    ).json()["id"]
+    other_packet = client.post(
+        f"/findings/{seed_ids.finding_b}/packets", headers=auth_headers(Role.BILLER, "b")
+    ).json()["id"]
+
+    approve_own = client.post(
+        f"/packets/{own_packet}/approve", headers=auth_headers(role, "a")
+    )
+    reject_other = client.post(
+        f"/packets/{other_packet}/reject", headers=auth_headers(role, "a")
+    )
+
+    if not can(role, action):
+        assert approve_own.status_code == 403
+        assert reject_other.status_code == 403
+        return
+
+    assert approve_own.status_code == 200
+    assert approve_own.json()["status"] == "approved"
+    assert reject_other.status_code == 404

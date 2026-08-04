@@ -1,10 +1,12 @@
-# Security controls (Phase 4)
+# Security controls (Phase 4, extended in Phase 7)
 
-This maps each control built in Phase 4 to its HIPAA Security Rule
-citation, where it lives in the codebase, and its verification status.
-This is engineering documentation, not legal advice — it must be reviewed
-by counsel/compliance as part of Phase 11 before any real PHI touches this
-system.
+This maps each security control to its HIPAA Security Rule citation, where
+it lives in the codebase, and its verification status. Built in Phase 4;
+extended in Phase 7 with the LLM-prompt/output controls below, since that's
+the first phase where PHI or a dollar figure could reach a third-party
+service. This is engineering documentation, not legal advice — it must be
+reviewed by counsel/compliance as part of Phase 11 before any real PHI
+touches this system.
 
 The 2026 HIPAA Security Rule update made encryption and multi-factor
 authentication **required**, not "addressable" as under the prior rule.
@@ -33,6 +35,8 @@ Every control below is written to that bar.
 | Static application security testing | §164.308(a)(8) (evaluation) | `bandit` (`make security`) | Runs clean (`bandit -r . -x ./tests,./evals` — the Makefile's original `-x tests,evals` exclude syntax didn't actually exclude anything on this platform; fixed to `-x ./tests,./evals`) |
 | Dependency vulnerability scanning | §164.308(a)(8) | `pip-audit` (`make security`) | **This project's actual dependencies are clean.** `pip-audit` reports 14 findings, but every one is in `dulwich`/`msgpack` (transitive deps of `poetry`/`CacheControl` — unrelated tools sharing this machine's global Python install) or in `pip` itself — none in `sqlalchemy`, `alembic`, `psycopg`, `cryptography`, `pyjwt`, or `pyotp`. This surfaces a real gap: **the project has no isolated virtual environment**, so `pip-audit` (and anyone reproducing this) audits the whole shared install rather than just this project's dependency tree. Worth fixing (a project-local venv or lockfile) before this scan result can be trusted at face value in CI |
 | Full-history secret scanning | §164.308(a)(1)(ii)(D) (information system activity review, by extension) | `gitleaks` (`make security`) | **Not run** — `gitleaks` is a Go binary, not installable via `pip`, and unavailable in this build environment. Must be run before Phase 11 |
+| Minimum-necessary PHI in LLM prompts | §164.514 (minimum necessary) | `src/packets/prompt.py` — patient name/member id are never interpolated into the text sent to the LLM; they're substituted back into the final letter only after generation | Implemented, tested — `tests/packets/test_prompt.py` asserts directly on the captured prompt text for a range of inputs, including distinctive names chosen so a false negative can't happen by luck |
+| Integrity control on LLM-generated content | §164.312(c)(1) (integrity) | `src/packets/currency.py` + `src/packets/service.py` — every dollar figure in a generated appeal letter is extracted and asserted to exactly match a value in the deterministic finding record; the draft is rejected and regenerated (up to a small retry cap) if not, and no unvalidated draft is ever persisted or returned | Implemented, tested — `tests/packets/test_currency.py`, `test_service.py`. This is CLAUDE.md's hardest rule: an LLM never computes, adjusts, or restates a dollar amount |
 
 ## Not yet built (later phases, by design)
 
@@ -48,6 +52,14 @@ Every control below is written to that bar.
   `src/db/models.py`) — the encryption primitive exists now; wiring it
   into the persistence layer's read/write path is follow-on work once
   Phase 5/6 define how claims get written.
+- **BAA with the LLM provider, and confirmation of zero-retention terms**
+  for the packet-drafting integration added in Phase 7
+  (`src/packets/drafter.py`'s `AnthropicPacketDrafter`) — explicitly Phase
+  11 scope, per `docs/MASTER-BUILD-PROMPT.md`'s compliance checklist. No
+  real LLM call happens anywhere in this codebase's tests; the real
+  adapter is untested by design (same deferral as real cloud KMS
+  adapters), so there's nothing to retroactively unwind if the BAA terms
+  require a different provider or configuration later.
 
 ## Asset inventory and network map
 
