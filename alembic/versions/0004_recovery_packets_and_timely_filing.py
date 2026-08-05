@@ -14,8 +14,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
-from sqlalchemy import text
+from alembic import context, op
+from sqlalchemy import inspect, text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db import models  # noqa: F401 -- registers RecoveryPacket on Base.metadata
@@ -29,17 +29,15 @@ depends_on: Sequence[str] | None = None
 _APP_ROLE = "asc_app"
 
 
-def upgrade() -> None:
-    bind = op.get_bind()
-
-    op.add_column(
-        "contracts",
-        sa.Column("timely_filing_days", sa.Integer(), nullable=False, server_default="90"),
-    )
-    op.add_column("contracts", sa.Column("packet_template", JSONB(), nullable=True))
-
-    Base.metadata.tables["recovery_packets"].create(bind=bind, checkfirst=False)
-
+def _grant_and_secure_recovery_packets() -> None:
+    # Idempotent statements only (GRANT and ENABLE/FORCE ROW LEVEL SECURITY
+    # are no-ops on re-application in Postgres) plus CREATE POLICY, which
+    # is NOT idempotent but is safe unguarded because Alembic guarantees
+    # this migration's upgrade() runs at most once per database. This is
+    # the *only* place recovery_packets gets any of the four -- 0001's
+    # create_all() creates the table but its grant/RLS loops only know
+    # about the tables hardcoded in `_MUTABLE_TABLES`/`_TENANT_SCOPED_TABLES`
+    # at the time 0001 was written, which predates this table.
     op.execute(text(f"GRANT SELECT, INSERT, UPDATE ON recovery_packets TO {_APP_ROLE}"))
     op.execute(text("ALTER TABLE recovery_packets ENABLE ROW LEVEL SECURITY"))
     op.execute(text("ALTER TABLE recovery_packets FORCE ROW LEVEL SECURITY"))
@@ -50,6 +48,43 @@ def upgrade() -> None:
             "WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid)"
         )
     )
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+
+    # Offline SQL generation (`alembic upgrade head --sql`) has no live
+    # connection to inspect -- always emit every statement there, matching
+    # this migration's original, unconditional behavior; that path is for
+    # eyeballing SQL, never for applying it.
+    if context.is_offline_mode():
+        op.add_column(
+            "contracts",
+            sa.Column("timely_filing_days", sa.Integer(), nullable=False, server_default="90"),
+        )
+        op.add_column("contracts", sa.Column("packet_template", JSONB(), nullable=True))
+        Base.metadata.tables["recovery_packets"].create(bind=bind, checkfirst=False)
+        _grant_and_secure_recovery_packets()
+        return
+
+    inspector = inspect(bind)
+
+    # Guarded, same reason as 0002/0003: on a fresh database, 0001's
+    # create_all() already creates these (they're part of db/models.py
+    # now, even though it predates this migration).
+    existing_contract_columns = {col["name"] for col in inspector.get_columns("contracts")}
+    if "timely_filing_days" not in existing_contract_columns:
+        op.add_column(
+            "contracts",
+            sa.Column("timely_filing_days", sa.Integer(), nullable=False, server_default="90"),
+        )
+    if "packet_template" not in existing_contract_columns:
+        op.add_column("contracts", sa.Column("packet_template", JSONB(), nullable=True))
+
+    if not inspector.has_table("recovery_packets"):
+        Base.metadata.tables["recovery_packets"].create(bind=bind, checkfirst=False)
+
+    _grant_and_secure_recovery_packets()
 
 
 def downgrade() -> None:
