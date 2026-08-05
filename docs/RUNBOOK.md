@@ -102,6 +102,79 @@ database — not done here, no such database exists in this environment):
    only be produced by doing this for real.
 5. Tear down the restored instance once verified (avoid double-billing).
 
+## CI/CD pipeline
+
+Phase 10 added three GitHub Actions workflows. Unlike everything else in
+this section, **the `ci.yml` stages actually run and are actually
+verified** — GitHub-hosted runners have Docker and can spin up a real
+Postgres service container, which is more than this repo has ever had
+available before. `deploy.yml`'s cloud-dependent stages are the exception:
+they're written and structurally correct but cannot run for real until the
+one-time setup below happens.
+
+- **`.github/workflows/ci.yml`** — runs on every push/PR to `master`:
+  `lint` (ruff, mypy --strict, lockfile-freshness check) → `test` (real
+  Postgres 16 service container; `scripts/db/init_roles.sql`; `alembic
+  upgrade head`; the full `pytest -q`, including every test that has been
+  silently skipping locally since Phase 3 for lack of a live database) →
+  `security` (bandit, pip-audit, full-history `gitleaks`) → `sbom`
+  (CycloneDX, uploaded as a build artifact, not committed) →
+  `container-scan` (`docker build` + `trivy`, fails on fixable
+  CRITICAL/HIGH) → `iac-scan` (`terraform validate` for both clouds +
+  `tfsec`).
+- **`.github/workflows/deploy.yml`** — triggers after `ci.yml` succeeds on
+  `master`, or manually via `workflow_dispatch`: build/push image → deploy
+  to a `staging` Terraform workspace → smoke test (`/healthz`, `/readyz`)
+  → OWASP ZAP baseline (passive) scan against staging → **manual
+  approval gate** → deploy to the `production` workspace. AWS and Azure
+  are separate, parallel job chains — see "One-time cloud setup" below.
+- **`.github/workflows/scheduled-security-scan.yml`** — runs every six
+  months (`cron: "0 0 1 1,7 *"`), re-running bandit/pip-audit/trivy against
+  the current codebase and opening a GitHub issue if anything new turns
+  up. This satisfies the 2026 HIPAA Security Rule's six-monthly
+  vulnerability-scan requirement; **the Rule's annual penetration test is
+  not something this repo can automate** — that's hiring a third-party
+  firm, a Phase 11 process/procurement item, tracked outside of code.
+
+### One-time cloud setup (before `deploy.yml`'s cloud jobs can run for real)
+
+Every cloud-dependent job in `deploy.yml` is guarded by
+`if: secrets.<...> != ''`, so until the secrets below exist it shows as
+**skipped**, not failed — an accurate status, not a permanently red
+pipeline for infrastructure nobody has provisioned yet.
+
+**AWS** (OIDC role assumption — no long-lived access keys stored in
+GitHub):
+1. Create an IAM OIDC identity provider for `token.actions.githubusercontent.com`
+   (one per AWS account, if one doesn't already exist for other repos).
+2. Create an IAM role trusting that provider, scoped (via the trust
+   policy's `sub` condition) to this repo, with permissions to run
+   `terraform apply` for `terraform/modules/aws` plus ECR push access.
+3. Add repo secrets: `AWS_DEPLOY_ROLE_ARN` (the role from step 2),
+   `AWS_ECR_REPOSITORY` (an ECR repository URI — Terraform doesn't
+   provision this; create it once, separately), `AWS_REGION` (optional,
+   defaults to `us-east-1`).
+
+**Azure** (federated credentials — same no-static-secrets principle):
+1. Create an Azure AD App Registration with a federated credential
+   trusting `token.actions.githubusercontent.com`, scoped to this repo.
+2. Grant that App Registration's service principal Contributor on the
+   target subscription/resource group.
+3. Add repo secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+   `AZURE_SUBSCRIPTION_ID`, `AZURE_ACR_REGISTRY` (an ACR login server —
+   also not Terraform-provisioned, create it once, separately).
+
+**Both clouds**: in this repo's Settings → Environments, create a
+`production` environment with a required-reviewers rule. That's what
+turns `deploy-production-*`'s `environment: production` reference into an
+actual pause-for-approval gate — the workflow YAML alone doesn't create
+that requirement, GitHub's environment protection rules do.
+
+None of the above has been done in the environment this was authored in
+— no AWS/Azure account exists here. This is the same category of gap as
+Terraform `apply` in the "Deploy" section above: written and structurally
+reviewed, not exercised against real infrastructure.
+
 ## Key rotation
 
 `EnvelopeEncryptor.rotate_kek()` (Phase 4, `src/security/encryption.py`,

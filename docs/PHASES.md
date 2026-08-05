@@ -1,6 +1,6 @@
 # Build Phases
 
-**Current phase: Phase 9 — Cloud-agnostic deployment**
+**Current phase: Phase 10 — CI/CD and pre-production hardening**
 
 Phase 3's gate is still unverified pending a live Postgres — see below.
 Phase 4 is fully verified and checked off. Phases 5, 6, 7, and 8 each split
@@ -242,6 +242,125 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       Codespace, AND (2) `terraform validate`/`plan`/`apply` succeed
       against real AWS and Azure accounts with an actual restore
       rehearsed and timed — two separate, later milestones, not one.
-- [ ] Phase 10 — CI/CD and pre-production hardening
+- [ ] Phase 10 — CI/CD and pre-production hardening — **code complete,
+      the pipeline itself has never actually run.** Unlike every prior
+      phase's DB-less limbo (which stays unresolved until someone brings
+      up a real Postgres), this phase's gap closes the moment this is
+      pushed: `.github/workflows/ci.yml` runs on GitHub-hosted runners,
+      which have Docker and can spin up a real Postgres 16 service
+      container — the first time in this build that the RLS
+      tenant-isolation gate, idempotent-remittance, effective-dated
+      pricing, audit-log append-only, the packet approve round-trip, and
+      the claim-access-history round-trip (Phases 3/5/6/7/8's stuck
+      DB-backed tests) get to actually run instead of skip. **Do not
+      check this phase off until that first real run is green** — it
+      might not be; this is genuinely the first time some of this code
+      touches a live database.
+      - **`.github/workflows/ci.yml`**: lint (ruff, mypy --strict,
+        lockfile-freshness) -> test (real Postgres 16 service container,
+        `scripts/db/init_roles.sql`, `alembic upgrade head`, full
+        `pytest -q`) -> security (bandit, pip-audit, full-history
+        `gitleaks`) -> sbom (CycloneDX artifact) -> container-scan
+        (`docker build` + `trivy`) -> iac-scan (`terraform validate` for
+        both clouds + `tfsec`).
+      - **`.github/workflows/deploy.yml`**: staging -> smoke test -> OWASP
+        ZAP baseline -> manual approval gate -> production, AWS and Azure
+        as separate job chains, OIDC/federated-credential auth (no static
+        keys). Every cloud-dependent job is guarded by
+        `if: secrets.* != ''`, so it shows **skipped**, not failed, until
+        real AWS/Azure credentials exist — same "no cloud account in this
+        environment" ceiling as Phase 9's Terraform, now explicit in the
+        pipeline's own status rather than just prose. One-time OIDC setup
+        documented in `docs/RUNBOOK.md`.
+      - **`.github/workflows/scheduled-security-scan.yml`**: six-monthly
+        cron (bandit/pip-audit/trivy), opens an issue on new findings —
+        satisfies the 2026 rule's vulnerability-scan cadence. The same
+        rule's annual penetration test is named as what it actually is
+        (a procurement/process item, Phase 11 scope) rather than faked as
+        a workflow step.
+      - **Dependency pinning**: `requirements.lock.txt` (`make lock`, via
+        `pip-compile`) — genuinely generated and verified locally,
+        including confirming it's stable under re-compilation (no
+        spurious drift) so the CI freshness check catches real
+        `pyproject.toml` drift, not unrelated upstream package releases.
+        Discovered and worked around a real `pip-tools`/`pip 25+`
+        incompatibility (`pip-tools` reaches into a private pip API that
+        25+ removed) — pinned `pip<25` for just that CI step and in the
+        Makefile's `lock` target comment, not project-wide. Dockerfile's
+        builder stage now installs from the lockfile, not
+        `pyproject.toml` directly, for byte-for-byte reproducible builds.
+      - **SBOM**: `make sbom` (`cyclonedx-py`) — genuinely generated and
+        verified locally; produced fresh as a CI artifact per build, not
+        committed (an SBOM describes one build's contents; a committed
+        static copy would drift from reality).
+      - **Adversarial review**: ran the `adversarial-reviewer` subagent
+        across the full `src/` tree, migrations, Terraform, Dockerfile,
+        and the new workflow files, per `docs/MASTER-BUILD-PROMPT.md`'s
+        explicit requirement. Found 2 HIGH, 5 MEDIUM, 3 LOW findings.
+        **Both HIGH findings fixed**:
+        1. *PHI columns were never actually encrypted.* The envelope-
+           encryption primitive (`EnvelopeEncryptor`, Phase 4) existed but
+           had zero call sites anywhere in the write/read path —
+           `claims.patient_name`/`patient_member_id` were plain `Text`
+           columns. Investigating this also surfaced a deeper bug:
+           `ingestion/apply.py` never read `claim.patient` at all, so
+           these columns were always `NULL` even though `domain/x835.py`
+           correctly parses the NM1*QC segment into `Claim835.patient`.
+           Fixed by: renaming the columns to
+           `patient_name_encrypted`/`patient_member_id_encrypted`
+           (`Text`, holding a JSON-serialized `EncryptedPayload` — see
+           `src/security/phi_columns.py`); adding `src/security/kms_env.py`
+           (`EnvKMS`, a real-but-weaker stopgap `KeyManagementService`
+           reading a static KEK from a secret, wired into `main.py` —
+           the real cloud KMS adapter remains a named, deferred gap, same
+           as before); threading `EnvelopeEncryptor` through
+           `ingestion.apply._apply_claim` (encrypt on write, from the
+           already-parsed `claim.patient`), `ingestion.pipeline.ingest_file`,
+           and `api.repository.PostgresRepository` (decrypt on the two
+           read paths that surface patient info). No new migration
+           needed — migration 0001 generates its schema from
+           `Base.metadata` via `create_all`, and this has never run
+           against a real database, so there was no live schema to
+           migrate away from.
+        2. *Ingestion wrote no claim/finding-level audit entries.* Only a
+           batch-level `remittance_ingested` row existed, so
+           `GET /claims/{id}/access-history` could never show a claim's
+           own ingestion or its findings being created — a real gap
+           against CLAUDE.md rule 5. Fixed in `ingestion/apply.py`:
+           `_apply_claim` now writes a `claim_ingested` audit entry per
+           claim and a `finding_created` entry per finding.
+        One MEDIUM finding fixed opportunistically alongside the above:
+        `db.repository.list_findings_by_payer_claim_control_number`
+        accepted `tenant_id` but never filtered by it — safe today only
+        because every caller runs inside `tenant_session` (RLS-scoped),
+        but a latent global-read footgun for any future caller that
+        didn't. One more MEDIUM fixed: AWS RDS defaults to allowing
+        unencrypted connections (Azure's flexible server does not) —
+        added an explicit `rds.force_ssl` parameter group and
+        `sslmode=require` on the assembled `DATABASE_URL`
+        (`terraform/modules/aws/`). **The remaining 4 MEDIUM and 3 LOW
+        findings were triaged, not silently dropped** — see
+        `docs/SECURITY.md`'s "Phase 10 adversarial review" section for
+        each one and why it's deferred (currency positional validation,
+        unwired rate-limiting/lockout/step-up auth, incomplete reversal
+        netting, an X12 PLB sign-convention question that needs a TR3
+        spec check before touching, undashed-SSN redaction gaps, and a
+        minimum-necessary policy question about `VIEWER`'s PHI access).
+      - New pure tests (verified now, no DB needed, same pure/DB-split
+        discipline as every prior phase):
+        `tests/security/test_kms_env.py`, `tests/security/test_phi_columns.py`.
+        New DB-backed tests (written, will run for real on the first CI
+        push): `tests/db/test_patient_columns_are_encrypted.py` (proves
+        the column holds ciphertext, not plaintext),
+        `tests/ingestion/test_apply_audit_entry.py`'s new
+        claim/finding-audit-entry test, and new assertions in
+        `tests/api/test_endpoints_live_db.py` (decrypted patient name
+        round-trips through the API; claim-ingestion shows up in access
+        history).
+      - Full local gate green: `ruff check .`, `mypy --strict .` (137
+        files), full suite (392 passed, 23 skipped — all DB-backed
+        skips), 100% branch coverage on `domain/variance.py`, eval
+        `GATE PASSED`, `bandit` clean, `pip-audit` clean against this
+        project's actual dependency tree.
 - [ ] Phase 11 — Real data readiness (the compliance gate — no code)
 - [ ] Phase 12 — First customer pilot

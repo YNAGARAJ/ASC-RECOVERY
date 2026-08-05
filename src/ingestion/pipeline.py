@@ -25,6 +25,7 @@ from ingestion.apply import ContractVersionIds, IngestionOutcome, apply_ingestio
 from ingestion.plan import PriorFinding, build_ingestion_plan, payer_key
 from ingestion.virus_scan import VirusScanner
 from observability.metrics import Instruments, noop_instruments, record_ingestion_outcome
+from security.encryption import EnvelopeEncryptor
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +66,18 @@ def ingest_file(
     source: str,
     uploaded_by: str,
     scanner: VirusScanner,
+    encryptor: EnvelopeEncryptor,
     tracer: Tracer | None = None,
     instruments: Instruments | None = None,
 ) -> IngestionOutcome | DuplicateOutcome:
     """Thin tracing/metrics wrapper around `_ingest_file_impl` -- callers
     that don't pass `tracer`/`instruments` (every test written before
     Phase 8) get no-ops at negligible cost, so instrumentation is
-    additive and never a required parameter that breaks them."""
+    additive and never a required parameter that breaks them. `encryptor`
+    is NOT optional/no-op-able the same way: there is no safe "no-op"
+    encryptor, so every caller must supply a real one (see
+    tests/ingestion/conftest.py's `make_test_encryptor` for the test-side
+    default)."""
     resolved_tracer = tracer if tracer is not None else NoOpTracer()
     resolved_instruments = instruments if instruments is not None else noop_instruments()
     started = time.perf_counter()
@@ -87,6 +93,7 @@ def ingest_file(
             source=source,
             uploaded_by=uploaded_by,
             scanner=scanner,
+            encryptor=encryptor,
         )
         latency_ms = (time.perf_counter() - started) * 1000
         if isinstance(outcome, IngestionOutcome):
@@ -113,6 +120,7 @@ def _ingest_file_impl(
     source: str,
     uploaded_by: str,
     scanner: VirusScanner,
+    encryptor: EnvelopeEncryptor,
 ) -> IngestionOutcome | DuplicateOutcome:
     file_hash = hashlib.sha256(content).hexdigest()
 
@@ -184,6 +192,7 @@ def _ingest_file_impl(
         remittance_id=remittance.id,
         actor=uploaded_by,
         contract_version_ids=contract_version_ids_typed,
+        encryptor=encryptor,
     )
 
 

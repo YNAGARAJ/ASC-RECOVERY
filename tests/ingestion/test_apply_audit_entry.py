@@ -14,7 +14,7 @@ from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
 
 
 def test_ingesting_a_file_writes_exactly_one_audit_entry(
@@ -32,6 +32,7 @@ def test_ingesting_a_file_writes_exactly_one_audit_entry(
             source="upload",
             uploaded_by="audit-tester",
             scanner=scanner,
+            encryptor=make_test_encryptor(),
         )
 
     assert isinstance(outcome, IngestionOutcome)
@@ -54,3 +55,61 @@ def test_ingesting_a_file_writes_exactly_one_audit_entry(
     assert entry.actor == "audit-tester"
     assert entry.resource_type == "remittance"
     assert entry.phi_accessed is True
+
+
+def test_ingesting_a_file_also_writes_claim_and_finding_audit_entries(
+    app_session_factory: sessionmaker[Session],
+) -> None:
+    """`GET /claims/{id}/access-history` (Phase 8) reconstructs a claim's
+    history from `audit_log` rows with resource_type "claim"/"finding" --
+    without these, ingestion itself is invisible to that report, even
+    though it's the first (and most PHI-bearing) thing that happens to a
+    claim."""
+    tenant_id = seed_tenant_with_contract(app_session_factory, "Claim audit tenant")
+    content = minimal_valid_835().encode("utf-8")
+    scanner = EicarAwareScanner()
+
+    with tenant_session(app_session_factory, tenant_id) as session:
+        outcome = ingest_file(
+            session,
+            tenant_id,
+            content=content,
+            source="upload",
+            uploaded_by="audit-tester",
+            scanner=scanner,
+            encryptor=make_test_encryptor(),
+        )
+    assert isinstance(outcome, IngestionOutcome)
+    assert outcome.claims_created == 1
+    assert outcome.findings_created == 1
+
+    with tenant_session(app_session_factory, tenant_id) as session:
+        claim_entries = (
+            session.execute(
+                select(AuditLogModel).where(
+                    AuditLogModel.tenant_id == tenant_id,
+                    AuditLogModel.resource_type == "claim",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        finding_entries = (
+            session.execute(
+                select(AuditLogModel).where(
+                    AuditLogModel.tenant_id == tenant_id,
+                    AuditLogModel.resource_type == "finding",
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(claim_entries) == 1
+    assert claim_entries[0].action == "claim_ingested"
+    assert claim_entries[0].actor == "audit-tester"
+    assert claim_entries[0].phi_accessed is True
+
+    assert len(finding_entries) == 1
+    assert finding_entries[0].action == "finding_created"
+    assert finding_entries[0].actor == "audit-tester"

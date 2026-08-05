@@ -401,7 +401,12 @@ def create_claim(
     total_charge: Decimal,
     total_paid_reported: Decimal,
     patient_responsibility: Decimal,
+    patient_name_encrypted: str | None = None,
+    patient_member_id_encrypted: str | None = None,
 ) -> ClaimModel:
+    # Callers pass already-encrypted values (security.phi_columns) -- this
+    # layer only ever persists opaque strings, never plaintext PHI. See
+    # ingestion.apply for the encryption call site.
     claim = ClaimModel(
         tenant_id=tenant_id,
         remittance_id=remittance_id,
@@ -412,6 +417,8 @@ def create_claim(
         total_charge=total_charge,
         total_paid_reported=total_paid_reported,
         patient_responsibility=patient_responsibility,
+        patient_name_encrypted=patient_name_encrypted,
+        patient_member_id_encrypted=patient_member_id_encrypted,
     )
     session.add(claim)
     session.flush()
@@ -531,12 +538,21 @@ def list_findings_by_payer_claim_control_number(
     """Findings belonging to any claim previously ingested under this payer
     claim control number -- used by ingestion to net a reversal (CLP02=22)
     against what it's reversing. Not scoped by remittance_id: a reversal
-    typically arrives in a different file than the original payment."""
+    typically arrives in a different file than the original payment.
+
+    Explicitly filtered by tenant_id (in addition to whatever RLS enforces
+    on the connection) -- this was previously accepted-but-unused, meaning
+    a payer_claim_control_number collision across tenants would leak
+    findings across tenants on any connection where RLS wasn't already
+    doing the job (e.g. a superuser/owner connection)."""
     return list(
         session.execute(
             select(FindingModel)
             .join(ClaimModel, FindingModel.claim_id == ClaimModel.id)
-            .where(ClaimModel.payer_claim_control_number == payer_claim_control_number)
+            .where(
+                ClaimModel.tenant_id == tenant_id,
+                ClaimModel.payer_claim_control_number == payer_claim_control_number,
+            )
         )
         .scalars()
         .all()

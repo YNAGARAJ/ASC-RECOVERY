@@ -12,7 +12,7 @@ from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import malformed_missing_isa
-from tests.ingestion.conftest import seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
 
 
 def test_malformed_file_is_quarantined_with_a_persisted_reason(
@@ -30,6 +30,7 @@ def test_malformed_file_is_quarantined_with_a_persisted_reason(
             source="upload",
             uploaded_by="tester",
             scanner=scanner,
+            encryptor=make_test_encryptor(),
         )
 
     assert isinstance(outcome, IngestionOutcome)

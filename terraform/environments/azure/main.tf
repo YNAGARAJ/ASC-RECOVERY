@@ -34,11 +34,23 @@ variable "container_image" {
   type        = string
 }
 
+variable "environment" {
+  description = <<-EOT
+    Deployment environment name. Paired with a Terraform workspace of the
+    same name (see docs/RUNBOOK.md's CI/CD section) so staging and
+    production get separate state and separate provisioned resources from
+    this one environment directory, instead of duplicating the whole
+    directory per environment.
+  EOT
+  type        = string
+  default     = "production"
+}
+
 module "asc_recovery" {
   source = "../../modules/azure"
 
   project_name    = "asc-recovery"
-  environment     = "production"
+  environment     = var.environment
   region          = var.region
   container_image = var.container_image
 }

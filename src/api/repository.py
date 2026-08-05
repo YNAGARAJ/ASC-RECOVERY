@@ -49,6 +49,8 @@ from packets.drafter import PacketDrafter
 from packets.prompt import PromptInput
 from packets.service import generate_packet_draft
 from packets.templates import PacketTemplate, select_template
+from security.encryption import EnvelopeEncryptor
+from security.phi_columns import decrypt_phi_field
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
 
@@ -381,11 +383,13 @@ class PostgresRepository:
         session_factory: sessionmaker[Session],
         *,
         drafter: PacketDrafter,
+        encryptor: EnvelopeEncryptor,
         tracer: Tracer | None = None,
         instruments: Instruments | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._drafter = drafter
+        self._encryptor = encryptor
         self._tracer = tracer
         self._instruments = instruments
 
@@ -421,6 +425,7 @@ class PostgresRepository:
                 source=source,
                 uploaded_by=uploaded_by,
                 scanner=scanner,
+                encryptor=self._encryptor,
                 tracer=self._tracer,
                 instruments=self._instruments,
             )
@@ -479,8 +484,12 @@ class PostgresRepository:
                 patient_control_number=detail.claim.patient_control_number,
                 payer_claim_control_number=detail.claim.payer_claim_control_number,
                 date_of_service=detail.claim.date_of_service,
-                patient_name=detail.claim.patient_name,
-                patient_member_id=detail.claim.patient_member_id,
+                patient_name=decrypt_phi_field(
+                    self._encryptor, detail.claim.patient_name_encrypted
+                ),
+                patient_member_id=decrypt_phi_field(
+                    self._encryptor, detail.claim.patient_member_id_encrypted
+                ),
                 service_line=service_line,
                 adjustments=adjustments,
             )
@@ -612,8 +621,12 @@ class PostgresRepository:
                 shortfall=str(detail.finding.shortfall),
                 root_cause=detail.finding.root_cause,
                 evidence=detail.finding.evidence,
-                patient_name=detail.claim.patient_name,
-                patient_member_id=detail.claim.patient_member_id,
+                patient_name=decrypt_phi_field(
+                    self._encryptor, detail.claim.patient_name_encrypted
+                ),
+                patient_member_id=decrypt_phi_field(
+                    self._encryptor, detail.claim.patient_member_id_encrypted
+                ),
             )
 
             result = generate_packet_draft(prompt_input, template, self._drafter)

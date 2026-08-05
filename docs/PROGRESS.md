@@ -1,239 +1,275 @@
 # Progress checkpoint
 
 Written for a fresh session with no memory of prior conversation. Repo is
-at a clean commit as of this checkpoint (about to commit "Phase 9: cloud-
-agnostic deployment"). Read `docs/PHASES.md` first for the phase
+at a clean commit as of this checkpoint (about to commit "Phase 10: CI/CD
+and pre-production hardening"). Read `docs/PHASES.md` first for the phase
 checklist — this file adds the texture that isn't in that summary.
 
-## Phase: 9 code-complete. Verification ceiling is lower than every prior phase.
+## Phase: 10 code-complete. The pipeline itself has never actually run.
 
 Phases 0–2 and 4 are fully done. Phases 3, 5, 6, 7, and 8 each have an
-honest local-Postgres gap. **Phase 9 is different in kind, not just
-degree**: its gate ("deploys clean to at least two clouds ... restore
-rehearsed and timed") needs a real Docker install and real, billed
-AWS/Azure accounts — not something achievable with local tooling at all,
-and not something to attempt without explicit go-ahead even if
-credentials existed (a real `terraform apply` is a costly, hard-to-reverse
-action against shared/external infrastructure). The user's own plan is to
-install Docker in a GitHub Codespace and test the full application there
-— that will verify containerization and the composition root for real,
-but not the Terraform/multi-cloud half, which needs a further, separate
-decision about real cloud accounts.
+honest local-Postgres gap; Phase 9 additionally needs real Docker and
+real, billed cloud accounts. **Phase 10 is different from all of them in
+one important way: its own gap closes automatically the moment this gets
+pushed.** `.github/workflows/ci.yml` runs on GitHub-hosted runners, which
+have Docker and can spin up a real Postgres 16 service container —
+something this local environment has never had. Once pushed, CI doesn't
+just verify Phase 10's own new code; it retroactively verifies every
+DB-backed test this whole build has been skipping since Phase 3. That
+first real run might fail — this is genuinely the first time some of this
+code touches a live database — so **do not check Phase 10 off in
+`docs/PHASES.md` until it's actually gone green.**
 
-Current phase per `docs/PHASES.md`: **Phase 9 — Cloud-agnostic
-deployment**, code-complete, application-layer pieces (composition root,
-health endpoints) fully tested, infrastructure-as-code (Dockerfile,
-Terraform) manually reviewed but not tool-verified.
+Current phase per `docs/PHASES.md`: **Phase 10 — CI/CD and pre-production
+hardening**, code-complete, adversarial review done and both HIGH findings
+fixed, pipeline never executed.
 
-## Done (this session, Phase 9)
+## Done (this session, Phase 10)
 
-**The first real gap found**: no production entrypoint existed anywhere.
-`api.app.create_app()` had only ever been called by tests, with a
-`FakeRepository` or a locally-constructed `PostgresRepository` — nothing
-wired a real repository + real LLM drafter + real observability
-exporters from environment variables into something `uvicorn` could
-serve. Building that was this phase's actual first task, not just
-Docker/Terraform packaging around something that already ran.
-
-- **`src/main.py`** — `create_app_from_env()`, the production composition
-  root. Reads `DATABASE_URL`/`JWT_SECRET_KEY`/`ANTHROPIC_API_KEY` via
-  `security.secrets.EnvSecretStore` (Phase 4, unchanged); constructs
-  `PostgresRepository` + `AnthropicPacketDrafter`; wires
-  `observability.setup_tracing`/`setup_metrics` with a console exporter
-  by default or a real OTLP exporter if `OTEL_EXPORTER_OTLP_ENDPOINT` is
-  set (new `opentelemetry-exporter-otlp-proto-http` dependency — real
-  integration code, untested against a live collector, same honest
-  status as every other real-cloud-integration gap this build has
-  named). **No module-level `app = create_app_from_env()`** — the
-  function has zero import-time side effects specifically so
-  `tests/test_main.py` can test both the missing-config and
-  successful-construction paths without import-order fragility; the
-  container instead runs it via uvicorn's ASGI factory mode
-  (`uvicorn main:create_app_from_env --factory`).
-- **`GET /healthz` / `GET /readyz`** (`src/api/routes/health.py`) — kept
-  deliberately separate: `/healthz` never checks a dependency (a
-  container orchestrator should never restart a healthy process just
-  because the DB blipped); `/readyz` calls the new `Repository.ping()`
-  and returns 503 on any failure (a load balancer pulls a not-ready
-  instance from rotation without killing it). Both public, no auth —
-  infra probes don't carry a bearer token. Fully tested
-  (`tests/api/test_health.py`) plus one live-Postgres round-trip
-  (`tests/api/test_endpoints_live_db.py::test_readyz_returns_200_against_real_postgres`).
-- **`PostgresRepository` now threads `tracer`/`instruments` through to
-  `ingestion.pipeline.ingest_file`** — a real wiring gap caught while
-  building the composition root: Phase 8 built the instrumentation but
-  `ingest_remittance` never actually passed it through, so every
-  ingestion via the API was silently using the no-op defaults regardless
-  of what `src/main.py` set up. Both are optional constructor kwargs,
-  defaulting to `None` (no-op), so no existing caller broke.
-- **`pyproject.toml` dependencies split**: `[project].dependencies` now
-  holds everything the running app actually needs at runtime (sqlalchemy,
-  alembic, psycopg, cryptography, pyjwt, pyotp, fastapi, uvicorn,
-  pydantic, python-multipart, anthropic, opentelemetry-*); the `dev`
-  extra is trimmed to lint/test-only tooling (pytest, pytest-cov, ruff,
-  mypy, httpx, openapi-spec-validator). Previously *everything* lived
-  under `dev`, because nothing had a runnable production entrypoint to
-  care about the distinction. This is what lets the Docker image's
-  `pip install .` skip installing pytest/ruff/mypy into production.
-- **`Dockerfile`** — multi-stage (builder installs into a venv, final
-  stage copies only the venv + `src/`/`alembic/`), non-root user (fixed
-  UID/GID, not `adduser --system`, so Terraform/K8s security contexts
-  have a stable value to reference), ASGI factory entrypoint. Base image
-  tag (`python:3.12-slim`) is **not** pinned to a digest — that requires
-  `docker pull`+`docker inspect` against a real registry, unavailable
-  here; a fabricated-looking `sha256:...` would be actively misleading,
-  so the Dockerfile instead comments the exact command to run once
-  Docker exists (the user's planned Codespace).
-- **`docker-compose.yml`** extended (not replaced) with an `app` service
-  — builds from the new Dockerfile, connects as `asc_app` (never
-  `asc_owner`), depends on `postgres` being healthy. Migrations are
-  **not** run automatically on container start (documented as a
-  deliberate anti-pattern once there's more than one replica — see
-  `docs/RUNBOOK.md`).
-- **`terraform/`** — a documented provider-agnostic *contract* (same
-  input variables, same output values), not a shared runtime module
-  (Terraform can't make one resource block conditionally become
-  `aws_db_instance` vs. `azurerm_postgresql_flexible_server` at plan
-  time — separate per-cloud modules satisfying an identical interface is
-  the correct pattern, not a workaround). **AWS and Azure, not three
-  clouds** — the gate says "at least two"; a third GCP module following
-  the same pattern is real future work, but every additional line of
-  unverifiable HCL here carries real risk with no `terraform validate`
-  to catch a mistake. Each module provisions: network (VPC/VNet, private
-  subnets, NAT, security groups — nothing PHI-bearing in a public
-  subnet), Postgres (RDS / Flexible Server, encrypted, private, automated
-  backups), object storage (S3 / Blob Storage, public access blocked at
-  the account/storage-account level, not just per-bucket), secrets
-  (Secrets Manager / Key Vault), KMS (KMS / Key Vault Keys, rotation
-  enabled), container runtime (ECS Fargate + ALB / Container Apps) — every
-  resource type is on that provider's published HIPAA-eligible-services
-  list (`terraform/README.md`'s citation table). **No new Python cloud
-  SDK code** — Terraform provisions the actual KMS key/secrets
-  store/bucket; the app still only ever talks to `EnvSecretStore`/
-  `LocalKMS`, same as every prior phase's real-cloud-adapter deferral.
-- **`docs/RUNBOOK.md`** — deploy, rollback, restore (procedure written;
-  "rehearsed and timed" needs a real database, flagged not faked), key
-  rotation (reuses `EnvelopeEncryptor.rotate_kek()`, Phase 4), incident
-  response, breach notification (60-day clock — process/legal work,
-  Phase 11 scope, not templated here), and zero-downtime migrations
-  (expand/contract — already this repo's practiced pattern; migrations
-  `0002`-`0004` were all additive-only before this was ever written down).
+- **`.github/workflows/ci.yml`** — lint (ruff, mypy --strict, lockfile
+  freshness) -> test (Postgres 16 service container, `init_roles.sql`,
+  `alembic upgrade head`, full `pytest -q`) -> security (bandit,
+  pip-audit, full-history `gitleaks`) -> sbom (CycloneDX artifact) ->
+  container-scan (`docker build` + `trivy`) -> iac-scan (`terraform
+  validate` for both clouds + `tfsec`). Runs on every push/PR to
+  `master`.
+- **`.github/workflows/deploy.yml`** — staging -> smoke test -> OWASP ZAP
+  baseline -> manual approval gate -> production, AWS and Azure as
+  separate job chains, OIDC/federated-credential auth (no static keys
+  stored in GitHub). Every cloud-dependent job guards on
+  `if: secrets.* != ''` so it shows **skipped**, not failed, until real
+  credentials exist. One-time setup (IAM OIDC provider/role, Azure App
+  Registration federated credential, a `production` GitHub Environment
+  with required reviewers) documented in `docs/RUNBOOK.md`'s new "CI/CD
+  pipeline" section.
+- **`.github/workflows/scheduled-security-scan.yml`** — six-monthly cron
+  (bandit/pip-audit/trivy), opens a GitHub issue on new findings. The
+  2026 rule's other requirement, an annual third-party penetration test,
+  is documented as procurement/process work, not faked as a step.
+- **`requirements.lock.txt`** (`make lock`, `pip-compile`) — genuinely
+  generated and verified locally, including confirming it's *stable*
+  under re-compilation (re-running `pip-compile` against its own existing
+  output file introduces zero drift; only a cold resolve to a fresh file
+  does). That distinction matters: it's what makes the CI freshness check
+  (which regenerates in place and diffs) catch real `pyproject.toml`
+  drift instead of false-positiving on every unrelated upstream package
+  release between commits. `Dockerfile`'s builder stage now installs from
+  this lockfile, not `pyproject.toml` directly.
+- **SBOM** (`make sbom`, `cyclonedx-py environment`) — genuinely generated
+  and verified locally. Not committed — an SBOM describes one build's
+  contents, so it's a CI artifact per run, not a static file that would
+  drift from reality.
+- **Adversarial review**: ran the `adversarial-reviewer` subagent across
+  the full `src/` tree, migrations, Terraform, Dockerfile, and the new
+  workflow files, per `docs/MASTER-BUILD-PROMPT.md`'s explicit
+  requirement. Found 2 HIGH, 5 MEDIUM, 3 LOW findings. Both HIGH fixed;
+  one MEDIUM (tenant-filter gap) and one MEDIUM (RDS transit encryption)
+  fixed opportunistically; the remaining 4 MEDIUM/3 LOW triaged and
+  documented rather than dropped — see `docs/SECURITY.md`'s "Phase 10
+  adversarial review" section.
+- **HIGH #1 fixed: PHI columns were never actually encrypted.** The
+  envelope-encryption primitive (`EnvelopeEncryptor`, Phase 4) existed
+  but had zero call sites in any write/read path —
+  `claims.patient_name`/`patient_member_id` were plain `Text` columns.
+  Digging into this surfaced a second, deeper bug in the same area:
+  `ingestion/apply.py` never read `claim.patient` at all when writing a
+  claim row, so these columns were always `NULL` regardless — even
+  though `domain/x835.py` correctly parses the NM1*QC segment into
+  `Claim835.patient` (an `Entity` with `.name`/`.id_code`). The columns
+  weren't just unencrypted; the feature was never wired end to end. Fixed
+  by:
+  - Renaming the columns to `patient_name_encrypted`/
+    `patient_member_id_encrypted` (`db/models.py`) — no new migration
+    needed, since migration `0001` generates its schema from
+    `Base.metadata` via `create_all` and has never run against a real
+    database (no live schema existed to migrate away from).
+  - New `src/security/phi_columns.py` — `encrypt_phi_field`/
+    `decrypt_phi_field`, JSON-serializing an `EncryptedPayload` into the
+    `Text` column.
+  - New `src/security/kms_env.py` (`EnvKMS`) — a real-but-weaker stopgap
+    `KeyManagementService` that derives a static KEK from a secret
+    (`PHI_ENCRYPTION_KEY`, via the existing `SecretStore` port) instead of
+    generating one in-process, so it survives restarts unlike
+    `kms_local.LocalKMS`. Wired into `main.py`. The real cloud KMS
+    adapter (AWS KMS / Azure Key Vault) remains a named, deferred gap —
+    unchanged from before this phase.
+  - Threaded `EnvelopeEncryptor` through `ingestion.apply._apply_claim`
+    (encrypts `claim.patient.name`/`.id_code` before `create_claim`),
+    `ingestion.pipeline.ingest_file` (a required kwarg — deliberately
+    *not* optional-with-a-no-op-default the way `tracer`/`instruments`
+    are, since there's no safe "don't encrypt" default), and
+    `api.repository.PostgresRepository` (decrypts on the two read paths
+    that surface patient info: finding detail, packet prompt
+    construction).
+- **HIGH #2 fixed: ingestion wrote no claim/finding-level audit
+  entries.** Only a batch-level `remittance_ingested` row existed, so
+  `GET /claims/{id}/access-history` (Phase 8) could never show a claim's
+  own ingestion or its findings being created — a real gap against
+  CLAUDE.md rule 5 ("every write to a PHI-bearing table goes through the
+  audit log"). Fixed in `ingestion/apply.py::_apply_claim`: a
+  `claim_ingested` audit entry per claim, a `finding_created` entry per
+  finding (using the DB-generated `FindingModel` rows `save_findings`
+  already returned but the caller previously discarded).
+- **MEDIUM fixed: `list_findings_by_payer_claim_control_number` accepted
+  `tenant_id` but never filtered by it.** Safe today only because every
+  caller runs inside `tenant_session` (RLS-scoped) — a latent global-read
+  footgun for any future caller that didn't (a superuser connection, a
+  batch job). Added the filter.
+- **MEDIUM fixed: AWS RDS defaults to allowing unencrypted DB
+  connections; Azure's flexible server does not.** Added an explicit
+  `aws_db_parameter_group` (`rds.force_ssl = 1`) and `sslmode=require` on
+  the assembled `DATABASE_URL` secret (`terraform/modules/aws/`) so PHI
+  queries can't fall back to plaintext-in-transit on AWS specifically.
+- **Discovered and worked around: `pip-tools` 7.6.0 is incompatible with
+  `pip` 25+.** `pip-tools` imports a private pip API
+  (`pip._internal.utils.compat.stdlib_pkgs`) that pip 25 removed —
+  confirmed locally (pip 24.3.1 works, pip 26.2.1 raises `ImportError`).
+  Pinned `pip<25` scoped to just the CI lockfile-freshness step and noted
+  in the Makefile's `lock` target comment — not a project-wide pin, since
+  nothing else needs it.
+- New pure tests (verified now, no DB needed — same pure/DB-split
+  discipline as every prior phase): `tests/security/test_kms_env.py`,
+  `tests/security/test_phi_columns.py`.
+- New DB-backed tests (written, will get their first real execution on
+  the CI push): `tests/db/test_patient_columns_are_encrypted.py` (proves
+  the column holds ciphertext, not plaintext — not just that decryption
+  round-trips through the app, which could pass even if storage were
+  plaintext-then-relabeled), a new test in
+  `tests/ingestion/test_apply_audit_entry.py` for the claim/finding audit
+  entries, and new assertions in `tests/api/test_endpoints_live_db.py`
+  (decrypted patient name/member id round-trip through the finding-detail
+  endpoint; claim ingestion shows up in access history).
+- Terraform: added a `variable "environment"` (default `"production"`) to
+  both `terraform/environments/{aws,azure}/main.tf` so `deploy.yml` can
+  target a `staging` Terraform workspace from the same environment
+  directory instead of duplicating it — a small, directly-motivated
+  change (the deploy pipeline needs somewhere to deploy that isn't prod).
 
 ## Failing
 
-Nothing. `pytest -q` → **374 passed, 20 skipped** (11 `tests/db/`, 4
-`tests/ingestion/`, 5 `tests/api/test_endpoints_live_db.py` — all honest
-skips, one more than Phase 8's checkpoint for the new `/readyz` live
-test). `mypy --strict .` and `ruff check .` clean across **132 source
-files** (was 128). `python -m evals.run` → 100%/100%/100%/100%,
-unaffected. `bandit -r . -x ./tests,./evals` clean. Branch coverage on
+Nothing. `pytest -q` -> **392 passed, 23 skipped** (11 `tests/db/`
+including the 2 new encryption tests, 5 `tests/ingestion/` including the
+new audit-entry test, 7 `tests/api/test_endpoints_live_db.py` — all
+honest skips, up from Phase 9's 20 because of the new DB-backed tests
+this phase added). `mypy --strict .` and `ruff check .` clean across
+**137 source files** (was 132; new: `security/kms_env.py`,
+`security/phi_columns.py`, plus test files). `python -m evals.run` ->
+100%/100%/100%/100%, unaffected. `bandit -r . -x ./tests,./evals` clean.
+`pip-audit` clean against this project's actual dependency tree (see the
+`pip-tools`/pip pin above for a *tooling* compatibility issue, unrelated
+to any vulnerable runtime dependency). Branch coverage on
 `domain/variance.py` still 100%.
 
-**What could not be run, and why, stated plainly**: `docker build`/`docker
-run` (no Docker in this environment); `terraform fmt`/`validate`/`plan`/
-`apply` (no Terraform CLI, and `apply` additionally needs real cloud
-accounts). In place of that tooling: manual line-by-line review of every
-`.tf` file, plus a brace-balance and quote-balance check across all of
-them (a real check, not theater — it would have caught an unclosed block
-or string, which is the most common class of copy-paste HCL mistake, even
-though it can't catch a wrong resource argument name or type mismatch the
-way `terraform validate` would).
+**What could not be run, and why, stated plainly**: the three new GitHub
+Actions workflows themselves — no way to execute a GitHub Actions
+workflow without GitHub Actions. Manually reviewed for YAML syntax and
+job-dependency correctness, same discipline as every prior phase's
+Terraform review, but that is not the same as a green run. `terraform
+validate`/`tfsec` against the two small HCL changes this phase made (RDS
+parameter group, `environment` variable) — no local Terraform CLI, same
+as Phase 9. `deploy.yml`'s cloud-dependent jobs — no AWS/Azure credentials
+exist to configure, so they'll show `skipped` on the very first run too,
+not just today locally.
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **`create_app_from_env()` has no module-level side effect, on
-  purpose.** A bare `app = create_app_from_env()` at import time is the
-  usual `uvicorn main:app` pattern, but it would mean simply *importing*
-  `main` fails hard if env vars aren't set — awkward for testing both the
-  missing-config and success paths in the same test session. uvicorn's
-  `--factory` flag (`uvicorn main:create_app_from_env --factory`) defers
-  construction to server startup instead of import time; this is a
-  first-class, documented uvicorn feature, not a workaround.
-- **`PostgresRepository.ingest_remittance` never passed `tracer`/
-  `instruments` to `ingest_file`, discovered while building the
-  composition root.** Phase 8 built real instrumentation and wired it
-  into `ingestion.pipeline.ingest_file`'s signature, but the one and only
-  caller inside the API layer never actually passed anything through —
-  so every ingestion via the API silently used the no-op defaults
-  regardless of what got configured upstream. Fixed by threading both
-  through `PostgresRepository.__init__`. Worth checking for the same
-  pattern (a Phase N instrument built but never reaching its Phase N+1
-  caller) if `packets.drafter`'s `Instruments` wiring is ever extended.
-- **FastAPI's `app.routes` doesn't reflect included routers directly in
-  the installed version (0.141.1)** — `_IncludedRouter` wrapper objects
-  show up instead of flattened `APIRoute`s until the app actually
-  serves a request or generates its OpenAPI schema. `tests/test_main.py`
-  checks `app.openapi()["paths"]` instead of walking `app.routes`,
-  matching how `tests/api/test_openapi.py` already did it. If a future
-  test introspects `app.routes` directly and routes seem to have
-  "vanished," this is why — it's a FastAPI-version quirk, not a routing
-  bug.
-- **`pyproject.toml`'s dependency split was overdue, not new scope
-  invented for this phase.** Every dependency added in Phases 6-8
-  (fastapi, anthropic, opentelemetry-*, ...) is something the app
-  actually needs to run, not just to test — but they all went into `dev`
-  because, until `src/main.py` existed, there was no "run" to distinguish
-  from "test." This phase's Dockerfile is what finally made the
-  distinction matter.
-- **Terraform's two secrets-manager-shaped resources per cloud
-  (`app_database_url` + the generic `app` secret for JWT/Anthropic keys)
-  exist because RDS's `manage_master_user_password` only covers the
-  master (`asc_owner`) user.** The `asc_app` runtime role doesn't exist
-  until the migration step creates it (`docs/RUNBOOK.md`), so Terraform
-  generates its password via `random_password` and pre-assembles the
-  full `DATABASE_URL` into its own secret, read back via a
-  `data "aws_secretsmanager_secret_version"` lookup on the master
-  secret to build the connection string. The Azure module does the
-  equivalent with Key Vault. If `scripts/db/init_roles.sql` is ever run
-  against real cloud infrastructure, its hardcoded local-dev password
-  for `asc_app` must be swapped for the Terraform-generated one first —
-  called out explicitly in `docs/RUNBOOK.md`'s step 3.
+- **No new Alembic migration for the `patient_name`/`patient_member_id`
+  column rename.** This looks wrong at first glance (renaming a column
+  usually needs a migration), but migration `0001` builds its schema by
+  calling `Base.metadata.create_all()` against whatever's currently in
+  `db/models.py` — it doesn't hardcode column definitions. Since no real
+  deployment has ever run these migrations (every DB-backed test this
+  whole build has been skip-pattern-avoiding a live Postgres), there was
+  no live schema to migrate away from. The very first real
+  `alembic upgrade head` (in CI) will just create the new column names
+  directly. This reasoning stops being valid the moment any real database
+  actually runs migration `0001` — from that point on, renaming a column
+  needs a real additive migration, per `docs/RUNBOOK.md`'s
+  expand/contract pattern.
+- **`encryptor` is a required parameter on `ingest_file`, not an optional
+  one defaulting to a no-op — deliberately inconsistent with how
+  `tracer`/`instruments` were added in Phase 8.** Tracing/metrics have a
+  safe "do nothing" default (`NoOpTracer`, `noop_instruments()`); there is
+  no safe "don't encrypt PHI" default. Making it required means every
+  caller (production and test) must explicitly supply a real encryptor —
+  a compile-time (well, mypy-time) guarantee against silently
+  reintroducing plaintext storage, rather than a runtime hope.
+  `tests/ingestion/conftest.py::make_test_encryptor()` is the one place
+  that got easier to call instead.
+- **One shared `EnvelopeEncryptor` instance per test file, not a fresh one
+  per call, in `tests/api/test_endpoints_live_db.py`.** `LocalKMS` holds
+  its KEK in memory, scoped to the instance — a fresh
+  `make_test_encryptor()` per `PostgresRepository`/`ingest_file` call
+  would wrap DEKs under unrelated, incompatible KEKs, and decryption
+  would fail across calls. Production has exactly this same shape (one
+  encryptor, constructed once in `main.py`, shared by the whole running
+  process) — the test fixture mirrors it rather than working around it.
+- **`EnvKMS` reads one static KEK from a secret and never rotates it
+  itself.** This is intentionally a stopgap, not a placeholder: it's a
+  real, working AES-256-GCM encryption-at-rest mechanism usable in an
+  actual deployment today (unlike `LocalKMS`, which loses its keys on
+  every restart), but it lacks a real cloud KMS's per-operation access
+  audit trail and automatic rotation. Swapping in AWS KMS/Azure Key Vault
+  later requires zero changes to `EnvelopeEncryptor` or any caller — only
+  a new adapter behind the same `KeyManagementService` Protocol, exactly
+  the port's own docstring promise.
+- **The CI lockfile-freshness check regenerates `requirements.lock.txt`
+  *in place*, not to a separate temp file — this was a real bug caught
+  and fixed during this same session, not a design chosen from the
+  start.** The first version wrote to a fresh temp path; `pip-compile`
+  had no reason to treat that as a "keep existing pins stable" hint, so
+  it did a cold resolve and picked up an unrelated transitive package's
+  patch release (`mako` 1.4.0 -> 1.4.1) that had nothing to do with this
+  repo's own `pyproject.toml`. Confirmed by testing both ways locally.
+  Regenerating in place (using the tracked file itself as the output
+  path, then diffing against a backup) makes `pip-compile` preserve
+  already-pinned versions and only show real drift.
 
 ## Traps for someone resuming cold
 
-- Everything from the Phase 3–8 checkpoints still applies (no
-  project-local virtualenv, CRLF warnings on `git add`, generated/ruff-
-  excluded `evals/golden/cases.py`, SSN-shaped test fixtures assembled at
-  runtime to avoid tripping `block_phi.sh`).
-- **Don't trust the Terraform to be free of mistakes just because brace/
-  quote balance checked out.** That check catches unclosed blocks/strings
-  only — it says nothing about whether `azurerm_container_app`'s `secret`
-  block schema is exactly right, or whether an argument name drifted from
-  the provider version pinned in `versions.tf`. Run `terraform validate`
-  as the very first step once the CLI exists, before trusting any of
-  this against a real account.
-- **`docker-compose.yml`'s `app` service will fail on a truly fresh
-  `docker compose up`** until migrations are run — this is intentional
-  (see `docs/RUNBOOK.md`'s "migrations are never automatic" decision),
-  not a bug to "fix" by adding an entrypoint script that runs Alembic.
-- **`terraform/modules/{aws,azure}` were authored without ever running
-  `terraform fmt`** — expect inconsistent alignment/whitespace in a few
-  spots; purely cosmetic, `terraform fmt` will normalize it instantly
-  once available, don't hand-align it first.
+- Everything from the Phase 3–9 checkpoints still applies (CRLF warnings
+  on `git add`, generated/ruff-excluded `evals/golden/cases.py`,
+  SSN-shaped test fixtures assembled at runtime to avoid tripping
+  `block_phi.sh`, FastAPI's `app.routes` not reflecting included routers
+  directly — check `app.openapi()["paths"]` instead).
+- **If `make lock` fails with
+  `ImportError: cannot import name 'stdlib_pkgs' from 'pip._internal.utils.compat'`**,
+  that's the `pip-tools`/pip 25+ incompatibility above, not a real
+  problem with this repo — `pip install "pip<25"`, run `make lock`, then
+  `pip install --upgrade pip` to restore. Don't "fix" it by pinning pip
+  project-wide; it's a local dev-tooling issue, not a production one (the
+  Dockerfile's builder stage always upgrades pip itself before installing
+  from the lockfile).
+- **Don't add a `sbom.json` to git even though `make sbom` creates one
+  locally** — it's `.gitignore`d deliberately-not-yet (check before
+  committing); an SBOM is a per-build artifact, not source.
+- **The first real CI run might fail, and that's expected, not a
+  regression to panic about.** Every DB-backed test this whole build has
+  written has been running against a skip-pattern, never real Postgres.
+  If something fails, fix it as a normal follow-up commit and re-run —
+  don't revert the CI workflow itself to make the red go away.
+- **`deploy.yml`'s cloud jobs will show `skipped`, not `success`, on the
+  very first run** — that's correct until the one-time OIDC/federated-
+  credential setup in `docs/RUNBOOK.md` happens. Skipped is not broken.
 
 ## Next 3 steps
 
-1. **In the Codespace**: install Docker, run `docker compose up -d`,
-   then `docker compose run --rm app alembic upgrade head` (or equivalent
-   — see `docs/RUNBOOK.md`), then exercise `/healthz`, `/readyz`, and a
-   real upload-through-packet-approval flow against the running stack.
-   If that all works, the Docker/composition-root half of Phase 9 is
-   genuinely verified — update `docs/PHASES.md` to say so specifically
-   (not "Phase 9 done," since Terraform is a separate, still-open half).
-2. **Separately, if/when real AWS and Azure accounts become available**:
-   run `terraform validate` first (catches real mistakes this session's
-   brace-balance check can't), then `plan`, then — only with explicit
-   sign-off, since `apply` is billed and not trivially reversible —
-   `apply` against a disposable sandbox account before anything that
-   matters. Rehearse and time a restore per `docs/RUNBOOK.md` before
-   checking off the phase's actual gate.
-3. **Otherwise, start Phase 10 (CI/CD and pre-production hardening)** per
-   `docs/MASTER-BUILD-PROMPT.md`: pipeline (lint -> type check -> unit ->
-   integration -> eval -> security scan -> container scan -> IaC scan ->
-   staging -> smoke test -> manual gate -> production), SBOM generation,
-   full-history secret scanning, and running the `adversarial-reviewer`
-   subagent across the whole codebase with a fix-everything-HIGH-or-above
-   requirement — a good fit for whenever Phase 9's Docker/Terraform
-   verification is still pending, since CI/CD pipeline *design* doesn't
-   itself require the infrastructure to exist yet. Enter plan mode first,
-   same as every prior phase.
+1. **Push this branch and watch `ci.yml` run for real.** This is the
+   actual gate for Phase 10 — if it goes green (including every
+   previously-skipped DB-backed test), update `docs/PHASES.md` to check
+   the phase off with that confirmation. If something fails, it's almost
+   certainly a genuine bug this session's skip-pattern testing couldn't
+   have caught — fix it, don't paper over it.
+2. **Once CI is green**: per the user's stated plan, do a full code audit
+   of the repository, then move to deploying in a GitHub Codespace
+   (install Docker there, exercise the full application) — this is the
+   Phase 9 Docker verification that's been deferred through Phases 9 and
+   10, now with a green CI pipeline backing it up.
+3. **Separately, whenever real AWS/Azure accounts become available**:
+   follow `docs/RUNBOOK.md`'s new CI/CD section to set up OIDC/federated
+   credentials and a `production` GitHub Environment with required
+   reviewers, so `deploy.yml`'s staging/production jobs go from `skipped`
+   to actually running. Then Phase 9's original Terraform
+   `validate`/`plan`/`apply`-against-a-real-account-with-a-timed-restore
+   gate is finally reachable, now through a reviewed pipeline instead of
+   a manual `terraform apply`.

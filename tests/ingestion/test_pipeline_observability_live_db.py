@@ -18,7 +18,7 @@ from ingestion.virus_scan import EicarAwareScanner
 from observability.metrics import setup_metrics
 from observability.tracing import setup_tracing
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
 
 
 def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
@@ -38,6 +38,7 @@ def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
             source="upload",
             uploaded_by="observability-tester",
             scanner=EicarAwareScanner(),
+            encryptor=make_test_encryptor(),
             tracer=tracer,
             instruments=instruments,
         )

@@ -21,6 +21,8 @@ from db import repository
 from domain.contract import ContractVersion
 from domain.variance import Finding
 from ingestion.plan import ClaimIngestionPlan, FileIngestionPlan
+from security.encryption import EnvelopeEncryptor
+from security.phi_columns import encrypt_phi_field
 
 ContractVersionIds = Mapping[tuple[str, date], uuid.UUID]
 
@@ -49,6 +51,9 @@ def _apply_claim(
     remittance_id: uuid.UUID,
     claim_plan: ClaimIngestionPlan,
     contract_version_ids: ContractVersionIds,
+    *,
+    actor: str,
+    encryptor: EnvelopeEncryptor,
 ) -> Sequence[Finding]:
     claim = claim_plan.claim
     if claim_plan.date_of_service is None:
@@ -73,6 +78,21 @@ def _apply_claim(
         total_charge=claim.total_charge.as_decimal(),
         total_paid_reported=claim.total_paid_reported.as_decimal(),
         patient_responsibility=claim.patient_responsibility.as_decimal(),
+        patient_name_encrypted=encrypt_phi_field(
+            encryptor, claim.patient.name if claim.patient is not None else None
+        ),
+        patient_member_id_encrypted=encrypt_phi_field(
+            encryptor, claim.patient.id_code if claim.patient is not None else None
+        ),
+    )
+    repository.write_audit_log(
+        session,
+        tenant_id,
+        actor=actor,
+        action="claim_ingested",
+        resource_type="claim",
+        resource_id=str(claim_row.id),
+        phi_accessed=True,
     )
 
     service_line_ids: dict[int, uuid.UUID] = {}
@@ -118,7 +138,7 @@ def _apply_claim(
     # than raising -- one malformed correlation must not fail the batch.
     persistable = tuple(f for f in claim_plan.findings if f.line_index in service_line_ids)
     if persistable:
-        repository.save_findings(
+        finding_rows = repository.save_findings(
             session,
             tenant_id,
             claim_row.id,
@@ -126,6 +146,16 @@ def _apply_claim(
             _resolve_contract_version_id(claim_plan.contract_version, contract_version_ids),
             persistable,
         )
+        for finding_row in finding_rows:
+            repository.write_audit_log(
+                session,
+                tenant_id,
+                actor=actor,
+                action="finding_created",
+                resource_type="finding",
+                resource_id=str(finding_row.id),
+                phi_accessed=False,
+            )
     return persistable
 
 
@@ -137,6 +167,7 @@ def apply_ingestion_plan(
     remittance_id: uuid.UUID,
     actor: str,
     contract_version_ids: ContractVersionIds,
+    encryptor: EnvelopeEncryptor,
 ) -> IngestionOutcome:
     if plan.quarantine_reason is not None:
         repository.update_remittance_status(
@@ -176,7 +207,13 @@ def apply_ingestion_plan(
             if claim_plan.skip_reason is not None:
                 continue
             persisted_findings = _apply_claim(
-                session, tenant_id, remittance_id, claim_plan, contract_version_ids
+                session,
+                tenant_id,
+                remittance_id,
+                claim_plan,
+                contract_version_ids,
+                actor=actor,
+                encryptor=encryptor,
             )
             findings_created += len(persisted_findings)
             dollars_detected += sum(

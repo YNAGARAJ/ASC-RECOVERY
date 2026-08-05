@@ -43,6 +43,8 @@ from db.base import make_engine, make_session_factory
 from observability.metrics import setup_metrics
 from observability.tracing import setup_tracing
 from packets.drafter import AnthropicPacketDrafter
+from security.encryption import EnvelopeEncryptor
+from security.kms_env import EnvKMS
 from security.secrets import EnvSecretStore, SecretNotFoundError
 
 
@@ -81,6 +83,7 @@ def create_app_from_env() -> FastAPI:
     database_url = _require(secrets, "DATABASE_URL")
     jwt_secret_key = _require(secrets, "JWT_SECRET_KEY")
     anthropic_api_key = _require(secrets, "ANTHROPIC_API_KEY")
+    _require(secrets, "PHI_ENCRYPTION_KEY")  # validated eagerly by EnvKMS below
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
 
     setup_tracing(_span_exporter(otlp_endpoint))
@@ -90,6 +93,11 @@ def create_app_from_env() -> FastAPI:
 
     session_factory = make_session_factory(make_engine(database_url))
     drafter = AnthropicPacketDrafter(anthropic_api_key, instruments=instruments)
-    repository = PostgresRepository(session_factory, drafter=drafter)
+    # EnvKMS is a stopgap KEK store (see security/kms_env.py's docstring) --
+    # a real cloud KMS adapter behind the same KeyManagementService port is
+    # a named, deferred gap (docs/SECURITY.md), not yet built for lack of a
+    # real cloud account to build it against.
+    encryptor = EnvelopeEncryptor(EnvKMS(secrets))
+    repository = PostgresRepository(session_factory, drafter=drafter, encryptor=encryptor)
 
     return create_app(repository=repository, jwt_secret_key=jwt_secret_key)

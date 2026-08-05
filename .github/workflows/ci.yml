@@ -1,0 +1,180 @@
+# Phase 10: the pipeline that finally gives this build real, automated
+# verification of things every prior phase could only write and hope --
+# GitHub-hosted runners have Docker and can run a real Postgres service
+# container, so `test` below runs every DB-backed test this repo has
+# (tests/db/, tests/ingestion/, tests/api/test_endpoints_live_db.py) that
+# has been skipping locally since Phase 3 for lack of a live database.
+#
+# Deploy/staging/production/DAST stages live in deploy.yml, not here --
+# keeps every PR's feedback (lint/test/security/scans) fast and
+# independent of cloud credentials this pipeline may not have yet.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: mypy --strict .
+      - name: Verify requirements.lock.txt is up to date
+        run: |
+          # pip-tools 7.6.0 reaches into pip's private internals
+          # (pip._internal.utils.compat.stdlib_pkgs) and breaks under pip
+          # 25+, which removed it -- pinning pip here, not upgrading it, is
+          # the fix (confirmed locally: pip 24.3.1 works, pip 26.2.1 raises
+          # ImportError). Revisit this pin once pip-tools ships a fix.
+          pip install "pip<25"
+          # pip-compile treats an existing --output-file as a hint and keeps
+          # already-pinned versions stable unless pyproject.toml's own
+          # constraints force a change -- regenerating in place (not to a
+          # fresh temp file) is what makes this catch real drift (someone
+          # edited pyproject.toml without running `make lock`) instead of
+          # false-positiving on every unrelated transitive package release
+          # between "lockfile committed" and "CI runs".
+          cp requirements.lock.txt requirements.lock.txt.orig
+          pip-compile pyproject.toml --output-file=requirements.lock.txt --strip-extras
+          diff requirements.lock.txt.orig requirements.lock.txt
+
+  # Centerpiece of this phase: a real Postgres 16, set up exactly the way
+  # docs/DB_SETUP.md documents for local dev (asc_owner runs migrations,
+  # asc_app -- non-superuser, no BYPASSRLS -- runs the test suite), so the
+  # RLS tenant-isolation gate, idempotent-remittance, effective-dated
+  # pricing, audit-log append-only, packet approve round-trip, and
+  # claim-access-history tests all get their first real execution here.
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: asc_recovery
+          POSTGRES_USER: asc_owner
+          POSTGRES_PASSWORD: asc_owner_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U asc_owner -d asc_recovery"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: asc_owner
+      PGPASSWORD: asc_owner_dev_password
+      PGDATABASE: asc_recovery
+      DATABASE_URL: postgresql+psycopg://asc_owner:asc_owner_dev_password@localhost:5432/asc_recovery
+      TEST_DATABASE_URL: postgresql+psycopg://asc_app:asc_app_dev_password@localhost:5432/asc_recovery
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -e ".[dev]"
+      - name: Install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Create asc_app runtime role
+        run: psql -f scripts/db/init_roles.sql
+      - name: Run migrations as asc_owner
+        run: alembic upgrade head
+      - name: Full test suite, including every live-Postgres test
+        run: |
+          pytest -q
+          pytest --cov=src/domain --cov-branch --cov-report=term-missing -q
+          coverage report --include="*/domain/variance.py" --fail-under=100 --show-missing
+      - name: Golden-dataset eval
+        run: python -m evals.run
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, so gitleaks below scans every commit, not just HEAD
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -e ".[dev]"
+      - name: bandit
+        run: bandit -r . -x ./tests,./evals
+      - name: pip-audit
+        run: pip-audit
+      - name: Install gitleaks
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+      - name: Full-history secret scan
+        run: gitleaks detect --no-banner
+
+  sbom:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -e ".[dev]"
+      - run: make sbom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+          retention-days: 90
+
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t asc-recovery:ci .
+      - name: Scan image for known vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: asc-recovery:ci
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+  iac-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform validate (aws)
+        working-directory: terraform/environments/aws
+        run: |
+          terraform init -backend=false
+          terraform validate
+      - name: terraform validate (azure)
+        working-directory: terraform/environments/azure
+        run: |
+          terraform init -backend=false
+          terraform validate
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform

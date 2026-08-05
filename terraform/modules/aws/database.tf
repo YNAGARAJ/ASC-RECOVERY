@@ -16,11 +16,31 @@ resource "aws_db_subnet_group" "main" {
   })
 }
 
+# RDS defaults to allowing unencrypted connections (unlike Azure's flexible
+# server, which enforces TLS by default) -- storage_encrypted below only
+# covers data at rest, not PHI-bearing queries in flight over the VPC.
+# Explicit here so the two clouds are actually equivalent, not just both
+# "encrypted at rest."
+resource "aws_db_parameter_group" "main" {
+  name   = "${local.name_prefix}-postgres16"
+  family = "postgres16"
+
+  parameter {
+    name  = "rds.force_ssl"
+    value = "1"
+  }
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-postgres16-params"
+  })
+}
+
 resource "aws_db_instance" "main" {
   identifier     = "${local.name_prefix}-postgres"
   engine         = "postgres"
   engine_version = "16"
   instance_class = var.db_instance_class
+  parameter_group_name = aws_db_parameter_group.main.name
 
   allocated_storage     = var.db_allocated_storage_gb
   max_allocated_storage = var.db_allocated_storage_gb * 4

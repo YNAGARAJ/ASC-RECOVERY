@@ -14,7 +14,7 @@ from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
 
 
 def test_ingesting_the_same_file_three_times_creates_no_duplicates(
@@ -35,6 +35,7 @@ def test_ingesting_the_same_file_three_times_creates_no_duplicates(
                     source="upload",
                     uploaded_by="tester",
                     scanner=scanner,
+                    encryptor=make_test_encryptor(),
                 )
             )
 

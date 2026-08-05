@@ -194,10 +194,12 @@ class Claim(Base):
     total_charge: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     total_paid_reported: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     patient_responsibility: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    # PHI, stored plain for now -- application-level column encryption is
-    # Phase 4 scope (docs/MASTER-BUILD-PROMPT.md). Not yet safe for real PHI.
-    patient_name: Mapped[str | None] = mapped_column(Text, nullable=True)
-    patient_member_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # AES-256-GCM envelope-encrypted (security.encryption.EnvelopeEncryptor)
+    # before this column is ever written -- see security.phi_columns for the
+    # JSON serialization format and ingestion.apply for the write path.
+    # Never store patient name/member id in plaintext here.
+    patient_name_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    patient_member_id_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

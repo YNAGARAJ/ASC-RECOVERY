@@ -19,14 +19,20 @@ FROM python:3.12-slim AS builder
 WORKDIR /build
 
 # Only copy what's needed to resolve dependencies first, so Docker's
-# layer cache isn't invalidated by every source-code change.
+# layer cache isn't invalidated by every source-code change. Dependencies
+# install from the pinned lockfile (requirements.lock.txt, generated via
+# `make lock` -- see that target's comment in the Makefile), not directly
+# from pyproject.toml's version ranges, so a build today and a build in a
+# year install byte-for-byte the same versions.
+COPY requirements.lock.txt ./
 COPY pyproject.toml ./
 COPY src/ ./src/
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir .
+ && pip install --no-cache-dir -r requirements.lock.txt \
+ && pip install --no-cache-dir --no-deps .
 
 FROM python:3.12-slim AS final
 

@@ -1,0 +1,221 @@
+# Phase 10: staging -> smoke test -> DAST -> manual gate -> production.
+# Deliberately separate from ci.yml so PR feedback stays fast and doesn't
+# depend on cloud credentials.
+#
+# Every cloud-dependent job below is guarded by `if: secrets.* != ''` so it
+# shows as SKIPPED, not failed, until real AWS/Azure credentials exist as
+# repo secrets -- an honest status for infrastructure this build has never
+# had a real account to provision against. See docs/RUNBOOK.md for the
+# one-time OIDC setup that turns these from skipped to real.
+#
+# Auth is OIDC role assumption (AWS) / federated credentials (Azure), never
+# long-lived static keys stored in GitHub -- see docs/RUNBOOK.md.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: "Which cloud to deploy to"
+        required: true
+        default: aws
+        type: choice
+        options: [aws, azure]
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC / federated credential auth below
+
+jobs:
+  # ---------------------------------------------------------------- AWS ---
+  deploy-staging-aws:
+    if: >-
+      secrets.AWS_DEPLOY_ROLE_ARN != '' &&
+      (github.event_name == 'workflow_dispatch' && inputs.cloud == 'aws' ||
+       github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      app_url: ${{ steps.tf-output.outputs.app_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      - name: Build, tag, and push image to ECR
+        env:
+          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REPOSITORY"
+          docker build -t "$ECR_REPOSITORY:${{ github.sha }}" .
+          docker push "$ECR_REPOSITORY:${{ github.sha }}"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform apply (staging workspace)
+        id: tf-output
+        working-directory: terraform/environments/aws
+        env:
+          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+        run: |
+          terraform init
+          terraform workspace select -or-create staging
+          terraform apply -auto-approve \
+            -var="environment=staging" \
+            -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}"
+          echo "app_url=$(terraform output -raw container_service_endpoint)" >> "$GITHUB_OUTPUT"
+
+  smoke-test-staging-aws:
+    needs: deploy-staging-aws
+    if: needs.deploy-staging-aws.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for /healthz and /readyz
+        run: |
+          url="${{ needs.deploy-staging-aws.outputs.app_url }}"
+          for i in $(seq 1 30); do
+            if curl -sf "$url/healthz" && curl -sf "$url/readyz"; then
+              echo "Staging is healthy and ready."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Staging never became healthy/ready within 5 minutes."
+          exit 1
+
+  dast-staging-aws:
+    needs: [deploy-staging-aws, smoke-test-staging-aws]
+    runs-on: ubuntu-latest
+    steps:
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: ${{ needs.deploy-staging-aws.outputs.app_url }}
+          # Baseline scan is passive-only (no active attack payloads against
+          # a system holding PHI-shaped synthetic data) -- appropriate for
+          # an automated pipeline stage; a real, authorized active DAST/pen
+          # test is Phase 11 process work, not something to script here.
+          cmd_options: "-a"
+
+  deploy-production-aws:
+    needs: dast-staging-aws
+    runs-on: ubuntu-latest
+    environment: production # requires a "required reviewers" rule configured
+    # in this repo's Settings -> Environments -> production for the manual
+    # gate to actually pause here -- see docs/RUNBOOK.md.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform apply (production workspace)
+        working-directory: terraform/environments/aws
+        env:
+          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+        run: |
+          terraform init
+          terraform workspace select -or-create production
+          terraform apply -auto-approve \
+            -var="environment=production" \
+            -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}"
+
+  # -------------------------------------------------------------- Azure ---
+  deploy-staging-azure:
+    if: >-
+      secrets.AZURE_CLIENT_ID != '' &&
+      github.event_name == 'workflow_dispatch' && inputs.cloud == 'azure'
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      app_url: ${{ steps.tf-output.outputs.app_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Build, tag, and push image to ACR
+        env:
+          ACR_REGISTRY: ${{ secrets.AZURE_ACR_REGISTRY }}
+        run: |
+          az acr login --name "${ACR_REGISTRY%%.*}"
+          docker build -t "$ACR_REGISTRY/asc-recovery:${{ github.sha }}" .
+          docker push "$ACR_REGISTRY/asc-recovery:${{ github.sha }}"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform apply (staging workspace)
+        id: tf-output
+        working-directory: terraform/environments/azure
+        env:
+          ACR_REGISTRY: ${{ secrets.AZURE_ACR_REGISTRY }}
+        run: |
+          terraform init
+          terraform workspace select -or-create staging
+          terraform apply -auto-approve \
+            -var="environment=staging" \
+            -var="container_image=${ACR_REGISTRY}/asc-recovery:${{ github.sha }}"
+          echo "app_url=$(terraform output -raw container_service_endpoint)" >> "$GITHUB_OUTPUT"
+
+  smoke-test-staging-azure:
+    needs: deploy-staging-azure
+    if: needs.deploy-staging-azure.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for /healthz and /readyz
+        run: |
+          url="${{ needs.deploy-staging-azure.outputs.app_url }}"
+          for i in $(seq 1 30); do
+            if curl -sf "$url/healthz" && curl -sf "$url/readyz"; then
+              echo "Staging is healthy and ready."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Staging never became healthy/ready within 5 minutes."
+          exit 1
+
+  dast-staging-azure:
+    needs: [deploy-staging-azure, smoke-test-staging-azure]
+    runs-on: ubuntu-latest
+    steps:
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: ${{ needs.deploy-staging-azure.outputs.app_url }}
+          cmd_options: "-a"
+
+  deploy-production-azure:
+    needs: dast-staging-azure
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform apply (production workspace)
+        working-directory: terraform/environments/azure
+        env:
+          ACR_REGISTRY: ${{ secrets.AZURE_ACR_REGISTRY }}
+        run: |
+          terraform init
+          terraform workspace select -or-create production
+          terraform apply -auto-approve \
+            -var="environment=production" \
+            -var="container_image=${ACR_REGISTRY}/asc-recovery:${{ github.sha }}"

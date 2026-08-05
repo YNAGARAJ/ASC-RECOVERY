@@ -37,10 +37,18 @@ from packets.prompt import (
 from security.rbac import Role
 from security.session import issue_session
 from tests.domain.fixtures_x835 import minimal_valid_835
+from tests.ingestion.conftest import make_test_encryptor
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 JWT_SECRET = "test-only-secret-never-use-in-production"
+
+# One shared encryptor for this whole file -- ingestion (writing, in
+# _seed_tenant) and every PostgresRepository built below (reading) must use
+# the same KEK, exactly like production uses one encryptor app-wide. A
+# fresh make_test_encryptor() per call would wrap DEKs under a different,
+# unrelated in-memory KEK each time, and decryption would fail.
+_TEST_ENCRYPTOR = make_test_encryptor()
 
 
 def _require_database_url() -> None:
@@ -83,6 +91,7 @@ def _seed_tenant(session_factory: sessionmaker[Session], label: str) -> tuple[uu
             source="upload",
             uploaded_by=subject,
             scanner=EicarAwareScanner(),
+            encryptor=_TEST_ENCRYPTOR,
         )
         assert outcome.status == "ingested"  # type: ignore[union-attr]
 
@@ -91,7 +100,9 @@ def _seed_tenant(session_factory: sessionmaker[Session], label: str) -> tuple[uu
 
 @pytest.fixture
 def live_client(app_session_factory: sessionmaker[Session]) -> TestClient:
-    repository = PostgresRepository(app_session_factory, drafter=ScriptedPacketDrafter([]))
+    repository = PostgresRepository(
+        app_session_factory, drafter=ScriptedPacketDrafter([]), encryptor=_TEST_ENCRYPTOR
+    )
     app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
     return TestClient(app)
 
@@ -157,7 +168,9 @@ def test_generate_and_approve_packet_round_trip_against_real_postgres(
     audit trail."""
     tenant_id, subject = _seed_tenant(app_session_factory, "packet-a")
     repository = PostgresRepository(
-        app_session_factory, drafter=ScriptedPacketDrafter([_VALID_SCRIPTED_DRAFT])
+        app_session_factory,
+        drafter=ScriptedPacketDrafter([_VALID_SCRIPTED_DRAFT]),
+        encryptor=_TEST_ENCRYPTOR,
     )
     app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
     client = TestClient(app)
@@ -194,7 +207,9 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     phi_access_log entry; this proves it's actually queryable back out
     through the auditor-facing endpoint, against real Postgres."""
     _, subject = _seed_tenant(app_session_factory, "access-history-a")
-    repository = PostgresRepository(app_session_factory, drafter=ScriptedPacketDrafter([]))
+    repository = PostgresRepository(
+        app_session_factory, drafter=ScriptedPacketDrafter([]), encryptor=_TEST_ENCRYPTOR
+    )
     app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
     client = TestClient(app)
 
@@ -204,6 +219,12 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     detail = client.get(f"/findings/{finding_id}", headers=_auth_headers(subject))
     assert detail.status_code == 200
     claim_id = detail.json()["finding"]["claim_id"]
+    # Phase 10: patient_name/patient_member_id round-trip through
+    # EnvelopeEncryptor -- the DB column never holds this plaintext (see
+    # tests/db/test_patient_columns_are_encrypted.py for the "never
+    # plaintext on disk" half of this proof).
+    assert detail.json()["patient_name"] == "PATIENT ONE"
+    assert detail.json()["patient_member_id"] == "TESTMBR000001"
 
     history = client.get(
         f"/claims/{claim_id}/access-history", headers=_auth_headers_as(subject, Role.ADMIN)
@@ -214,6 +235,10 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
         event["action"] == "finding_detail_view" and event["actor"] == subject
         for event in events
     )
+    # Phase 10: ingestion itself (not just later views) is now part of a
+    # claim's access history.
+    assert any(event["action"] == "claim_ingested" for event in events)
+    assert any(event["action"] == "finding_created" for event in events)
 
 
 def test_readyz_returns_200_against_real_postgres(live_client: TestClient) -> None:

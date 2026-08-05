@@ -63,5 +63,8 @@ resource "aws_secretsmanager_secret" "app_database_url" {
 
 resource "aws_secretsmanager_secret_version" "app_database_url" {
   secret_id = aws_secretsmanager_secret.app_database_url.id
-  secret_string = "postgresql+psycopg://asc_app:${random_password.app_db.result}@${aws_db_instance.main.address}:5432/asc_recovery"
+  # sslmode=require pairs with aws_db_parameter_group.main's rds.force_ssl=1
+  # (database.tf) -- the parameter group refuses the plaintext connection
+  # server-side, this makes sure the app never even offers one.
+  secret_string = "postgresql+psycopg://asc_app:${random_password.app_db.result}@${aws_db_instance.main.address}:5432/asc_recovery?sslmode=require"
 }

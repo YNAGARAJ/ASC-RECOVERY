@@ -17,9 +17,21 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository
 from db.base import make_engine, make_session_factory
+from security.encryption import EnvelopeEncryptor
+from security.kms_local import LocalKMS
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+
+
+def make_test_encryptor() -> EnvelopeEncryptor:
+    """A fresh EnvelopeEncryptor backed by an in-memory LocalKMS -- ingestion
+    tests only need patient PHI to actually get encrypted before ingestion
+    writes it; key persistence/rotation is tests/security/test_encryption.py's
+    job, not this one."""
+    kms = LocalKMS()
+    kms.generate_kek("test-kek")
+    return EnvelopeEncryptor(kms)
 
 
 def _require_database_url() -> None:

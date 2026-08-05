@@ -36,6 +36,12 @@ services:
       DATABASE_URL: "postgresql+psycopg://asc_app:asc_app_dev_password@postgres:5432/asc_recovery"
       JWT_SECRET_KEY: "local-dev-jwt-secret-never-use-in-production"
       ANTHROPIC_API_KEY: "replace-with-a-real-key-to-exercise-packet-generation"
+      # base64 of 32 zero bytes -- fine for local-only, same "never reused
+      # anywhere real" status as the other dev values above. A real
+      # deployment gets this from Secrets Manager/Key Vault (see
+      # security/kms_env.py and docs/RUNBOOK.md), generated with
+      # `openssl rand -base64 32`, never a fixed value like this one.
+      PHI_ENCRYPTION_KEY: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
     depends_on:
       postgres:
         condition: service_healthy
