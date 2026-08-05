@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository
 from db.base import make_engine, make_session_factory
+from db.tenancy import tenant_session
 from security.encryption import EnvelopeEncryptor
 from security.kms_local import LocalKMS
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
@@ -55,11 +56,23 @@ def seed_tenant_with_contract(
 ) -> uuid.UUID:
     """A tenant plus one open-ended fee-schedule contract for TEST_PAYER,
     covering 99213/99214 -- enough for the fixtures in
-    tests/domain/fixtures_x835.py to price against."""
+    tests/domain/fixtures_x835.py to price against.
+
+    `tenants` has no RLS (ungated, like `users`), so creating it needs no
+    tenant context -- but `contracts` does, so creating *that* outside
+    `tenant_session` fails against a real Postgres with "unrecognized
+    configuration parameter app.tenant_id" the moment its RLS policy's
+    WITH CHECK clause tries to read a setting nothing ever SET. Matches
+    the pattern tests/api/test_endpoints_live_db.py's `_seed_tenant`
+    already uses correctly."""
     with session_factory() as session, session.begin():
         tenant = repository.create_tenant(session, f"{label} {uuid.uuid4()}")
-        contract = repository.create_contract(session, tenant.id, TEST_PAYER, "Test Contract")
+        tenant_id = tenant.id
+
+    with tenant_session(session_factory, tenant_id) as session:
+        contract = repository.create_contract(session, tenant_id, TEST_PAYER, "Test Contract")
         repository.create_contract_version(
-            session, tenant.id, contract.id, make_contract_version()
+            session, tenant_id, contract.id, make_contract_version()
         )
-        return tenant.id
+
+    return tenant_id
