@@ -16,5 +16,29 @@ services:
       timeout: 5s
       retries: 20
 
+  # Phase 9: the app itself, built from the repo's Dockerfile. Connects
+  # as `asc_app` (the non-owner runtime role, per docs/DB_SETUP.md), never
+  # `asc_owner` -- this container has no DDL privileges. Migrations are a
+  # separate, explicit step (see docs/RUNBOOK.md) -- deliberately not run
+  # automatically on container start; `docker compose up` alone will
+  # leave the schema unmigrated the first time.
+  #
+  # JWT_SECRET_KEY / ANTHROPIC_API_KEY below are placeholder dev values,
+  # same "fine for local-only, never reused anywhere real" status as
+  # postgres's fixed dev passwords above (see docs/PROGRESS.md's Phase
+  # 3/4 notes) -- replace ANTHROPIC_API_KEY with a real key to actually
+  # exercise packet generation locally.
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql+psycopg://asc_app:asc_app_dev_password@postgres:5432/asc_recovery"
+      JWT_SECRET_KEY: "local-dev-jwt-secret-never-use-in-production"
+      ANTHROPIC_API_KEY: "replace-with-a-real-key-to-exercise-packet-generation"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   asc_pg_data:

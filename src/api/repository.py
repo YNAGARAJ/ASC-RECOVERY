@@ -20,6 +20,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Protocol
 
+from opentelemetry.trace import Tracer
+from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository as db_repository
@@ -42,6 +44,7 @@ from domain.money import Money, Rate
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.virus_scan import VirusScanner
+from observability.metrics import Instruments
 from packets.drafter import PacketDrafter
 from packets.prompt import PromptInput
 from packets.service import generate_packet_draft
@@ -259,6 +262,8 @@ def _rule_input_to_contract_version(data: ContractVersionInput) -> ContractVersi
 
 
 class Repository(Protocol):
+    def ping(self) -> bool: ...
+
     def get_user_by_subject(self, subject: str) -> UserRecord | None: ...
 
     def ingest_remittance(
@@ -371,9 +376,26 @@ class PostgresRepository:
     caller-supplied tenant_id (never a client-supplied one -- see
     api/auth.py)."""
 
-    def __init__(self, session_factory: sessionmaker[Session], *, drafter: PacketDrafter) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        *,
+        drafter: PacketDrafter,
+        tracer: Tracer | None = None,
+        instruments: Instruments | None = None,
+    ) -> None:
         self._session_factory = session_factory
         self._drafter = drafter
+        self._tracer = tracer
+        self._instruments = instruments
+
+    def ping(self) -> bool:
+        """For GET /readyz -- no tenant context needed, just proves the
+        DB is reachable. Any exception here means "not ready", not a
+        crash: callers catch and translate to a 503."""
+        with self._session_factory() as session:
+            session.execute(text("SELECT 1"))
+        return True
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None:
         with self._session_factory() as session:
@@ -399,6 +421,8 @@ class PostgresRepository:
                 source=source,
                 uploaded_by=uploaded_by,
                 scanner=scanner,
+                tracer=self._tracer,
+                instruments=self._instruments,
             )
 
     def list_findings(

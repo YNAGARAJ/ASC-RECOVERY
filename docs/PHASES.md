@@ -1,6 +1,6 @@
 # Build Phases
 
-**Current phase: Phase 8 — Observability and audit**
+**Current phase: Phase 9 — Cloud-agnostic deployment**
 
 Phase 3's gate is still unverified pending a live Postgres — see below.
 Phase 4 is fully verified and checked off. Phases 5, 6, 7, and 8 each split
@@ -8,7 +8,10 @@ their work into a pure half (fully verified here) and a DB-writing half
 (code-complete, unverified for the same reason as Phase 3) — see below.
 Phase 8 is unusual in that most of its work is inherently pure
 (instrumentation and alert logic, not persistence), so its DB-touching
-surface is the smallest of the four.
+surface is the smallest of the four. **Phase 9 is unverified for a
+different, larger reason**: its gate needs a real Docker install and real
+AWS/Azure accounts, not just local Postgres — see its entry below for
+exactly what is and isn't checked.
 
 One phase per session. `/clear` between phases. Never advance past a failing
 gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
@@ -205,7 +208,40 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       history, confirm it shows up — against real Postgres. Written, skips
       cleanly without `TEST_DATABASE_URL`, never executed. **Do not check
       this phase off until that test is run against a live Postgres.**
-- [ ] Phase 9 — Cloud-agnostic deployment
+- [ ] Phase 9 — Cloud-agnostic deployment — **code complete, verification
+      ceiling lower than every prior phase.** This phase's gate needs
+      real Docker and real AWS/Azure accounts, not just local Postgres —
+      a qualitatively bigger ask than anything gated so far. What's
+      genuinely built and verified without any of that:
+      - `src/main.py` — the production composition root that didn't
+        exist before this phase (`api.app.create_app()` had never been
+        wired to a real `PostgresRepository` from environment variables).
+        `tests/test_main.py`: missing-env-var errors and successful
+        construction both proven for real (`create_engine` doesn't
+        connect until first use, so no DB is needed to test this).
+      - `GET /healthz` / `GET /readyz` (`src/api/routes/health.py`,
+        `Repository.ping()`) — liveness vs. readiness kept deliberately
+        separate; fully tested in `tests/api/test_health.py`, plus one
+        live-Postgres round-trip in `test_endpoints_live_db.py`.
+      - `pyproject.toml` now separates runtime dependencies
+        (`[project].dependencies`) from dev/lint tooling (`dev` extra) —
+        previously everything lived under `dev` because nothing had
+        packaged a runnable production entrypoint yet; this is what lets
+        the Docker image's `pip install .` skip pytest/ruff/mypy.
+      **Written but explicitly unverified, honestly, not silently**:
+      `Dockerfile`/`.dockerignore`/`docker-compose.yml`'s new `app`
+      service (no Docker in this environment — the user's plan is to
+      verify these in a Codespace); `terraform/modules/{aws,azure}/` and
+      `terraform/environments/{aws,azure}/` (no Terraform CLI, and
+      `apply` additionally needs real billed cloud accounts — manually
+      reviewed line by line, brace/quote-balance-checked, but not
+      `terraform validate`-checked); `docs/RUNBOOK.md`'s restore
+      procedure (needs a real provisioned database to actually time).
+      **Do not check this phase off until**: (1) `docker compose up`
+      + `alembic upgrade head` + exercising the API works in the
+      Codespace, AND (2) `terraform validate`/`plan`/`apply` succeed
+      against real AWS and Azure accounts with an actual restore
+      rehearsed and timed — two separate, later milestones, not one.
 - [ ] Phase 10 — CI/CD and pre-production hardening
 - [ ] Phase 11 — Real data readiness (the compliance gate — no code)
 - [ ] Phase 12 — First customer pilot

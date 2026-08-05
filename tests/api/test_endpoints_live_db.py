@@ -214,3 +214,12 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
         event["action"] == "finding_detail_view" and event["actor"] == subject
         for event in events
     )
+
+
+def test_readyz_returns_200_against_real_postgres(live_client: TestClient) -> None:
+    """Phase 9: /readyz has no auth and no tenant context -- it exists to
+    prove the deployed instance can actually reach its database, which
+    is exactly what this proves against a real one."""
+    response = live_client.get("/readyz")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"

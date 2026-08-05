@@ -48,6 +48,7 @@ class FakeRepository:
     access_events: list[tuple[uuid.UUID, AccessEventSummary]] = field(default_factory=list)
     ingest_calls: list[tuple[uuid.UUID, bytes, str, str]] = field(default_factory=list)
     next_ingest_outcome: IngestionOutcome | DuplicateOutcome | None = None
+    healthy: bool = True
 
     # --- seeding helpers, test-only -------------------------------------
 
@@ -65,6 +66,9 @@ class FakeRepository:
         self.audit_entries[entry.id] = (tenant_id, entry)
 
     # --- Repository protocol ---------------------------------------------
+
+    def ping(self) -> bool:
+        return self.healthy
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None:
         return self.users.get(subject)
