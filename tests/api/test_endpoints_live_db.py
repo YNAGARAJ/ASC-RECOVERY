@@ -253,8 +253,17 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
         f"db row={repository.get_user_by_subject(admin_subject)!r}"
     )
     events = history.json()["items"]
+    # phi_access_log-sourced events always carry the generic literal
+    # action="phi_access" (db.repository.get_claim_access_history) -- the
+    # specific reason lives in `purpose` (phi_access_log's own column,
+    # set by write_phi_access_log(..., purpose="finding_detail_view")),
+    # not `action`. Checking `action` here was a pre-existing bug: it
+    # could never match any real event, since nothing ever sets
+    # action="finding_detail_view".
     assert any(
-        event["action"] == "finding_detail_view" and event["actor"] == subject
+        event["action"] == "phi_access"
+        and event["purpose"] == "finding_detail_view"
+        and event["actor"] == subject
         for event in events
     ), events
     # Phase 10: ingestion itself (not just later views) is now part of a
