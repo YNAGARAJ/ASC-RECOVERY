@@ -37,6 +37,8 @@ dev = [
     "openapi-spec-validator>=0.7",
     "pip-tools>=7",
     "cyclonedx-bom>=7",
+    "bandit>=1.9",
+    "pip-audit>=2.10",
 ]
 
 [build-system]

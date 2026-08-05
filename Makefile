@@ -29,6 +29,16 @@ security:
 # that error, `pip install "pip<25"` first, run `make lock`, then restore
 # pip (`pip install --upgrade pip`). See .github/workflows/ci.yml's lint
 # job for the same pin, scoped to just this step.
+#
+# pip-tools has no --universal/multi-platform mode (unlike `uv pip compile
+# --universal`) -- it resolves against whoever's running it. CI runs on
+# Linux (ubuntu-latest), so a lockfile regenerated on Windows or macOS
+# will differ (Windows pulls in `colorama`/`tzdata`, which Linux doesn't
+# need) and fail CI's freshness check even though nothing is actually
+# wrong. Run this from a Linux shell/container when possible; if you must
+# run it on Windows/macOS, diff the result against CI's own regenerated
+# copy (the failed job's log shows the exact diff) and manually drop any
+# platform-only lines before committing.
 lock:
 	pip-compile pyproject.toml --output-file=requirements.lock.txt --strip-extras
 

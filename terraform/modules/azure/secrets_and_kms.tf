@@ -43,7 +43,8 @@ resource "azurerm_key_vault_key" "main" {
     automatic {
       time_before_expiry = "P30D"
     }
-    expire_after = "P1Y"
+    expire_after         = "P1Y"
+    notify_before_expiry = "P30D"
   }
 
   depends_on = [azurerm_key_vault_access_policy.deployer]
