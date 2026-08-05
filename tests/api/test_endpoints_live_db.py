@@ -112,13 +112,28 @@ def _auth_headers(subject: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {tokens.access_token}"}
 
 
+def _seed_second_user(
+    session_factory: sessionmaker[Session], tenant_id: uuid.UUID, label: str, *, role: Role
+) -> str:
+    """A second user on an already-seeded tenant, for tests that need to
+    exercise an endpoint gated to a role `_seed_tenant`'s single BILLER
+    user doesn't have. A real user row is required, matching the token's
+    role claim: `api/auth.py::get_auth_context` deliberately rejects a
+    token whose role claim disagrees with the DB user's actual role (401
+    "role assignment has changed" -- a safeguard against a stale token
+    surviving a real role change) -- so minting a same-subject token with
+    a *different* role than that subject's actual DB row (the original,
+    broken approach here) can never work."""
+    subject = f"live-user-{label}-{uuid.uuid4().hex[:12]}"
+    with session_factory() as session, session.begin():
+        db_repository.create_user(session, tenant_id, subject=subject, role=role.value)
+    return subject
+
+
 def _auth_headers_as(subject: str, role: Role) -> dict[str, str]:
-    """Role lives in the JWT itself (Phase 6: `AccessTokenClaims` carries
-    no DB round-trip for role, only `sub` needs to resolve via the `users`
-    table for tenant_id) -- minting a different role for an existing
-    seeded subject is a legitimate way to exercise an endpoint gated to a
-    role `_seed_tenant`'s single BILLER user doesn't have, without adding
-    a second user just for one test."""
+    """Like `_auth_headers`, but for a subject whose actual DB-assigned
+    role (see `_seed_second_user`) isn't BILLER -- `role` here must match
+    that row, or `get_auth_context`'s consistency check rejects it."""
     tokens = issue_session(JWT_SECRET, subject, role, mfa_verified=True)
     return {"Authorization": f"Bearer {tokens.access_token}"}
 
@@ -206,7 +221,10 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     for a given claim. Viewing a finding's PHI-bearing detail writes a
     phi_access_log entry; this proves it's actually queryable back out
     through the auditor-facing endpoint, against real Postgres."""
-    _, subject = _seed_tenant(app_session_factory, "access-history-a")
+    tenant_id, subject = _seed_tenant(app_session_factory, "access-history-a")
+    admin_subject = _seed_second_user(
+        app_session_factory, tenant_id, "access-history-a-admin", role=Role.ADMIN
+    )
     repository = PostgresRepository(
         app_session_factory, drafter=ScriptedPacketDrafter([]), encryptor=_TEST_ENCRYPTOR
     )
@@ -227,7 +245,7 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     assert detail.json()["patient_member_id"] == "TESTMBR000001"
 
     history = client.get(
-        f"/claims/{claim_id}/access-history", headers=_auth_headers_as(subject, Role.ADMIN)
+        f"/claims/{claim_id}/access-history", headers=_auth_headers_as(admin_subject, Role.ADMIN)
     )
     assert history.status_code == 200
     events = history.json()["items"]
