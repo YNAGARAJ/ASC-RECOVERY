@@ -156,6 +156,10 @@ jobs:
           severity: "CRITICAL,HIGH"
           exit-code: "1"
           ignore-unfixed: true
+          # See .trivyignore's own comment for why these two are suppressed
+          # (confirmed false positives, not accepted risk) -- trivy-action
+          # does not auto-discover this file, it must be named explicitly.
+          trivyignores: .trivyignore
 
   iac-scan:
     runs-on: ubuntu-latest

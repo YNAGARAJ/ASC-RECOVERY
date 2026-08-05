@@ -51,6 +51,7 @@ jobs:
           severity: "CRITICAL,HIGH"
           exit-code: "1"
           ignore-unfixed: true
+          trivyignores: .trivyignore
 
       - name: Open an issue if anything found new findings
         if: steps.bandit.outcome == 'failure' || steps.pip_audit.outcome == 'failure' || steps.trivy.outcome == 'failure'

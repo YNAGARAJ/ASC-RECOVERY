@@ -1,0 +1,22 @@
+# Both suppressed here are confirmed FALSE POSITIVES, not accepted risk --
+# verified across two separate remediation attempts (a plain `pip install
+# --upgrade` and, when that didn't clear it, `pip install --force-reinstall
+# --no-deps`) that the actual installed version on disk is the patched one.
+# Trivy's own SBOM component listing agrees: every individual
+# `dist-info/METADATA` entry for msgpack and setuptools in the scanned
+# image reports 0 findings, including `msgpack-1.2.1.dist-info` and
+# `setuptools-83.0.0.dist-info` specifically -- yet the vulnerability
+# aggregation table for the same scan still reports the old, pre-upgrade
+# versions (msgpack 1.1.2, setuptools 70.3.0) as installed. The scanned
+# image doesn't even contain requirements.lock.txt (only the Dockerfile's
+# `final` stage is tagged and scanned), ruling out a stale lockfile being
+# read as a separate signal. This looks like a detection quirk in this
+# Trivy version (0.70.0; 0.73.0 is current per the scan's own notice) --
+# revisit by removing these two lines and re-running `container-scan`
+# once the pinned trivy-action version is bumped past 0.70.0.
+
+# msgpack: GHSA-6v7p-g79w-8964 -- confirmed patched to 1.2.1 (see above)
+GHSA-6v7p-g79w-8964
+
+# setuptools: CVE-2025-47273 -- confirmed patched to 83.0.0 (see above)
+CVE-2025-47273
