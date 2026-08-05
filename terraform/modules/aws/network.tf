@@ -122,11 +122,18 @@ resource "aws_security_group" "app" {
   vpc_id      = aws_vpc.main.id
   description = "ASC Recovery app tasks"
 
+  # Narrowed to HTTPS only (was all ports/protocols) -- the app only ever
+  # makes outbound calls to the Anthropic API and AWS service endpoints
+  # (Secrets Manager, KMS, S3, CloudWatch Logs), all HTTPS. The CIDR
+  # itself stays 0.0.0.0/0: Anthropic is a third-party SaaS with no fixed,
+  # stable IP range to allowlist, so tfsec's public-egress check can't be
+  # satisfied by narrowing the CIDR without breaking LLM packet drafting.
+  #tfsec:ignore:aws-ec2-no-public-egress-sgr
   egress {
-    description = "All outbound (Anthropic API, AWS API endpoints, etc.)"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    description = "HTTPS outbound (Anthropic API, AWS API endpoints)"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -151,4 +158,20 @@ resource "aws_security_group" "database" {
   tags = merge(var.tags, {
     Name = "${local.name_prefix}-db-sg"
   })
+}
+
+# A separate rule, not an inline block on either security group above --
+# an inline egress block on `app` referencing `database.id` and an inline
+# ingress block on `database` referencing `app.id` would each need the
+# other to exist first, a genuine cycle. Same reason
+# container_runtime.tf's `alb_to_app` rule is separate from both the ALB
+# and app security groups' own inline blocks.
+resource "aws_security_group_rule" "app_to_database" {
+  type                     = "egress"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.app.id
+  source_security_group_id = aws_security_group.database.id
+  description               = "App tasks to Postgres"
 }

@@ -20,6 +20,17 @@ resource "azurerm_key_vault" "main" {
 
   public_network_access_enabled = false
 
+  # Explicit, even though public_network_access_enabled = false above
+  # already blocks public network access at a coarser level -- tfsec
+  # (azure-keyvault-specify-network-acl) wants this stated, not implied.
+  # No VNet integration/private endpoint exists yet in this module, so
+  # "AzureServices" is the bypass that still lets the deploying
+  # principal and the container runtime's Azure-side calls through.
+  network_acls {
+    default_action = "Deny"
+    bypass         = "AzureServices"
+  }
+
   tags = var.tags
 }
 

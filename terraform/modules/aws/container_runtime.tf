@@ -79,6 +79,12 @@ resource "aws_iam_role_policy" "task_app_permissions" {
   name = "${local.name_prefix}-task-app-permissions"
   role = aws_iam_role.task.id
 
+  # tfsec: aws-iam-no-policy-wildcards -- the "/*" suffix is the standard,
+  # correct way to grant object-level S3 actions scoped to ONE specific
+  # already-named bucket (aws_s3_bucket.remittances.arn), not a true
+  # wildcard across resources. There is no way to express "every object
+  # in this one bucket" without it.
+  #tfsec:ignore:aws-iam-no-policy-wildcards
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -99,6 +105,7 @@ resource "aws_iam_role_policy" "task_app_permissions" {
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/ecs/${local.name_prefix}"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.main.arn
 
   tags = var.tags
 }
@@ -154,6 +161,11 @@ resource "aws_security_group" "alb" {
   vpc_id      = aws_vpc.main.id
   description = "ASC Recovery ALB -- public HTTPS ingress only"
 
+  # tfsec: aws-ec2-no-public-ingress-sgr -- this IS the public ingress
+  # path for a SaaS API ambulatory surgery centers reach over the
+  # internet; there is no fixed client CIDR to allowlist. Narrowing this
+  # would break the product, not harden it.
+  #tfsec:ignore:aws-ec2-no-public-ingress-sgr
   ingress {
     description = "HTTPS"
     from_port   = 443
@@ -162,11 +174,15 @@ resource "aws_security_group" "alb" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # Scoped to the app security group on the app's own port, not
+  # 0.0.0.0/0 -- the ALB only ever needs to reach the Fargate tasks
+  # behind it, never the open internet.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "To app tasks only"
+    from_port       = 8000
+    to_port         = 8000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
   }
 
   tags = merge(var.tags, {
@@ -176,10 +192,15 @@ resource "aws_security_group" "alb" {
 
 resource "aws_lb" "main" {
   name               = "${local.name_prefix}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
+  # tfsec: aws-elb-alb-not-public -- same reason as the ingress rule
+  # above: an internal-only ALB would make this a private-network-only
+  # API, defeating the point of a public SaaS product.
+  #tfsec:ignore:aws-elb-alb-not-public
+  internal                  = false
+  load_balancer_type        = "application"
+  security_groups           = [aws_security_group.alb.id]
+  subnets                   = aws_subnet.public[*].id
+  drop_invalid_header_fields = true
 
   tags = merge(var.tags, {
     Name = "${local.name_prefix}-alb"

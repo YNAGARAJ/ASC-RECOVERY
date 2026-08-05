@@ -50,6 +50,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "remittances" {
     id     = "retain-six-years"
     status = "Enabled"
 
+    # Applies to every object in the bucket -- an empty filter, not a
+    # missing one. The provider currently defaults to this when neither
+    # `filter` nor `prefix` is set, but warns that it'll be a hard error
+    # in a future version; stating it explicitly now avoids that.
+    filter {}
+
     # HIPAA documentation retention is 6 years -- this transitions
     # (rather than deletes) noncurrent versions to cheaper storage well
     # before that window closes; actual deletion policy is a Phase 11

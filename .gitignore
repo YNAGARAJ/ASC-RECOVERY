@@ -35,3 +35,26 @@ Thumbs.db
 # `make eval` invocations, not meaningful shared history across machines;
 # a real deployment sends this to a metrics backend instead.
 evals/history/
+
+# Terraform. .terraform.lock.hcl is deliberately NOT committed here (even
+# though it usually should be) -- CI's `terraform init` resolves fresh on
+# every run rather than reusing a committed lock file, and a lock file
+# generated on one OS only records that platform's provider hashes,
+# causing the exact cross-platform mismatch class of bug
+# requirements.lock.txt hit in Phase 10 (see docs/PROGRESS.md). Revisit
+# once there's a reason to pin providers for real (a `terraform apply`
+# against a real account).
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CycloneDX SBOM (make sbom) -- a per-build artifact (see docs/RUNBOOK.md
+# and Makefile's `sbom` target comment), not source; CI produces it fresh
+# per run as a build artifact instead.
+sbom.json

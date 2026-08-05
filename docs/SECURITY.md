@@ -118,6 +118,49 @@ real, scoped gap, deliberately not rushed into a fix this phase:
   whoever owns that product decision, not something to unilaterally
   narrow.
 
+## Phase 10 iac-scan: first real tfsec run against this Terraform
+
+CI's `iac-scan` job ran `tfsec` against `terraform/` for the first time
+(Phase 9's HCL was manual-review-only, never tool-scanned). Found 8
+CRITICAL, 6 HIGH, 8 MEDIUM, 18 LOW findings. All CRITICAL/HIGH are
+resolved — either a real fix or a `#tfsec:ignore` comment at the exact
+finding with a justification, verified locally (`tfsec terraform`, 0
+critical/0 high remaining). `ci.yml`'s tfsec step now runs with
+`--minimum-severity HIGH`, so MEDIUM/LOW are still visible in the job log
+but don't block the pipeline.
+
+**Fixed**: ALB egress narrowed from all-ports/0.0.0.0/0 to the app
+security group on port 8000 only; app task egress narrowed from
+all-ports to HTTPS (443) only, with a matching new
+`aws_security_group_rule` for the app→database Postgres egress that the
+broad rule used to cover implicitly; ALB now sets
+`drop_invalid_header_fields = true`; Azure Key Vault now has an explicit
+`network_acls { default_action = "Deny", bypass = "AzureServices" }`
+block (previously relied only on `public_network_access_enabled = false`,
+a coarser control); CloudWatch log group now encrypted with the existing
+KMS key.
+
+**Ignored, with justification inline at each finding** (not fixable
+without breaking the product): ALB ingress on 443 from 0.0.0.0/0 — this
+is the public API's only ingress path, ambulatory surgery centers have no
+fixed CIDR to allowlist. ALB `internal = false` — same reason, an
+internal-only ALB isn't a public SaaS API. App task egress to 0.0.0.0/0
+on port 443 — Anthropic's API is third-party with no fixed IP range to
+scope to; the port is narrowed, the CIDR can't be. IAM policy's `/*`
+suffix on the remittances bucket ARN — this is the correct, standard way
+to scope S3 object-level actions to one specific already-named bucket,
+not a true wildcard; tfsec's static check can't tell the difference.
+
+**Deferred (MEDIUM/LOW, same triage discipline as the adversarial review
+above)**: RDS IAM authentication (this system already uses
+Secrets-Manager-backed password auth; adding IAM auth as a second
+mechanism needs corresponding application-side changes, not a one-line
+Terraform flag); VPC Flow Logs; S3 access-log bucket for the remittances
+bucket (needs a second bucket with its own encryption/public-access-block
+config); Key Vault key/secret expiry dates; RDS Performance Insights;
+remaining security-group-rule descriptions and Key Vault secret
+content-type metadata.
+
 ## Asset inventory and network map
 
 The 2026 rule requires both, reviewed annually. This is the template Phase

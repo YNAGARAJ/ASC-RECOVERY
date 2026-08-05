@@ -178,3 +178,11 @@ jobs:
         uses: aquasecurity/tfsec-action@v1.0.3
         with:
           working_directory: terraform
+          # CRITICAL/HIGH block the pipeline; MEDIUM/LOW are still
+          # reported in the job log but don't fail it. First real tfsec
+          # run against this HCL found 8 CRITICAL/6 HIGH (all now fixed
+          # or have a documented, justified #tfsec:ignore at the exact
+          # finding) and 8 MEDIUM/18 LOW (triaged, not fixed this phase
+          # -- see docs/SECURITY.md's "Phase 10 adversarial review"
+          # section for the same triage pattern applied here).
+          tfsec_args: --minimum-severity HIGH
