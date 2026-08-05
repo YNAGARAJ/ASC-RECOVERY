@@ -1,17 +1,20 @@
 # Build Phases
 
-**Current phase: Phase 10 — CI/CD and pre-production hardening**
+**Current phase: Phase 11 — Real data readiness (the compliance gate — no code)**
 
-Phase 3's gate is still unverified pending a live Postgres — see below.
-Phase 4 is fully verified and checked off. Phases 5, 6, 7, and 8 each split
-their work into a pure half (fully verified here) and a DB-writing half
-(code-complete, unverified for the same reason as Phase 3) — see below.
-Phase 8 is unusual in that most of its work is inherently pure
-(instrumentation and alert logic, not persistence), so its DB-touching
-surface is the smallest of the four. **Phase 9 is unverified for a
-different, larger reason**: its gate needs a real Docker install and real
-AWS/Azure accounts, not just local Postgres — see its entry below for
-exactly what is and isn't checked.
+**Update from Phase 10**: Phases 3, 5, 6, 7, and 8's DB-backed halves —
+previously all "code complete, unverified pending a live Postgres" — got
+their first real execution when Phase 10's CI pipeline went green against
+an actual Postgres 16 service container, and are now confirmed rather
+than assumed. Each phase's entry below is left as originally written for
+the historical record of what was and wasn't known at the time, with a
+checkbox update reflecting the now-confirmed state. **Phase 9 remains the
+one exception**: its gate needs a real Docker install and real, billed
+AWS/Azure accounts, which Phase 10's CI gets partway toward (container
+build + `terraform validate` both now run for real) but doesn't fully
+close — no cloud credentials exist yet for an actual `terraform apply`,
+so `deploy.yml`'s cloud-dependent jobs still show `skipped`. See Phase
+9's and Phase 10's entries below for exactly what is and isn't checked.
 
 One phase per session. `/clear` between phases. Never advance past a failing
 gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
@@ -19,7 +22,11 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
 - [x] Phase 0 — Scaffold, constitution, guardrails
 - [x] Phase 1 — Domain core (pure, no I/O)
 - [x] Phase 2 — Eval harness and golden dataset
-- [ ] Phase 3 — Persistence, tenancy, and effective-dated contracts —
+- [x] Phase 3 — Persistence, tenancy, and effective-dated contracts —
+      **confirmed by Phase 10's CI run** (RLS tenant-isolation,
+      idempotent-remittance, effective-dated pricing, and audit-log
+      append-only all passed against a real Postgres 16). Left below as
+      originally written, describing the state before that confirmation —
       **code complete, hard gate not yet run.** The build environment this
       was written in has no Docker/WSL/Postgres, only `pip`. Everything
       checkable without a live database is green: `mypy --strict .`,
@@ -45,7 +52,11 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       and the two explicitly out-of-scope items (real cloud KMS adapters,
       deferred to Phase 9; `gitleaks` full-history scan, unavailable in
       this environment).
-- [ ] Phase 5 — Ingestion pipeline — **code complete, DB-writing half
+- [x] Phase 5 — Ingestion pipeline — **confirmed by Phase 10's CI run**
+      (the idempotency, quarantine, and audit-entry DB-backed tests all
+      passed against a real Postgres — with two real bugs fixed along the
+      way, see Phase 10's "CI debugging round"). Left below as originally
+      written — **code complete, DB-writing half
       unverified for the same reason as Phase 3.** Split into a pure
       planning layer (`src/ingestion/reconcile.py`, `plan.py`, `sources.py`,
       `virus_scan.py`) and a thin DB-apply layer (`apply.py`,
@@ -67,7 +78,11 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       `src/db/repository.py`. **Do not check this phase off until the
       three DB-backed tests above are run against a live Postgres**, same
       standard as Phase 3.
-- [ ] Phase 6 — API layer — **code complete, DB-writing half unverified
+- [x] Phase 6 — API layer — **confirmed by Phase 10's CI run** (the
+      live-Postgres findings-list/finding-detail/RLS tests all passed,
+      plus a real auth bug this phase's own new test coverage caught and
+      fixed — see Phase 10's "CI debugging round"). Left below as
+      originally written — **code complete, DB-writing half unverified
       for the same reason as Phases 3 and 5.** FastAPI service exposing
       upload remittance, list/detail findings, export worklist CSV,
       contract management, and audit log query. Same pure/DB split as
@@ -109,8 +124,11 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       user-management HTTP endpoint either — out of this phase's explicit
       scope. **Do not check this phase off until the live-DB tests above
       are run against a real Postgres**, same standard as Phases 3 and 5.
-- [ ] Phase 7 — Recovery packet generation (the only place an LLM appears)
-      — **code complete, DB-writing half unverified for the same reason as
+- [x] Phase 7 — Recovery packet generation (the only place an LLM appears)
+      — **confirmed by Phase 10's CI run** (the generate-draft ->
+      approve round-trip test passed against real Postgres, both audit
+      entries confirmed). Left below as originally written —
+      **code complete, DB-writing half unverified for the same reason as
       Phases 3, 5, and 6.** New `src/packets/` package (pure): `currency.py`
       (extracts every currency-shaped figure from LLM output, parses as
       `Decimal`, rejects if any value isn't in the finding record's known
@@ -152,7 +170,13 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       without `TEST_DATABASE_URL`, never executed. **Do not check this
       phase off until that test is run against a live Postgres**, same
       standard as Phases 3, 5, and 6.
-- [ ] Phase 8 — Observability and audit — **code complete, one DB-backed
+- [x] Phase 8 — Observability and audit — **confirmed by Phase 10's CI
+      run** (the finding-view -> claim-access-history round-trip passed
+      against real Postgres — after fixing a test bug this phase's own
+      run surfaced: checking the wrong field name, `action` instead of
+      `purpose`, for a `phi_access_log`-sourced event; see Phase 10's "CI
+      debugging round"). Left below as originally written — **code
+      complete, one DB-backed
       round-trip test unverified for the same reason as Phases 3, 5, 6, and
       7.** Both of the phase's literal gate requirements are fully verified
       without a live database — this is the bulk of the phase's actual
@@ -242,20 +266,17 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       Codespace, AND (2) `terraform validate`/`plan`/`apply` succeed
       against real AWS and Azure accounts with an actual restore
       rehearsed and timed — two separate, later milestones, not one.
-- [ ] Phase 10 — CI/CD and pre-production hardening — **code complete,
-      the pipeline itself has never actually run.** Unlike every prior
-      phase's DB-less limbo (which stays unresolved until someone brings
-      up a real Postgres), this phase's gap closes the moment this is
-      pushed: `.github/workflows/ci.yml` runs on GitHub-hosted runners,
-      which have Docker and can spin up a real Postgres 16 service
-      container — the first time in this build that the RLS
-      tenant-isolation gate, idempotent-remittance, effective-dated
-      pricing, audit-log append-only, the packet approve round-trip, and
-      the claim-access-history round-trip (Phases 3/5/6/7/8's stuck
-      DB-backed tests) get to actually run instead of skip. **Do not
-      check this phase off until that first real run is green** — it
-      might not be; this is genuinely the first time some of this code
-      touches a live database.
+- [x] Phase 10 — CI/CD and pre-production hardening — **the pipeline
+      actually ran, went green, and in the process retroactively verified
+      every DB-backed test Phases 3/5/6/7/8 could only ever skip locally**
+      (RLS tenant-isolation, idempotent-remittance, effective-dated
+      pricing, audit-log append-only, the packet approve round-trip, the
+      claim-access-history round-trip). Getting there took 15 follow-up
+      commits after the initial push, fixing real bugs the first-ever
+      live-Postgres/Docker/Terraform/CI run surfaced — see "the CI
+      debugging round" below for the full list; none of these were
+      hypothetical, every one was a genuine defect this build had been
+      carrying since the phase that introduced it.
       - **`.github/workflows/ci.yml`**: lint (ruff, mypy --strict,
         lockfile-freshness) -> test (real Postgres 16 service container,
         `scripts/db/init_roles.sql`, `alembic upgrade head`, full
@@ -362,5 +383,56 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
         skips), 100% branch coverage on `domain/variance.py`, eval
         `GATE PASSED`, `bandit` clean, `pip-audit` clean against this
         project's actual dependency tree.
+      - **The CI debugging round** — every one of these was a real,
+        pre-existing bug (most dating to the phase named), invisible
+        until this phase's pipeline gave it a live Postgres/Docker/
+        Terraform/CI environment to run in for the first time:
+        - `bandit`/`pip-audit` were installed globally on the dev
+          machine all along but never declared in `pyproject.toml`'s
+          `dev` extra — every local `make security` passed by accident.
+        - `requirements.lock.txt`, generated on Windows, pulled in
+          `colorama`/`tzdata` that Linux's resolver correctly omits —
+          the CI freshness check must regenerate *in place* (not to a
+          temp file) or it flags unrelated upstream releases as drift.
+        - Azure's `azurerm_key_vault_key.main` was missing
+          `notify_before_expiry`, a required companion to `expire_after`
+          (Phase 9) — the first real `terraform validate` this HCL ever got.
+        - Two gitleaks false positives (synthetic JWT/PHI-encryption test
+          secrets) needed a documented `.gitleaks.toml` allowlist.
+        - Migrations `0002`-`0004` all collided with `0001`'s
+          `create_all()` (which reflects *today's* `db/models.py`, not a
+          historical snapshot) — made idempotent, with an
+          offline-SQL-generation branch preserved.
+        - `aquasecurity/trivy-action@0.28.0` doesn't exist (`v0.36.0` is
+          current); `tfsec-action`'s severity-floor input is
+          `additional_args`, not the `tfsec_args` first guessed — both
+          silently no-op on an unrecognized input name rather than error.
+        - First real `tfsec` run: 8 CRITICAL/6 HIGH, resolved with a mix
+          of real fixes (narrowed security-group egress, Key Vault
+          network ACL, `drop_invalid_header_fields`) and justified
+          `#tfsec:ignore` comments for what's inherent to a public API.
+        - `tests/ingestion/conftest.py::seed_tenant_with_contract` (Phase
+          5) created its contract outside `tenant_session`, failing
+          against real RLS with "unrecognized configuration parameter
+          app.tenant_id".
+        - The observability test's shared contract fixture priced 99213
+          below what the 835 reports as allowed, producing a *negative*
+          shortfall that `record_ingestion_outcome` correctly never
+          reports as `dollars_detected` (Counters can't go negative) —
+          the test's own assumption was wrong, not the metrics code.
+        - `_auth_headers_as(subject, Role.ADMIN)` minted a token claiming
+          a role that disagreed with the subject's actual DB-assigned
+          role — `api/auth.py::get_auth_context` deliberately 401s on
+          that mismatch (a real safeguard, working as designed).
+        - Trivy flagged `setuptools`/`msgpack` at stale versions even
+          after `--force-reinstall` confirmed patched versions on disk —
+          suppressed via `.trivyignore` as a documented tool quirk (this
+          Trivy is one version behind current) after two remediation
+          attempts both provably fixed the actual image.
+        - The claim-access-history test checked `event["action"] ==
+          "finding_detail_view"`, but PHI-access-log-sourced events
+          always carry the generic literal `action="phi_access"` — the
+          specific reason lives in `purpose`. A Phase 8 test bug that
+          could never have matched any real event.
 - [ ] Phase 11 — Real data readiness (the compliance gate — no code)
 - [ ] Phase 12 — First customer pilot
