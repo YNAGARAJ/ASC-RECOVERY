@@ -434,5 +434,68 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
           always carry the generic literal `action="phi_access"` — the
           specific reason lives in `purpose`. A Phase 8 test bug that
           could never have matched any real event.
-- [ ] Phase 11 — Real data readiness (the compliance gate — no code)
+- [ ] Phase 11 — Real data readiness (the compliance gate — no code) —
+      **drafting complete, the actual gate is nowhere near closed.** Per
+      `docs/MASTER-BUILD-PROMPT.md`, this phase is a 15-item checklist —
+      BAAs, a Security Risk Analysis, an incident response plan, a breach
+      notification procedure, workforce training, insurance, a third-party
+      penetration test, legal review — none of which can be *completed*
+      by writing files. New `docs/compliance/` directory: for every item
+      groundable in this system's already-built, already-verified
+      technical controls (`docs/SECURITY.md`'s control matrix,
+      `docs/RUNBOOK.md`'s operational procedures, `terraform/`'s actual
+      infrastructure), wrote a real starting document, explicitly marked
+      as an engineering draft pending legal/compliance sign-off — not a
+      blank template, but not adopted policy either. For the items that
+      are purely external actions (signing a vendor's own BAA, buying
+      insurance, hiring a pentest firm), `docs/compliance/README.md`
+      states exactly what needs to happen and who to involve, with no
+      item marked done that isn't. **Do not check this phase off, and do
+      not start Phase 12, until every one of the 15 items in
+      `docs/compliance/README.md`'s tracker reads DONE with real
+      evidence** — a signed contract, a purchased policy, a completed
+      engagement report, a documented drill, not a drafted document
+      however good.
+      - `docs/compliance/SECURITY-RISK-ANALYSIS.md` — restructures
+        `docs/SECURITY.md`'s control matrix into risk-analysis form
+        (threats × existing controls × residual risk × remediation
+        priority). Highest-priority open item it surfaces: rate limiting
+        and account lockout exist and are tested but aren't wired into
+        any route — the single highest residual-risk finding.
+      - `docs/compliance/INCIDENT-RESPONSE-PLAN.md` — expands
+        `docs/RUNBOOK.md`'s existing 4-step outline into the full
+        Identify/Contain/Assess/Eradicate/Recover/Lessons-learned cycle,
+        a severity classification, and a contact-tree template. Every
+        name field is deliberately blank — filling those in and running
+        a tabletop exercise is explicitly called out as required before
+        this is usable, not just written.
+      - `docs/compliance/BREACH-NOTIFICATION-PROCEDURE.md` — the
+        60-day clock, a reportability decision tree, and the notification
+        recipient/deadline table (including the easy-to-miss detail that
+        a signed BAA's own notification deadline to the customer is often
+        shorter than the statutory 60 days). Explicitly does not authorize
+        sending any actual notification.
+      - `docs/compliance/DATA-RETENTION-SCHEDULE.md` — documents
+        retention periods that are already true facts about the running
+        system (S3 lifecycle, RDS backup retention, log retention, token
+        TTLs), separately from the genuinely undecided destruction
+        procedure (this system currently has no hard-delete path at all).
+      - `docs/compliance/SECURITY-QUESTIONNAIRE-ANSWERS.md` — the
+        lowest-risk document in this phase, since it just restates
+        already-true `docs/SECURITY.md` facts in customer-questionnaire
+        form — while still honestly flagging what's not yet true (no
+        signed BAAs, no completed pentest) rather than glossing over it.
+      - `docs/compliance/BUSINESS-CONTINUITY-DR-PLAN.md` — documents
+        the DR mechanism Phase 9 already built, proposes RPO/RTO targets
+        for the business to confirm, and is explicit that a plan with no
+        rehearsed restore is documented, not tested.
+      - `docs/compliance/SANCTION-POLICY.md` — a standard,
+        right-sized progressive-discipline template for HIPAA workforce
+        violations, requiring HR/legal adoption.
+      - `docs/compliance/README.md` — the master tracker: all 15
+        checklist items from the master prompt, each with a status and a
+        concrete next action — the asset-inventory/network-map item is
+        explicitly marked blocked on Phase 9's real infrastructure (a
+        template filled with placeholder infrastructure would be
+        fiction), not silently skipped.
 - [ ] Phase 12 — First customer pilot
