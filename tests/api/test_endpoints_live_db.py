@@ -256,11 +256,11 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     assert any(
         event["action"] == "finding_detail_view" and event["actor"] == subject
         for event in events
-    )
+    ), events
     # Phase 10: ingestion itself (not just later views) is now part of a
     # claim's access history.
-    assert any(event["action"] == "claim_ingested" for event in events)
-    assert any(event["action"] == "finding_created" for event in events)
+    assert any(event["action"] == "claim_ingested" for event in events), events
+    assert any(event["action"] == "finding_created" for event in events), events
 
 
 def test_readyz_returns_200_against_real_postgres(live_client: TestClient) -> None:
