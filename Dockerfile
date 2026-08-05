@@ -30,7 +30,14 @@ COPY src/ ./src/
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
-RUN pip install --no-cache-dir --upgrade pip \
+# setuptools and msgpack aren't in requirements.lock.txt or anything it
+# resolves -- setuptools ships bundled by `python -m venv`'s own bootstrap
+# (a known source of stale-setuptools CVE findings in slim Python images);
+# msgpack's exact origin wasn't pinned down (not a dependency of anything
+# declared here), but Trivy flags both at vulnerable pinned versions
+# regardless of why they're present, so both are explicitly upgraded here
+# rather than left at whatever the base image happened to bundle.
+RUN pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" "msgpack>=1.2.1" \
  && pip install --no-cache-dir -r requirements.lock.txt \
  && pip install --no-cache-dir --no-deps .
 
