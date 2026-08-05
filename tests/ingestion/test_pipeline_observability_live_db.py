@@ -12,6 +12,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.tenancy import tenant_session
+from domain.money import Money
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
@@ -24,7 +25,19 @@ from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contr
 def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
     app_session_factory: sessionmaker[Session],
 ) -> None:
-    tenant_id = seed_tenant_with_contract(app_session_factory, "Observability tenant")
+    # minimal_valid_835() reports allowed=450 for 99213 -- a contract
+    # price below that (the shared default, make_contract_version()'s
+    # $100) prices as an apparent *overpayment* (negative shortfall),
+    # which record_ingestion_outcome deliberately never reports as
+    # dollars_detected (an OTel Counter can't accept a negative value).
+    # This test needs a genuine positive shortfall to prove the
+    # instrument actually fires, so it prices 99213 above what's
+    # reported allowed instead of using the shared default.
+    tenant_id = seed_tenant_with_contract(
+        app_session_factory,
+        "Observability tenant",
+        fee_schedule={"99213": Money("500.00")},
+    )
     span_exporter = InMemorySpanExporter()
     tracer = setup_tracing(span_exporter)
     metric_reader = InMemoryMetricReader()

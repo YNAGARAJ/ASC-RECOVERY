@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db import repository
 from db.base import make_engine, make_session_factory
 from db.tenancy import tenant_session
+from domain.money import Money
 from security.encryption import EnvelopeEncryptor
 from security.kms_local import LocalKMS
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
@@ -52,11 +53,18 @@ def app_session_factory() -> sessionmaker[Session]:
 
 
 def seed_tenant_with_contract(
-    session_factory: sessionmaker[Session], label: str
+    session_factory: sessionmaker[Session],
+    label: str,
+    *,
+    fee_schedule: dict[str, Money] | None = None,
 ) -> uuid.UUID:
     """A tenant plus one open-ended fee-schedule contract for TEST_PAYER,
     covering 99213/99214 -- enough for the fixtures in
-    tests/domain/fixtures_x835.py to price against.
+    tests/domain/fixtures_x835.py to price against. `fee_schedule`
+    defaults to make_contract_version()'s own default ($100 for 99213) --
+    override it when a test cares about the sign or size of the resulting
+    shortfall (see test_pipeline_observability_live_db.py, which needs a
+    genuine positive shortfall to prove the dollars_detected metric fires).
 
     `tenants` has no RLS (ungated, like `users`), so creating it needs no
     tenant context -- but `contracts` does, so creating *that* outside
@@ -72,7 +80,10 @@ def seed_tenant_with_contract(
     with tenant_session(session_factory, tenant_id) as session:
         contract = repository.create_contract(session, tenant_id, TEST_PAYER, "Test Contract")
         repository.create_contract_version(
-            session, tenant_id, contract.id, make_contract_version()
+            session,
+            tenant_id,
+            contract.id,
+            make_contract_version(fee_schedule=fee_schedule),
         )
 
     return tenant_id
