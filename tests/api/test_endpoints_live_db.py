@@ -247,7 +247,11 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     history = client.get(
         f"/claims/{claim_id}/access-history", headers=_auth_headers_as(admin_subject, Role.ADMIN)
     )
-    assert history.status_code == 200
+    assert history.status_code == 200, (
+        f"expected 200, got {history.status_code}: {history.text!r} -- "
+        f"admin_subject={admin_subject!r}, "
+        f"db row={repository.get_user_by_subject(admin_subject)!r}"
+    )
     events = history.json()["items"]
     assert any(
         event["action"] == "finding_detail_view" and event["actor"] == subject
