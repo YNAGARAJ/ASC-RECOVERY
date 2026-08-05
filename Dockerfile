@@ -34,10 +34,14 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # resolves -- setuptools ships bundled by `python -m venv`'s own bootstrap
 # (a known source of stale-setuptools CVE findings in slim Python images);
 # msgpack's exact origin wasn't pinned down (not a dependency of anything
-# declared here), but Trivy flags both at vulnerable pinned versions
-# regardless of why they're present, so both are explicitly upgraded here
-# rather than left at whatever the base image happened to bundle.
-RUN pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" "msgpack>=1.2.1" \
+# declared here). A plain `--upgrade` wasn't enough: Trivy kept reporting
+# the old vulnerable versions (msgpack 1.1.2, setuptools 70.3.0) even
+# after the upgrade installed 1.2.1/83.0.0 cleanly alongside them --
+# venv-bootstrapped packages can leave stale dist-info metadata that
+# `--upgrade` layers on top of instead of replacing. `--force-reinstall`
+# removes the old install record instead of upgrading over it.
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir --force-reinstall --no-deps "setuptools>=78.1.1" "msgpack>=1.2.1" \
  && pip install --no-cache-dir -r requirements.lock.txt \
  && pip install --no-cache-dir --no-deps .
 
