@@ -25,6 +25,10 @@ def _extra_finding(label: str) -> FindingDetail:
         root_cause="UNDETERMINED_VARIANCE",
         rule_version="2026.08.0",
         created_at=now(),
+        outcome=None,
+        amount_recovered=None,
+        outcome_recorded_by=None,
+        outcome_recorded_at=None,
     )
     return FindingDetail(
         summary=summary,
@@ -44,6 +48,7 @@ def _extra_finding(label: str) -> FindingDetail:
             service_date=date(2023, 2, 1),
         ),
         adjustments=[],
+        confidence_score=None,
     )
 
 

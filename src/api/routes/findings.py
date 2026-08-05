@@ -18,8 +18,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from api.auth import AuthContext, get_repository, require_permission
-from api.repository import FindingFilters, Page, Repository
-from api.schemas import FindingDetailOut, FindingListOut
+from api.repository import FindingFilters, Page, RecordOutcomeInput, Repository
+from api.schemas import FindingDetailOut, FindingListOut, FindingSummaryOut, RecordOutcomeIn
+from domain.outcomes import NothingToAppealError, OutcomeAlreadyRecordedError
 from security.rbac import Action
 
 router = APIRouter()
@@ -82,6 +83,8 @@ def export_findings_csv(
             "actual_allowed",
             "shortfall",
             "root_cause",
+            "outcome",
+            "amount_recovered",
         ]
     )
     for item in result.items:
@@ -94,6 +97,8 @@ def export_findings_csv(
                 item.actual_allowed,
                 item.shortfall,
                 item.root_cause,
+                item.outcome or "",
+                item.amount_recovered or "",
             ]
         )
     return StreamingResponse(
@@ -113,3 +118,29 @@ def get_finding(
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
     return FindingDetailOut.from_domain(detail)
+
+
+@router.post("/findings/{finding_id}/outcome", response_model=FindingSummaryOut)
+def record_outcome(
+    finding_id: UUID,
+    body: RecordOutcomeIn,
+    ctx: AuthContext = require_permission(Action.RECORD_FINDING_OUTCOME),
+    repository: Repository = Depends(get_repository),
+) -> FindingSummaryOut:
+    data = RecordOutcomeInput(
+        outcome=body.outcome,
+        amount_recovered=None if body.amount_recovered is None else Decimal(body.amount_recovered),
+    )
+    try:
+        row = repository.record_finding_outcome(
+            ctx.tenant_id, finding_id, data=data, recorded_by=ctx.user_id
+        )
+    except OutcomeAlreadyRecordedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except NothingToAppealError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
+    return FindingSummaryOut.from_domain(row)

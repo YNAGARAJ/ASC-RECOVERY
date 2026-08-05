@@ -1,6 +1,6 @@
 # Build Phases
 
-**Current phase: Phase 11 — Real data readiness (the compliance gate — no code)**
+**Current phase: Phase 12 — First customer pilot**
 
 **Update from Phase 10**: Phases 3, 5, 6, 7, and 8's DB-backed halves —
 previously all "code complete, unverified pending a live Postgres" — got
@@ -498,4 +498,90 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
         explicitly marked blocked on Phase 9's real infrastructure (a
         template filled with placeholder infrastructure would be
         fiction), not silently skipped.
-- [ ] Phase 12 — First customer pilot
+- [ ] Phase 12 — First customer pilot — **code complete, DB-backed half
+      unverified for the same reason as every phase before Phase 10's CI
+      run gave them a real Postgres**: this build environment still has
+      no live database, only `pip`. **Started with Phase 11's own gate
+      still open** — its checklist item above explicitly says "do not
+      start Phase 12 until every one of the 15 items reads DONE," which is
+      not the case; the user explicitly directed proceeding anyway
+      ("yes, proceed with Phase 12 we have audit to do"), a deliberate
+      override of the master prompt's sequencing, not an oversight.
+      Per `docs/MASTER-BUILD-PROMPT.md`, this phase builds the pilot
+      workflow (onboard one ASC, load a fee schedule, ingest a quarter of
+      835 files, produce a findings report) and the **outcome feedback
+      loop** the master prompt calls "the moat": every finding gets a
+      recovered/denied/abandoned/expired outcome, fed back into a
+      confidence score for future findings against the same payer and
+      root cause.
+      - **`src/domain/outcomes.py`** (new, pure) — `Outcome` enum,
+        `validate_outcome_recording` (rejects recording a second outcome
+        on the same finding, and recording on a `CORRECT_NO_VARIANCE`
+        finding — nothing to appeal there), `calculate_confidence`
+        (recovered-count / decided-count, `None` on cold start rather than
+        a fabricated default). Fully verified without a DB:
+        `tests/domain/test_outcomes.py`, 8 tests.
+      - **`alembic/versions/0005_finding_outcomes.py`** — four nullable
+        columns on `findings` (`outcome`, `amount_recovered`,
+        `outcome_recorded_by`, `outcome_recorded_at`). Offline-verified
+        only (`alembic upgrade head --sql` clean) — same ceiling every
+        migration had before Phase 10's CI run proved 0001-0004 against a
+        real database.
+      - **`src/db/repository.py`** — `record_finding_outcome`,
+        `list_historical_outcomes` (payer + root_cause, joined via
+        `contract_version -> contract` since `Finding` carries no direct
+        payer column), `list_findings_past_deadline_without_outcome` (a
+        human confirms an expiry; the system never flips one on its own).
+        DB-backed, unverified locally — `tests/db/test_finding_outcomes.py`
+        (3 tests, findings seeded directly via `save_findings` rather than
+        through full 835 ingestion, for exact control over payer/root
+        cause/shortfall) skips cleanly without `TEST_DATABASE_URL`, never
+        executed here.
+      - **`security/rbac.py`** — new `Action.RECORD_FINDING_OUTCOME`
+        (BILLER and ADMIN); `tests/api/test_authz_matrix.py` extended, now
+        52 cases, all passing.
+      - **API**: `POST /findings/{id}/outcome` (409 if already recorded,
+        422 on `CORRECT_NO_VARIANCE`); `confidence_score` added to
+        `FindingDetailOut` only, deliberately **not** `FindingSummaryOut`
+        — computing it is a real query per finding, and the list endpoint
+        can return up to 100 rows per page, so putting it there would be
+        an N+1 cost for a signal nobody asked to sort or filter by.
+        `GET /findings/export.csv` gained `outcome`/`amount_recovered`
+        columns.
+      - **`scripts/onboard_customer.py`** (new) + a new "Onboarding a new
+        customer" section in `docs/RUNBOOK.md` — deliberately a script,
+        not an API endpoint: `security/rbac.py` is entirely tenant-scoped,
+        and there is no "platform superadmin" role that could gate a
+        `POST /tenants` endpoint without breaking the no-cross-tenant-
+        access boundary maintained since Phase 3. Verified locally as far
+        as this environment allows: `ruff`/`mypy --strict` clean, `--help`
+        runs, exits 1 with a clear message when `DATABASE_URL` is unset,
+        and rejects an invalid `admin_role` before ever opening a
+        connection. **Never run against a real Postgres.**
+      - **New DB-backed tests** (all skip cleanly without
+        `TEST_DATABASE_URL`, none executed in this environment):
+        `tests/db/test_finding_outcomes.py`; a new cross-tenant 404 proof
+        for `POST /findings/{id}/outcome` in
+        `tests/api/test_endpoints_live_db.py`; and
+        `tests/api/test_pilot_workflow_live_db.py` — the full synthetic
+        pilot demonstration (onboard a tenant -> load a fee schedule ->
+        ingest three synthetic 835 files sharing one payer, honestly
+        standing in for "a quarter" since no real pilot customer exists
+        in this environment -> pull a findings report via the API ->
+        record two outcomes -> confirm the third, still-undecided
+        finding's `confidence_score` comes back `"0.5"` -> confirm a
+        decided finding's own score excludes itself from its own history
+        -> confirm recording twice on the same finding is rejected with
+        409).
+      - Full local gate green: `ruff check .`, `mypy --strict .` (143
+        files), full suite (408 passed, 28 skipped — all DB-backed
+        skips), 100% branch coverage on `domain/variance.py`, eval `GATE
+        PASSED`, `bandit` clean, `pip-audit` clean. `gitleaks` not run
+        locally (unavailable in this environment, same as every prior
+        phase — CI's `security` job covers it).
+      - **Do not check this phase off until**: the four DB-backed test
+        files above are run against a live Postgres, same standard as
+        every prior phase — CI's next push against `master` is what
+        actually proves them, not this local gate. Phase 11's own gate
+        also remains genuinely open regardless of Phase 12's status; this
+        phase does not retroactively close it.

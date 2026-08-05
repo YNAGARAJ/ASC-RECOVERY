@@ -25,6 +25,7 @@ _EXPECTED: dict[tuple[Role, Action], bool] = {
     (Role.VIEWER, Action.MANAGE_USERS): False,
     (Role.VIEWER, Action.READ_AUDIT_LOG): False,
     (Role.VIEWER, Action.READ_PHI_ACCESS_LOG): False,
+    (Role.VIEWER, Action.RECORD_FINDING_OUTCOME): False,
     (Role.BILLER, Action.READ_CLAIM): True,
     (Role.BILLER, Action.READ_FINDING): True,
     (Role.BILLER, Action.READ_WORKLIST): True,
@@ -37,6 +38,7 @@ _EXPECTED: dict[tuple[Role, Action], bool] = {
     (Role.BILLER, Action.MANAGE_USERS): False,
     (Role.BILLER, Action.READ_AUDIT_LOG): False,
     (Role.BILLER, Action.READ_PHI_ACCESS_LOG): False,
+    (Role.BILLER, Action.RECORD_FINDING_OUTCOME): True,
     (Role.ADMIN, Action.READ_CLAIM): True,
     (Role.ADMIN, Action.READ_FINDING): True,
     (Role.ADMIN, Action.READ_WORKLIST): True,
@@ -49,6 +51,7 @@ _EXPECTED: dict[tuple[Role, Action], bool] = {
     (Role.ADMIN, Action.MANAGE_USERS): True,
     (Role.ADMIN, Action.READ_AUDIT_LOG): True,
     (Role.ADMIN, Action.READ_PHI_ACCESS_LOG): True,
+    (Role.ADMIN, Action.RECORD_FINDING_OUTCOME): True,
     (Role.AUDITOR, Action.READ_CLAIM): True,
     (Role.AUDITOR, Action.READ_FINDING): True,
     (Role.AUDITOR, Action.READ_WORKLIST): False,
@@ -61,6 +64,7 @@ _EXPECTED: dict[tuple[Role, Action], bool] = {
     (Role.AUDITOR, Action.MANAGE_USERS): False,
     (Role.AUDITOR, Action.READ_AUDIT_LOG): True,
     (Role.AUDITOR, Action.READ_PHI_ACCESS_LOG): True,
+    (Role.AUDITOR, Action.RECORD_FINDING_OUTCOME): False,
 }
 
 

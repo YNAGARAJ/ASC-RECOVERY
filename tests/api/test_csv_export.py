@@ -28,6 +28,8 @@ def test_csv_has_header_and_one_data_row(client: TestClient) -> None:
         "actual_allowed",
         "shortfall",
         "root_cause",
+        "outcome",
+        "amount_recovered",
     ]
     assert len(rows) == 2
     assert rows[1][2] == "99213"

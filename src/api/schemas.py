@@ -9,6 +9,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +42,10 @@ class FindingSummaryOut(BaseModel):
     root_cause: str
     rule_version: str
     created_at: datetime
+    outcome: str | None
+    amount_recovered: str | None
+    outcome_recorded_by: str | None
+    outcome_recorded_at: datetime | None
 
     @classmethod
     def from_domain(cls, row: FindingSummary) -> FindingSummaryOut:
@@ -55,6 +60,10 @@ class FindingSummaryOut(BaseModel):
             root_cause=row.root_cause,
             rule_version=row.rule_version,
             created_at=row.created_at,
+            outcome=row.outcome,
+            amount_recovered=row.amount_recovered,
+            outcome_recorded_by=row.outcome_recorded_by,
+            outcome_recorded_at=row.outcome_recorded_at,
         )
 
 
@@ -96,6 +105,7 @@ class FindingDetailOut(BaseModel):
     patient_member_id: str | None
     service_line: ServiceLineOut
     adjustments: list[AdjustmentOut]
+    confidence_score: str | None
 
     @classmethod
     def from_domain(cls, detail: FindingDetail) -> FindingDetailOut:
@@ -107,6 +117,7 @@ class FindingDetailOut(BaseModel):
             date_of_service=detail.date_of_service,
             patient_name=detail.patient_name,
             patient_member_id=detail.patient_member_id,
+            confidence_score=detail.confidence_score,
             service_line=ServiceLineOut(
                 line_index=detail.service_line.line_index,
                 procedure_code=detail.service_line.procedure_code,
@@ -123,6 +134,14 @@ class FindingDetailOut(BaseModel):
                 for a in detail.adjustments
             ],
         )
+
+
+class RecordOutcomeIn(BaseModel):
+    outcome: Literal["recovered", "denied", "abandoned", "expired"]
+    # str, not Decimal -- same money-field convention as everywhere else in
+    # this module; parsed to Decimal in the route handler before it
+    # reaches api.repository.RecordOutcomeInput.
+    amount_recovered: str | None = None
 
 
 class IngestionOutcomeOut(BaseModel):

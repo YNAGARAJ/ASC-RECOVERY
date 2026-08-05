@@ -66,6 +66,54 @@ below says explicitly what is and isn't verified.
    chain (image, secrets injection, network path to the DB) actually
    works, not just that the container started.
 
+## Onboarding a new customer
+
+`scripts/onboard_customer.py` (Phase 12) creates a tenant, its first admin
+user, and optionally an initial contract + fee-schedule version. It is a
+script, not an API endpoint, on purpose: `security/rbac.py` is entirely
+tenant-scoped, and there is no "platform superadmin" role that could gate a
+`POST /tenants` endpoint without breaking the no-cross-tenant-access
+boundary this build has maintained since Phase 3. It connects directly with
+the application's own `DATABASE_URL` (the `asc_app` role) and calls
+straight into `db.repository`, the same adapter `PostgresRepository` wraps
+-- bypassing HTTP entirely, the same way `scripts/db/init_roles.sql` is a
+direct-DB-access, operator-run step rather than an endpoint.
+
+1. Write a JSON config, e.g. `onboard_riverside.json`:
+   ```json
+   {
+     "tenant_name": "Riverside ASC",
+     "admin_subject": "auth0|riverside-admin",
+     "admin_role": "admin",
+     "contract": {
+       "payer_id": "ACME-PPO",
+       "name": "Acme Health PPO",
+       "effective_from": "2026-01-01",
+       "fee_schedule": { "99213": "100.00", "99214": "150.00" }
+     }
+   }
+   ```
+   `admin_subject` is the bearer token `sub` claim the real IdP will issue
+   for this user (see `src/api/auth.py`) -- this script only creates the
+   `users` row that maps it to a tenant and role, it does not create the
+   IdP account itself, which is out of this codebase's scope. `contract`
+   is optional; omit it to onboard a tenant with no fee schedule yet and
+   load one later via `POST /contracts` + `POST /contracts/{id}/versions`.
+   Payment rules (MPPR, bilateral, assistant surgeon, implant carve-out)
+   always start disabled here for the same reason -- configure them via
+   that same endpoint once the tenant can authenticate.
+
+2. Run it:
+   ```
+   DATABASE_URL="<asc_app connection string>" \
+     PYTHONPATH=src python scripts/onboard_customer.py onboard_riverside.json
+   ```
+   Prints the new tenant/user/contract ids on success. Not run against a
+   real Postgres in the environment this was authored in -- verified so far
+   only via `ruff`/`mypy --strict` and a fake `DATABASE_URL` that exercises
+   config validation without a live connection; get a real run against a
+   provisioned database before trusting it for an actual pilot customer.
+
 ## Rollback
 
 Re-run step 5 above with the previous image tag — both Terraform modules

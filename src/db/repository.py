@@ -559,6 +559,89 @@ def list_findings_by_payer_claim_control_number(
     )
 
 
+# --- Outcomes and confidence scoring (Phase 12) -----------------------------------
+
+
+def record_finding_outcome(
+    session: Session,
+    tenant_id: uuid.UUID,
+    finding_id: uuid.UUID,
+    *,
+    outcome: str,
+    amount_recovered: Decimal | None,
+    recorded_by: str,
+) -> FindingModel:
+    """The human-recording step -- callers must call
+    domain.outcomes.validate_outcome_recording first (this function does
+    not re-check that an outcome isn't already set or that the finding
+    isn't a CORRECT_NO_VARIANCE one; that's pure domain logic, not a
+    database concern)."""
+    finding = session.execute(
+        select(FindingModel).where(
+            FindingModel.tenant_id == tenant_id, FindingModel.id == finding_id
+        )
+    ).scalar_one()
+    finding.outcome = outcome
+    finding.amount_recovered = amount_recovered
+    finding.outcome_recorded_by = recorded_by
+    finding.outcome_recorded_at = datetime.now(UTC)
+    session.flush()
+    return finding
+
+
+def list_historical_outcomes(
+    session: Session, tenant_id: uuid.UUID, payer_id: str, root_cause: str
+) -> list[FindingModel]:
+    """Every already-decided finding (outcome recorded) for this payer and
+    root cause -- domain.outcomes.calculate_confidence turns this into a
+    score for a new finding matching the same two dimensions. Payer
+    identity comes via contract_version -> contract, since Claim itself
+    doesn't carry payer_id directly; findings with no contract_version
+    (UNPRICED_CODE) can never match a payer this way and are correctly
+    excluded."""
+    return list(
+        session.execute(
+            select(FindingModel)
+            .join(
+                ContractVersionModel,
+                FindingModel.contract_version_id == ContractVersionModel.id,
+            )
+            .join(ContractModel, ContractVersionModel.contract_id == ContractModel.id)
+            .where(
+                FindingModel.tenant_id == tenant_id,
+                ContractModel.payer_id == payer_id,
+                FindingModel.root_cause == root_cause,
+                FindingModel.outcome.is_not(None),
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+def list_findings_past_deadline_without_outcome(
+    session: Session, tenant_id: uuid.UUID, as_of: date
+) -> list[FindingModel]:
+    """Findings whose approved recovery packet's appeal deadline has
+    passed with no outcome recorded yet. A human confirms these as
+    `expired` (domain.outcomes.Outcome.EXPIRED) -- this query only
+    surfaces candidates, it never writes anything itself."""
+    return list(
+        session.execute(
+            select(FindingModel)
+            .join(RecoveryPacketModel, RecoveryPacketModel.finding_id == FindingModel.id)
+            .where(
+                FindingModel.tenant_id == tenant_id,
+                FindingModel.outcome.is_(None),
+                RecoveryPacketModel.status == "approved",
+                RecoveryPacketModel.deadline < as_of,
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FindingDetail:
     """Full evidence chain for a single finding -- Finding joined with its

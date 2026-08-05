@@ -208,6 +208,34 @@ def test_decide_packet_matrix(client: TestClient, seed_ids: SeedIds, role: Role)
 
 
 @pytest.mark.parametrize("role", list(Role))
+def test_record_outcome_matrix(client: TestClient, seed_ids: SeedIds, role: Role) -> None:
+    """Cross-tenant proof for outcome recording: a tenant-A user must
+    never be able to record an outcome against tenant B's finding."""
+    action = Action.RECORD_FINDING_OUTCOME
+
+    other = client.post(
+        f"/findings/{seed_ids.finding_b}/outcome",
+        headers=auth_headers(role, "a"),
+        json={"outcome": "recovered", "amount_recovered": "50.00"},
+    )
+    own = client.post(
+        f"/findings/{seed_ids.finding_a}/outcome",
+        headers=auth_headers(role, "a"),
+        json={"outcome": "recovered", "amount_recovered": "50.00"},
+    )
+
+    if not can(role, action):
+        assert own.status_code == 403
+        assert other.status_code == 403
+        return
+
+    assert other.status_code == 404
+    assert own.status_code == 200
+    assert own.json()["outcome"] == "recovered"
+    assert own.json()["amount_recovered"] == "50.00"
+
+
+@pytest.mark.parametrize("role", list(Role))
 def test_claim_access_history_matrix(client: TestClient, seed_ids: SeedIds, role: Role) -> None:
     action = Action.READ_PHI_ACCESS_LOG
     # Generate some access history first, independent of the role under

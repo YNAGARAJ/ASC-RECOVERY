@@ -58,6 +58,10 @@ def _finding_detail(tenant_label: str, claim_id: uuid.UUID) -> FindingDetail:
         root_cause="MPPR_NOT_APPLIED",
         rule_version="2026.08.0",
         created_at=now(),
+        outcome=None,
+        amount_recovered=None,
+        outcome_recorded_by=None,
+        outcome_recorded_at=None,
     )
     return FindingDetail(
         summary=summary,
@@ -77,6 +81,7 @@ def _finding_detail(tenant_label: str, claim_id: uuid.UUID) -> FindingDetail:
             service_date=date(2023, 1, 10),
         ),
         adjustments=[],
+        confidence_score=None,
     )
 
 

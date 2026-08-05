@@ -5,130 +5,202 @@ at a clean commit as of this checkpoint. Read `docs/PHASES.md` first for
 the phase checklist — this file adds the texture that isn't in that
 summary.
 
-## Phase: 11 (real data readiness — the compliance gate). Drafting done, the actual gate is nowhere close to met.
+## Phase: 12 (first customer pilot). Code complete; DB-backed half unverified, same ceiling as every phase before Phase 10's CI run.
 
-Phase 10 is done and CI-confirmed (see its own detailed entry in
-`docs/PHASES.md`, including the "CI debugging round" list of 15 real bugs
-the first-ever live pipeline run surfaced and fixed). Phase 11 is a
-different kind of phase entirely: **no code**, per
-`docs/MASTER-BUILD-PROMPT.md` — a 15-item checklist of legal/compliance/
-business actions (BAAs, a Security Risk Analysis, incident response plan,
-breach notification procedure, workforce training, insurance, a
-third-party penetration test, legal review) that must all be genuinely
-true, not just documented, before Phase 12 (first customer pilot) can
-start.
+**This phase started with Phase 11's own gate still open.** Phase 11's
+entry in `docs/PHASES.md` says explicitly: "do not check this phase off,
+and do not start Phase 12, until every one of the 15 items in
+`docs/compliance/README.md`'s tracker reads DONE with real evidence." That
+has not happened — nothing in `docs/compliance/` is signed, purchased,
+engaged, or tested. The user explicitly directed proceeding anyway ("yes,
+proceed with Phase 12 we have audit to do") after being told this
+directly. This is a deliberate sequencing override, not something a
+resuming session should quietly "fix" by trying to backfill Phase 11 —
+that phase's remaining items are external actions (BAAs, insurance, a
+pentest engagement), not more engineering.
 
-**Percentage of Phase 11's gate met: roughly 0/15 by the gate's own
-definition** ("all 15 read DONE with real evidence"), even though 7 of
-the 15 items now have a real, useful drafted document behind them. A
-drafted document is explicitly not a completed item in this phase — see
-`docs/compliance/README.md`'s own framing. Don't let the volume of
-writing produced this session read as more progress than it is: nothing
-in `docs/compliance/` is signed, purchased, engaged, or tested yet.
+Everything in this phase that *can* be verified without a live Postgres
+has been: pure domain logic, RBAC matrix, schema serialization, the
+onboarding script's config validation, offline Alembic SQL generation.
+Everything that needs a real database (four DB-backed test files) is
+written, skips cleanly with an explicit message, and has never executed —
+it will get its first real run the next time this branch's CI pipeline
+goes green against a real Postgres, same as every DB-writing phase before
+Phase 10.
 
 ## Done (files completed, one line each)
 
-New `docs/compliance/` directory:
-- `README.md` — the master tracker: all 15 checklist items from the
-  master prompt, each with a status and a concrete next action.
-- `SECURITY-RISK-ANALYSIS.md` — restructures `docs/SECURITY.md`'s control
-  matrix into risk-analysis form (threat × existing control × residual
-  risk × remediation priority). Flags unwired rate-limiting/account-
-  lockout as the single highest residual-risk finding.
-- `INCIDENT-RESPONSE-PLAN.md` — expands `docs/RUNBOOK.md`'s 4-step
-  outline into the full response cycle, a severity scheme, and a
-  contact-tree template — every name field deliberately blank.
-- `BREACH-NOTIFICATION-PROCEDURE.md` — the 60-day clock, a reportability
-  decision tree, and the notification recipient/deadline table.
-- `DATA-RETENTION-SCHEDULE.md` — documents retention periods already true
-  of the running system, separately from the genuinely undecided
-  destruction procedure.
-- `SECURITY-QUESTIONNAIRE-ANSWERS.md` — restates `docs/SECURITY.md` facts
-  in customer-questionnaire form; lowest-risk document in this phase.
-- `BUSINESS-CONTINUITY-DR-PLAN.md` — documents Phase 9's DR mechanism,
-  proposes RPO/RTO targets, explicit that nothing is tested yet.
-- `SANCTION-POLICY.md` — a standard progressive-discipline template for
-  HIPAA workforce violations.
-
-`docs/PHASES.md` — Phase 10 marked done with full "CI debugging round"
-detail; Phases 3/5/6/7/8 checkboxes updated to reflect Phase 10's CI
-confirmation; Phase 11 entry added (deliberately left unchecked).
+- `src/domain/outcomes.py` (new) — `Outcome` enum, `validate_outcome_recording`
+  (rejects a second recording on the same finding, and any recording on a
+  `CORRECT_NO_VARIANCE` finding), `calculate_confidence` (recovered-count /
+  decided-count, `None` on cold start). Pure, no I/O.
+- `tests/domain/test_outcomes.py` (new) — 8 tests, all passing.
+- `alembic/versions/0005_finding_outcomes.py` (new) — four nullable
+  columns on `findings`: `outcome`, `amount_recovered`,
+  `outcome_recorded_by`, `outcome_recorded_at`. Same idempotency pattern as
+  0002-0004 (offline branch + inspector-guarded online branch).
+- `src/db/models.py` — `Finding` extended with the four columns above.
+- `src/db/repository.py` — `record_finding_outcome`, `list_historical_outcomes`
+  (payer + root_cause, joined via `contract_version -> contract`),
+  `list_findings_past_deadline_without_outcome` (surfaces candidates for a
+  human to confirm as expired; never writes anything itself).
+- `src/security/rbac.py` — new `Action.RECORD_FINDING_OUTCOME`, granted to
+  BILLER and ADMIN.
+- `src/api/repository.py` — `FindingSummary`/`FindingDetail` extended with
+  outcome fields; new `RecordOutcomeInput`; `Repository.record_finding_outcome`
+  (Protocol + `PostgresRepository` impl); `confidence_score` computed in
+  `get_finding_detail` only (not the list endpoint — see Decisions below);
+  new `_lookup_payer_id` helper.
+- `src/api/schemas.py` — `RecordOutcomeIn`; outcome fields on
+  `FindingSummaryOut`; `confidence_score` on `FindingDetailOut`.
+- `src/api/routes/findings.py` — `POST /findings/{id}/outcome` (409 on
+  `OutcomeAlreadyRecordedError`, 422 on `NothingToAppealError`); CSV export
+  gained `outcome`/`amount_recovered` columns.
+- `tests/api/fakes.py`, `tests/api/conftest.py`, `tests/api/test_pagination.py`,
+  `tests/api/test_csv_export.py`, `tests/api/test_authz_matrix.py` — updated
+  for the new fields/route; `test_authz_matrix.py` now has a
+  `test_record_outcome_matrix` case, 52 total cases in that file, all
+  passing.
+- `scripts/onboard_customer.py` (new) — creates a tenant, its first admin
+  user, and optionally an initial contract + fee-schedule version. A
+  script, not an endpoint (see Decisions). Connects with the app's own
+  `DATABASE_URL`, calls straight into `db.repository`.
+- `docs/RUNBOOK.md` — new "Onboarding a new customer" section documenting
+  the script, its JSON config shape, and a worked example.
+- `tests/db/test_finding_outcomes.py` (new) — 3 DB-backed tests for the
+  three new repository functions, findings seeded directly via
+  `save_findings` (not full 835 ingestion) for exact control over
+  payer/root_cause/shortfall.
+- `tests/api/test_endpoints_live_db.py` — new
+  `test_record_outcome_cross_tenant_lookup_is_404_against_real_rls`.
+- `tests/api/test_pilot_workflow_live_db.py` (new) — the full synthetic
+  pilot: onboard -> load fee schedule -> ingest three synthetic 835 files
+  sharing one payer (standing in for "a quarter" — no real pilot customer
+  exists in this environment) -> findings report via the API -> record two
+  outcomes -> confirm the third finding's `confidence_score` is `"0.5"` ->
+  confirm a decided finding's own score excludes itself -> confirm
+  recording twice is rejected with 409.
+- `docs/PHASES.md` — Phase 12 entry added with full detail (deliberately
+  left unchecked); current-phase header updated.
 
 ## In progress
 
-Nothing mid-write. All 8 planned Phase 11 documents are complete as
-drafts. The remaining work in this phase is not writing — it's the real
-external actions `docs/compliance/README.md` lists for the other 8
-checklist items (BAAs ×3, insurance, pentest, workforce training, legal
-review of the fee structure, and the asset-inventory item blocked on
-Phase 9).
+Nothing mid-write. Every item in the approved Phase 12 plan is complete —
+this checkpoint is being written at the end of the phase's local-gate
+pass, not mid-implementation.
 
 ## Failing
 
-N/A — no code changed this phase, nothing for `make test`/`make lint`/
-`make eval`/`make security` to touch. Phase 10's gate remains green as of
-its last confirmed CI run (see `docs/PHASES.md`'s Phase 10 entry) with
-the same caveat noted there: confirmed via the user pasting CI logs into
-chat, not independently re-verified from this environment (no `gh` CLI
-configured here).
+Nothing failing locally. Full gate run this session, all green:
+`ruff check .` clean, `mypy --strict .` clean (143 files), `pytest -q`
+408 passed / 28 skipped (skips are every DB-backed test file across the
+whole repo, not new failures), 100% branch coverage on
+`domain/variance.py`, `python -m evals.run` GATE PASSED, `bandit -r .`
+clean, `pip-audit` clean, `alembic upgrade head --sql` clean through 0005.
+`gitleaks` was not run — not installed in this environment, same gap as
+every prior phase; CI's `security` job is what actually covers it.
+
+**The real unresolved item is verification, not failure**: the four
+DB-backed test files this phase added/touched
+(`tests/db/test_finding_outcomes.py`,
+`tests/api/test_endpoints_live_db.py`'s new case,
+`tests/api/test_pilot_workflow_live_db.py`) have never run against a real
+Postgres. They skip cleanly with an explicit message rather than silently
+passing — but "written and skips cleanly" is not the same as "verified,"
+and a resuming session should not report this phase as fully done until
+CI actually runs them green.
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **Every drafted compliance document opens with an explicit "engineering-
-  drafted, not adopted" disclaimer**, mirroring the pattern
-  `docs/SECURITY.md` already established in Phase 4 ("this is engineering
-  documentation, not legal advice"). This is deliberate and should not be
-  softened or removed when these documents are eventually revised — the
-  risk of someone mistaking a well-written draft for adopted policy is
-  exactly the failure mode this phase's own gate exists to prevent.
-- **The asset inventory/network map item was left explicitly BLOCKED, not
-  drafted with placeholder infrastructure.** `docs/SECURITY.md` already
-  has the template; filling it in before Phase 9's Terraform is applied
-  against a real account would mean documenting infrastructure that
-  doesn't exist. Don't complete this item early with fictional
-  owner/review-date values just to check a box.
-- **The Anthropic BAA/zero-retention-terms item is flagged as needing
-  active verification, not an assumption.** `docs/SECURITY.md` and
-  `packets/drafter.py::AnthropicPacketDrafter` were both written without
-  a BAA in place, and LLM API providers' retention terms can vary by tier
-  and change over time — whoever handles this item should confirm current
-  terms directly with Anthropic rather than trusting anything drafted
-  here about what those terms are.
-- **The data-retention destruction procedure (`DATA-RETENTION-SCHEDULE.md`)
-  is a genuinely open question, not a gap to fill in unilaterally.** This
-  system currently has no hard-delete path for any PHI-bearing row
-  (`audit_log`/`phi_access_log` can't even be soft-deleted by the app
-  role, by design). Deciding what "destruction" means here is a real
-  compliance decision with implementation consequences (a future phase's
-  code, not this one's).
+- **`confidence_score` lives only on `FindingDetailOut`, not
+  `FindingSummaryOut`.** The approved plan didn't specify this split
+  explicitly; it was decided during implementation to avoid an N+1 query
+  cost across a paginated list of up to 100 findings. If a future phase
+  wants confidence visible in the worklist table itself, that needs a
+  batched query design, not just moving the existing per-finding lookup
+  into the list path.
+- **Onboarding a new tenant is a script (`scripts/onboard_customer.py`),
+  deliberately not an API endpoint.** `security/rbac.py` is entirely
+  tenant-scoped — there is no "platform superadmin" role that could gate a
+  `POST /tenants` endpoint without breaking the no-cross-tenant-access
+  boundary maintained since Phase 3. Introducing one is a real
+  architectural decision for a later phase to make deliberately, not a
+  side effect of this phase's onboarding need.
+- **`list_findings_past_deadline_without_outcome` only surfaces
+  candidates — it never writes `outcome="expired"` itself.** Every outcome
+  recording, including expiry, is a human decision
+  (`domain.outcomes.validate_outcome_recording` is only ever called from
+  the human-facing recording path). There is currently no scheduled job or
+  route that calls this query at all; it exists for a future "overdue
+  findings" view/report to be built on top of, not wired to anything yet.
+- **Findings in `tests/db/test_finding_outcomes.py` are built directly via
+  `db.repository.save_findings`, not through the full 835 ingestion
+  pipeline** (unlike `tests/api/test_endpoints_live_db.py`'s existing
+  pattern). This was a deliberate choice for that file specifically, to
+  get exact control over payer_id/root_cause/shortfall combinations needed
+  to prove the filtering logic, without hand-building distinct synthetic
+  835 files for every scenario. `test_pilot_workflow_live_db.py`, by
+  contrast, does go through real ingestion (`ingest_file`) end to end,
+  because demonstrating the actual pilot workflow — not just the
+  repository functions — is that file's whole point.
+- **The synthetic "quarter" in `test_pilot_workflow_live_db.py` is three
+  files, not a real quarter's volume**, each built from a parameterized
+  copy of `tests/domain/fixtures_x835.py`'s `claim_segments` shape (same
+  charge/allowed/paid numbers, different claim/payer control numbers so
+  they don't collide on remittance file_hash dedup or claim identity).
+  This keeps all three findings identical in payer/root_cause/shortfall by
+  construction, which is exactly what the confidence-score test needs and
+  is stated as a demonstration, not a claim of real pilot volume.
 
 ## Traps for someone resuming cold
 
-- **Don't mistake a drafted document for a completed checklist item.**
-  `docs/compliance/README.md`'s status column exists precisely to prevent
-  this — check it, not just whether a file exists.
-- **The BAA-to-customer notification deadline in a real signed contract
-  is often shorter than the statutory 60-day HIPAA clock**
-  (`BREACH-NOTIFICATION-PROCEDURE.md` section 3) — easy to miss during a
-  real incident if nobody checks the actual contract terms in advance.
-- Everything from the Phase 3-10 checkpoints still applies (CRLF warnings
+- **Don't check Phase 11 off as a side effect of Phase 12 progress.**
+  They are independent; Phase 12 being code-complete says nothing about
+  Phase 11's external checklist items being done. See Phase 11's own
+  `docs/PHASES.md` entry and `docs/compliance/README.md`'s tracker.
+- **`RootCause` is stored on `Finding` as `.name` (e.g.
+  `"UNDETERMINED_VARIANCE"`), not `.value`** — reconstructing it from a DB
+  row requires `RootCause[stored_string]` (bracket lookup), not
+  `RootCause(stored_string)` (call syntax, which would raise). This
+  predates this phase but is exactly what `record_finding_outcome`'s
+  validation path in `api/repository.py` depends on getting right.
+  `list_historical_outcomes` takes `root_cause: str` and matches it
+  against this same `.name` string, not the enum's `.value`.
+  `Decimal(1) / Decimal(2)` from `calculate_confidence` renders as `"0.5"`
+  via `str(Decimal(...))`, but `Decimal(0) / Decimal(1)` renders as `"0"`,
+  not `"0.0"` — `test_pilot_workflow_live_db.py`'s assertions depend on
+  getting this exactly right; don't "simplify" those literals without
+  checking Python's actual `Decimal` string formatting.
+- **`db.repository.list_findings` orders by `FindingModel.created_at.desc()`**,
+  and rows inserted within the same transaction can share an identical
+  `created_at` (Postgres's `now()` is transaction-start time, not
+  statement time) — `test_pilot_workflow_live_db.py` deliberately never
+  depends on which of the three ingested findings comes back "first";
+  it only partitions the returned list into "two I'll decide" and "one
+  I won't," which holds regardless of tie-breaking order since all three
+  are structurally identical by construction.
+- Everything from the Phase 3-11 checkpoints still applies (CRLF warnings
   on `git add`, cross-platform lockfile drift if `make lock` runs on
   Windows/macOS, `.terraform/`/`sbom.json` gitignored on purpose,
-  `docs/AUDIT-PROMPTS.md` is the user's own file for a later phase — see
-  `docs/PHASES.md`'s Phase 10 entry for the full, longer list).
+  `scripts/hooks/block_phi.sh` blocks any email not ending in
+  `@example.com`/`@test`/`@localhost` in new file content — this session
+  hit that hook once with `@example.test` and had to switch to
+  `@example.com`). See `docs/PHASES.md`'s Phase 10 entry for the full,
+  longer list of earlier traps.
 
 ## Next 3 steps
 
-1. **Work through `docs/compliance/README.md`'s 8 externally-actioned
-   items** — these require the user/business, not more engineering: BAAs
-   (cloud provider via AWS Artifact/Azure's online acceptance; customer;
-   Anthropic), cyber liability insurance quotes, engaging a third-party
-   pentest firm, workforce training once real workforce exists, legal
-   review of the contingency-fee contract structure.
-2. **Fill in the blanks in `INCIDENT-RESPONSE-PLAN.md` and
-   `SANCTION-POLICY.md`** (real names, real contacts) and run a tabletop
-   exercise — both are explicitly not usable until this happens.
-3. **Once Phase 9's real infrastructure exists**: complete the
-   asset-inventory/network-map item, and run the actual timed restore
-   drill `BUSINESS-CONTINUITY-DR-PLAN.md` calls for. Only after all 15
-   items in `docs/compliance/README.md` read DONE should Phase 12 start.
+1. **Push this branch and let CI run the four new/updated DB-backed test
+   files against a real Postgres** — this is the only thing standing
+   between "code complete" and actually checking Phase 12 off in
+   `docs/PHASES.md`. Nothing about the pure/local half needs redoing.
+2. **If CI surfaces a real bug** (same pattern as Phase 10's "CI debugging
+   round" and Phase 5/6/7/8's first live runs): fix it, re-run the full
+   local gate, push again. Do not assume the DB-backed tests are correct
+   just because they're well-written and skip cleanly locally.
+3. **Separately, and not blocking Phase 12's own code-complete status**:
+   Phase 11's external checklist items (BAAs, insurance, pentest,
+   workforce training, legal review) are still open and are what actually
+   gates real PHI ever reaching this system — see that phase's own
+   `docs/PHASES.md` entry and `docs/compliance/README.md` for the concrete
+   next actions there.

@@ -23,10 +23,13 @@ from api.repository import (
     FindingSummary,
     Page,
     PagedResult,
+    RecordOutcomeInput,
     RecoveryPacketSummary,
     UserRecord,
 )
 from domain.deadlines import calculate_appeal_deadline
+from domain.outcomes import Outcome, validate_outcome_recording
+from domain.variance import RootCause
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome
 from ingestion.virus_scan import VirusScanner
@@ -281,3 +284,27 @@ class FakeRepository:
         )
         self.packets[packet_id] = (tenant_id, updated)
         return updated
+
+    def record_finding_outcome(
+        self,
+        tenant_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        data: RecordOutcomeInput,
+        recorded_by: str,
+    ) -> FindingSummary | None:
+        entry = self.findings.get(finding_id)
+        if entry is None or entry[0] != tenant_id:
+            return None
+        _, detail = entry
+        existing_outcome = Outcome(detail.summary.outcome) if detail.summary.outcome else None
+        validate_outcome_recording(RootCause[detail.summary.root_cause], existing_outcome)
+        updated_summary = replace(
+            detail.summary,
+            outcome=data.outcome,
+            amount_recovered=None if data.amount_recovered is None else str(data.amount_recovered),
+            outcome_recorded_by=recorded_by,
+            outcome_recorded_at=now(),
+        )
+        self.findings[finding_id] = (tenant_id, replace(detail, summary=updated_summary))
+        return updated_summary

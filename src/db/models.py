@@ -283,6 +283,15 @@ class Finding(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
+    # Phase 12's outcome feedback loop -- recorded once, by a human, never
+    # silently overwritten (domain.outcomes.validate_outcome_recording
+    # enforces this before any write). NULL until an outcome is recorded.
+    outcome: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    amount_recovered: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    outcome_recorded_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    outcome_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class AuditLog(Base):

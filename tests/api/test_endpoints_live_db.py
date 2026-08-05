@@ -272,6 +272,36 @@ def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     assert any(event["action"] == "finding_created" for event in events), events
 
 
+def test_record_outcome_cross_tenant_lookup_is_404_against_real_rls(
+    live_client: TestClient, app_session_factory: sessionmaker[Session]
+) -> None:
+    """Phase 12: recording an outcome against another tenant's finding id
+    must 404, never silently write against it -- same cross-tenant shape
+    RLS already proves for GET /findings/{id}."""
+    _, subject_a = _seed_tenant(app_session_factory, "outcome-a")
+    _, subject_b = _seed_tenant(app_session_factory, "outcome-b")
+
+    other_list = live_client.get("/findings", headers=_auth_headers(subject_b))
+    other_finding_id = other_list.json()["items"][0]["id"]
+
+    cross_tenant_response = live_client.post(
+        f"/findings/{other_finding_id}/outcome",
+        headers=_auth_headers(subject_a),
+        json={"outcome": "recovered", "amount_recovered": "50.00"},
+    )
+    assert cross_tenant_response.status_code == 404
+
+    own_list = live_client.get("/findings", headers=_auth_headers(subject_a))
+    own_finding_id = own_list.json()["items"][0]["id"]
+    own_response = live_client.post(
+        f"/findings/{own_finding_id}/outcome",
+        headers=_auth_headers(subject_a),
+        json={"outcome": "recovered", "amount_recovered": "50.00"},
+    )
+    assert own_response.status_code == 200
+    assert own_response.json()["outcome"] == "recovered"
+
+
 def test_readyz_returns_200_against_real_postgres(live_client: TestClient) -> None:
     """Phase 9: /readyz has no auth and no tenant context -- it exists to
     prove the deployed instance can actually reach its database, which

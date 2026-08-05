@@ -38,6 +38,7 @@ class Action(enum.Enum):
     MANAGE_USERS = "manage_users"
     READ_AUDIT_LOG = "read_audit_log"
     READ_PHI_ACCESS_LOG = "read_phi_access_log"
+    RECORD_FINDING_OUTCOME = "record_finding_outcome"
 
 
 _PERMISSIONS: dict[Role, frozenset[Action]] = {
@@ -59,6 +60,7 @@ _PERMISSIONS: dict[Role, frozenset[Action]] = {
             Action.READ_CONTRACT,
             Action.DRAFT_RECOVERY_PACKET,
             Action.APPROVE_RECOVERY_PACKET,
+            Action.RECORD_FINDING_OUTCOME,
         }
     ),
     Role.ADMIN: frozenset(Action),

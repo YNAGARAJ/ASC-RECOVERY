@@ -41,6 +41,13 @@ from domain.contract import (
 )
 from domain.deadlines import calculate_appeal_deadline
 from domain.money import Money, Rate
+from domain.outcomes import (
+    HistoricalOutcome,
+    Outcome,
+    calculate_confidence,
+    validate_outcome_recording,
+)
+from domain.variance import RootCause
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.virus_scan import VirusScanner
@@ -88,6 +95,10 @@ class FindingSummary:
     root_cause: str
     rule_version: str
     created_at: datetime
+    outcome: str | None
+    amount_recovered: str | None
+    outcome_recorded_by: str | None
+    outcome_recorded_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +130,13 @@ class FindingDetail:
     patient_member_id: str | None
     service_line: ServiceLineInfo
     adjustments: list[AdjustmentInfo]
+    confidence_score: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordOutcomeInput:
+    outcome: str
+    amount_recovered: Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +348,15 @@ class Repository(Protocol):
         self, tenant_id: uuid.UUID, claim_id: uuid.UUID
     ) -> tuple[AccessEventSummary, ...]: ...
 
+    def record_finding_outcome(
+        self,
+        tenant_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        data: RecordOutcomeInput,
+        recorded_by: str,
+    ) -> FindingSummary | None: ...
+
 
 def _packet_to_summary(row: RecoveryPacketModel) -> RecoveryPacketSummary:
     return RecoveryPacketSummary(
@@ -356,6 +383,21 @@ def _template_from_json(data: dict[str, object] | None) -> PacketTemplate | None
     )
 
 
+def _lookup_payer_id(session: Session, contract_version_id: uuid.UUID | None) -> str | None:
+    """`Claim`/`Finding` never carry payer identity directly -- it's only
+    reachable via contract_version -> contract, and a finding with no
+    contract_version (root_cause UNPRICED_CODE) has no payer to look up
+    at all. Shared by confidence-score lookup and packet generation's
+    existing contract-attribute lookup."""
+    if contract_version_id is None:
+        return None
+    version = session.get(ContractVersionORM, contract_version_id)
+    if version is None:
+        return None
+    contract = session.get(ContractORM, version.contract_id)
+    return contract.payer_id if contract is not None else None
+
+
 def _finding_to_summary(row: FindingModel) -> FindingSummary:
     return FindingSummary(
         id=row.id,
@@ -368,6 +410,10 @@ def _finding_to_summary(row: FindingModel) -> FindingSummary:
         root_cause=row.root_cause,
         rule_version=row.rule_version,
         created_at=row.created_at,
+        outcome=row.outcome,
+        amount_recovered=None if row.amount_recovered is None else str(row.amount_recovered),
+        outcome_recorded_by=row.outcome_recorded_by,
+        outcome_recorded_at=row.outcome_recorded_at,
     )
 
 
@@ -478,6 +524,19 @@ class PostgresRepository:
                 paid_computed=str(detail.service_line.paid_computed),
                 service_date=detail.service_line.service_date,
             )
+            payer_id = _lookup_payer_id(session, detail.finding.contract_version_id)
+            confidence_score = None
+            if payer_id is not None:
+                historical_rows = db_repository.list_historical_outcomes(
+                    session, tenant_id, payer_id, detail.finding.root_cause
+                )
+                historical = [
+                    HistoricalOutcome(Outcome(row.outcome))
+                    for row in historical_rows
+                    if row.id != finding_id
+                ]
+                confidence = calculate_confidence(historical)
+                confidence_score = None if confidence is None else str(confidence.as_decimal())
             return FindingDetail(
                 summary=_finding_to_summary(detail.finding),
                 evidence=detail.finding.evidence,
@@ -492,6 +551,7 @@ class PostgresRepository:
                 ),
                 service_line=service_line,
                 adjustments=adjustments,
+                confidence_score=confidence_score,
             )
 
     def list_contracts(
@@ -709,6 +769,30 @@ class PostgresRepository:
                 )
                 for event in events
             )
+
+    def record_finding_outcome(
+        self,
+        tenant_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        data: RecordOutcomeInput,
+        recorded_by: str,
+    ) -> FindingSummary | None:
+        with tenant_session(self._session_factory, tenant_id) as session:
+            row = session.get(FindingModel, finding_id)
+            if row is None or row.tenant_id != tenant_id:
+                return None
+            existing_outcome = Outcome(row.outcome) if row.outcome is not None else None
+            validate_outcome_recording(RootCause[row.root_cause], existing_outcome)
+            updated = db_repository.record_finding_outcome(
+                session,
+                tenant_id,
+                finding_id,
+                outcome=data.outcome,
+                amount_recovered=data.amount_recovered,
+                recorded_by=recorded_by,
+            )
+            return _finding_to_summary(updated)
 
     def decide_packet(
         self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
