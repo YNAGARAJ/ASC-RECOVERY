@@ -10,8 +10,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from api.repository import (
+    AccessEventSummary,
     AuditLogEntry,
     AuditLogFilters,
     ContractSummary,
@@ -43,6 +45,7 @@ class FakeRepository:
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
     packets: dict[uuid.UUID, tuple[uuid.UUID, RecoveryPacketSummary]] = field(default_factory=dict)
+    access_events: list[tuple[uuid.UUID, AccessEventSummary]] = field(default_factory=list)
     ingest_calls: list[tuple[uuid.UUID, bytes, str, str]] = field(default_factory=list)
     next_ingest_outcome: IngestionOutcome | DuplicateOutcome | None = None
 
@@ -84,6 +87,7 @@ class FakeRepository:
                 claims_created=0,
                 findings_created=0,
                 reconciliation_mismatches=0,
+                dollars_detected=Decimal("0"),
             )
         if self.next_ingest_outcome is not None:
             return self.next_ingest_outcome
@@ -93,6 +97,7 @@ class FakeRepository:
             claims_created=1,
             findings_created=1,
             reconciliation_mismatches=0,
+            dollars_detected=Decimal("50.00"),
         )
 
     def list_findings(
@@ -114,7 +119,7 @@ class FakeRepository:
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
 
     def get_finding_detail(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> FindingDetail | None:
         entry = self.findings.get(finding_id)
         if entry is None:
@@ -125,7 +130,27 @@ class FakeRepository:
             # IDOR-shaped guarantee tests/db/test_rls_tenant_isolation.py
             # proves at the DB layer.
             return None
+        self._record_access(
+            tenant_id,
+            actor=actor,
+            action="finding_detail_view",
+            claim_id=detail.summary.claim_id,
+            purpose="finding_detail_view",
+        )
         return detail
+
+    def _record_access(
+        self, tenant_id: uuid.UUID, *, actor: str, action: str, claim_id: uuid.UUID, purpose: str
+    ) -> None:
+        event = AccessEventSummary(
+            occurred_at=now(),
+            actor=actor,
+            action=action,
+            resource_type="claim",
+            resource_id=str(claim_id),
+            purpose=purpose,
+        )
+        self.access_events.append((tenant_id, event))
 
     def list_contracts(self, tenant_id: uuid.UUID, *, page: Page) -> PagedResult[ContractSummary]:
         items = [summary for tid, summary in self.contracts.values() if tid == tenant_id]
@@ -187,6 +212,14 @@ class FakeRepository:
         entry = self.findings.get(finding_id)
         if entry is None or entry[0] != tenant_id:
             return None
+        _, detail = entry
+        self._record_access(
+            tenant_id,
+            actor=generated_by,
+            action="packet_generation",
+            claim_id=detail.summary.claim_id,
+            purpose="packet_generation",
+        )
         packet = RecoveryPacketSummary(
             id=uuid.uuid4(),
             finding_id=finding_id,
@@ -202,13 +235,32 @@ class FakeRepository:
         return packet
 
     def list_packets(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> list[RecoveryPacketSummary]:
+        entry = self.findings.get(finding_id)
+        if entry is not None and entry[0] == tenant_id:
+            self._record_access(
+                tenant_id,
+                actor=actor,
+                action="packet_list_view",
+                claim_id=entry[1].summary.claim_id,
+                purpose="packet_list_view",
+            )
         return [
             packet
             for tid, packet in self.packets.values()
             if tid == tenant_id and packet.finding_id == finding_id
         ]
+
+    def get_claim_access_history(
+        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+    ) -> tuple[AccessEventSummary, ...]:
+        events = [
+            event
+            for tid, event in self.access_events
+            if tid == tenant_id and event.resource_id == str(claim_id)
+        ]
+        return tuple(sorted(events, key=lambda event: event.occurred_at))
 
     def decide_packet(
         self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str

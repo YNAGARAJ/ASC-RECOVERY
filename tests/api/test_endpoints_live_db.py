@@ -101,6 +101,17 @@ def _auth_headers(subject: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {tokens.access_token}"}
 
 
+def _auth_headers_as(subject: str, role: Role) -> dict[str, str]:
+    """Role lives in the JWT itself (Phase 6: `AccessTokenClaims` carries
+    no DB round-trip for role, only `sub` needs to resolve via the `users`
+    table for tenant_id) -- minting a different role for an existing
+    seeded subject is a legitimate way to exercise an endpoint gated to a
+    role `_seed_tenant`'s single BILLER user doesn't have, without adding
+    a second user just for one test."""
+    tokens = issue_session(JWT_SECRET, subject, role, mfa_verified=True)
+    return {"Authorization": f"Bearer {tokens.access_token}"}
+
+
 def test_findings_list_returns_only_own_tenant_row(
     live_client: TestClient, app_session_factory: sessionmaker[Session]
 ) -> None:
@@ -173,3 +184,33 @@ def test_generate_and_approve_packet_round_trip_against_real_postgres(
         )
     assert generated_count == 1
     assert approved_count == 1
+
+
+def test_viewing_a_finding_shows_up_in_its_claim_access_history(
+    app_session_factory: sessionmaker[Session],
+) -> None:
+    """Phase 8 gate: the audit report reconstructs a full access history
+    for a given claim. Viewing a finding's PHI-bearing detail writes a
+    phi_access_log entry; this proves it's actually queryable back out
+    through the auditor-facing endpoint, against real Postgres."""
+    _, subject = _seed_tenant(app_session_factory, "access-history-a")
+    repository = PostgresRepository(app_session_factory, drafter=ScriptedPacketDrafter([]))
+    app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
+    client = TestClient(app)
+
+    findings = client.get("/findings", headers=_auth_headers(subject))
+    finding_id = findings.json()["items"][0]["id"]
+
+    detail = client.get(f"/findings/{finding_id}", headers=_auth_headers(subject))
+    assert detail.status_code == 200
+    claim_id = detail.json()["finding"]["claim_id"]
+
+    history = client.get(
+        f"/claims/{claim_id}/access-history", headers=_auth_headers_as(subject, Role.ADMIN)
+    )
+    assert history.status_code == 200
+    events = history.json()["items"]
+    assert any(
+        event["action"] == "finding_detail_view" and event["actor"] == subject
+        for event in events
+    )

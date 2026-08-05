@@ -30,3 +30,8 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local eval run history (evals/history.py) -- a rolling local log of
+# `make eval` invocations, not meaningful shared history across machines;
+# a real deployment sends this to a metrics backend instead.
+evals/history/

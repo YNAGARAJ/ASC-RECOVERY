@@ -63,10 +63,10 @@ class PHIRedactionFilter(logging.Filter):
             if hasattr(record, field_name):
                 setattr(record, field_name, _REDACTED)
 
-        record.msg = _scrub_text(str(record.msg))
+        record.msg = scrub_text(str(record.msg))
         if record.args:
             record.args = tuple(
-                _scrub_text(arg) if isinstance(arg, str) else arg for arg in record.args
+                scrub_text(arg) if isinstance(arg, str) else arg for arg in record.args
             )
 
         if record.exc_info and not record.exc_text:
@@ -74,12 +74,16 @@ class PHIRedactionFilter(logging.Filter):
             # Formatter, which runs after filters, sees it already set and
             # uses this scrubbed version verbatim instead of recomputing
             # the raw traceback text itself.
-            record.exc_text = _scrub_text(_exception_formatter.formatException(record.exc_info))
+            record.exc_text = scrub_text(_exception_formatter.formatException(record.exc_info))
 
         return True
 
 
-def _scrub_text(text: str) -> str:
+def scrub_text(text: str) -> str:
+    """Regex-scrub SSN/MBI-shaped substrings -- the same defense-in-depth
+    mechanism `PHIRedactionFilter` applies to log records, exposed
+    publicly so `observability.tracing`'s span-attribute scrubbing reuses
+    these exact patterns instead of a second, driftable copy of them."""
     text = _SSN_PATTERN.sub(_REDACTED, text)
     text = _MBI_PATTERN.sub(_REDACTED, text)
     return text

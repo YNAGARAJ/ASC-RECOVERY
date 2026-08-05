@@ -1,11 +1,14 @@
 # Build Phases
 
-**Current phase: Phase 7 — Recovery packet generation**
+**Current phase: Phase 8 — Observability and audit**
 
 Phase 3's gate is still unverified pending a live Postgres — see below.
-Phase 4 is fully verified and checked off. Phases 5, 6, and 7 each split
+Phase 4 is fully verified and checked off. Phases 5, 6, 7, and 8 each split
 their work into a pure half (fully verified here) and a DB-writing half
 (code-complete, unverified for the same reason as Phase 3) — see below.
+Phase 8 is unusual in that most of its work is inherently pure
+(instrumentation and alert logic, not persistence), so its DB-touching
+surface is the smallest of the four.
 
 One phase per session. `/clear` between phases. Never advance past a failing
 gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
@@ -146,7 +149,62 @@ gate. See `docs/MASTER-BUILD-PROMPT.md` for full phase prompts and gates.
       without `TEST_DATABASE_URL`, never executed. **Do not check this
       phase off until that test is run against a live Postgres**, same
       standard as Phases 3, 5, and 6.
-- [ ] Phase 8 — Observability and audit
+- [ ] Phase 8 — Observability and audit — **code complete, one DB-backed
+      round-trip test unverified for the same reason as Phases 3, 5, 6, and
+      7.** Both of the phase's literal gate requirements are fully verified
+      without a live database — this is the bulk of the phase's actual
+      substance, not a workaround:
+      - **"Trace sampling captures no PHI (assert on exported spans)"**:
+        `src/observability/tracing.py`'s `PHIScrubbingSpanExporter` wraps
+        any real `SpanExporter` (decorator pattern, no auto-instrumentation
+        anywhere in this codebase — auto-instrumentors can capture raw SQL
+        or route params as span attributes, an uncontrolled leak surface).
+        `tests/observability/test_tracing.py` builds a span with a
+        deliberately PHI-shaped attribute and asserts the exported span
+        has none of it — real spans, real export pipeline, no mocking.
+      - **"Audit report reconstructs a full access history for a given
+        claim"**: `phi_access_log` (Phase 3 model, zero writers until now)
+        is finally wired into every PHI-bearing read path
+        (`api.repository.PostgresRepository.get_finding_detail`,
+        `list_packets`, `generate_packet`). `src/db/access_history.py`
+        (pure) merges `audit_log` and `phi_access_log` rows into one
+        chronological picture; `GET /claims/{claim_id}/access-history`
+        (`Action.READ_PHI_ACCESS_LOG`, already AUDITOR/ADMIN-only) exposes
+        it, added to the same 4-role authz-matrix discipline as every
+        Phase 6/7 endpoint (`tests/api/test_authz_matrix.py`, now 48
+        cases) — including the cross-tenant proof that another tenant's
+        claim history comes back empty, never a leak.
+
+      Also built: `src/observability/metrics.py` (`dollars_detected`,
+      `findings_per_remittance`, `ingestion_latency`, `ingestion_failures`,
+      `llm_cost_per_packet`, all wired into real code —
+      `ingestion.pipeline.ingest_file`, `ingestion.apply.apply_ingestion_plan`,
+      `packets.drafter.AnthropicPacketDrafter` — plus a documented
+      `queue_depth` stub, since ingestion is synchronous and there's no
+      queue to measure); `src/observability/alerts.py` (5 pure evaluators
+      for every alert the prompt names — ingestion failure, eval
+      regression, auth anomaly, unusual PHI access volume, cross-tenant
+      probe — detection logic only, wiring to a real paging service
+      deferred to Phase 9/10, same as every other real-integration
+      deferral this build has made); `evals/history.py` (JSONL-based eval
+      run history + regression detection, deliberately **not** a DB table
+      — eval scores are a build/CI signal, not tenant data, so `make eval`
+      stays Postgres-independent).
+
+      **Explicitly not built, named rather than silently skipped**:
+      `dollars_recovered`, `recovery_rate_by_cause`, and `time_to_recovery`
+      — all three require knowing whether a payer actually paid a finding,
+      and no outcome-tracking data model exists anywhere in this codebase.
+      `docs/MASTER-BUILD-PROMPT.md`'s own Phase 12 section frames "the
+      outcome feedback loop" as work not yet done. This is a data-model
+      gap, not a testing gap — revisit once Phase 12 exists.
+
+      **Not yet verified**: one round-trip test
+      (`tests/api/test_endpoints_live_db.py::test_viewing_a_finding_shows_up_in_its_claim_access_history`)
+      — view a finding (writes `phi_access_log`), fetch the claim's access
+      history, confirm it shows up — against real Postgres. Written, skips
+      cleanly without `TEST_DATABASE_URL`, never executed. **Do not check
+      this phase off until that test is run against a live Postgres.**
 - [ ] Phase 9 — Cloud-agnostic deployment
 - [ ] Phase 10 — CI/CD and pre-production hardening
 - [ ] Phase 11 — Real data readiness (the compliance gate — no code)

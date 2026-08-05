@@ -7,10 +7,13 @@ ingestion.plan) -> apply (ingestion.apply).
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
+from opentelemetry.trace import NoOpTracer, Tracer
 from sqlalchemy.orm import Session
 
 from db import repository
@@ -21,6 +24,7 @@ from domain.x835 import ClaimStatus, parse_835
 from ingestion.apply import ContractVersionIds, IngestionOutcome, apply_ingestion_plan
 from ingestion.plan import PriorFinding, build_ingestion_plan, payer_key
 from ingestion.virus_scan import VirusScanner
+from observability.metrics import Instruments, noop_instruments, record_ingestion_outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +53,59 @@ def _quarantine_new_remittance(
         claims_created=0,
         findings_created=0,
         reconciliation_mismatches=0,
+        dollars_detected=Decimal("0"),
     )
 
 
 def ingest_file(
+    session: Session,
+    tenant_id: uuid.UUID,
+    *,
+    content: bytes,
+    source: str,
+    uploaded_by: str,
+    scanner: VirusScanner,
+    tracer: Tracer | None = None,
+    instruments: Instruments | None = None,
+) -> IngestionOutcome | DuplicateOutcome:
+    """Thin tracing/metrics wrapper around `_ingest_file_impl` -- callers
+    that don't pass `tracer`/`instruments` (every test written before
+    Phase 8) get no-ops at negligible cost, so instrumentation is
+    additive and never a required parameter that breaks them."""
+    resolved_tracer = tracer if tracer is not None else NoOpTracer()
+    resolved_instruments = instruments if instruments is not None else noop_instruments()
+    started = time.perf_counter()
+
+    with resolved_tracer.start_as_current_span(
+        "ingestion.ingest_file",
+        attributes={"tenant_id": str(tenant_id), "source": source},
+    ) as span:
+        outcome = _ingest_file_impl(
+            session,
+            tenant_id,
+            content=content,
+            source=source,
+            uploaded_by=uploaded_by,
+            scanner=scanner,
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+        if isinstance(outcome, IngestionOutcome):
+            span.set_attribute("outcome_status", outcome.status)
+            span.set_attribute("findings_created", outcome.findings_created)
+            record_ingestion_outcome(
+                resolved_instruments,
+                tenant_id=str(tenant_id),
+                status=outcome.status,
+                latency_ms=latency_ms,
+                dollars_detected=outcome.dollars_detected,
+                findings_created=outcome.findings_created,
+            )
+        else:
+            span.set_attribute("outcome_status", "duplicate")
+        return outcome
+
+
+def _ingest_file_impl(
     session: Session,
     tenant_id: uuid.UUID,
     *,

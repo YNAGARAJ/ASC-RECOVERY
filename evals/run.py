@@ -26,6 +26,13 @@ from domain.variance import ActualServiceLine, Finding, RootCause, evaluate_clai
 from domain.x835 import parse_835
 from evals.generator import GoldenCase
 from evals.golden.cases import GOLDEN_CASES
+from evals.history import (
+    EvalRunRecord,
+    append_eval_run,
+    detect_eval_regression,
+    load_eval_history,
+    now_iso,
+)
 
 _TOLERANCE = Money("0.01")
 _RECALL_GATE = Decimal("1.0")
@@ -187,6 +194,21 @@ def main() -> int:
         f"(detected {result.detected_dollars} vs injected {result.injected_dollars})"
     )
     print("GATE PASSED" if result.passed else "GATE FAILED")
+
+    append_eval_run(
+        EvalRunRecord(
+            recorded_at=now_iso(),
+            recall=float(result.recall),
+            precision=float(result.precision),
+            root_cause_accuracy=float(result.root_cause_accuracy),
+            dollar_accuracy=float(result.dollar_accuracy),
+            passed=result.passed,
+        )
+    )
+    regression = detect_eval_regression(load_eval_history())
+    if regression is not None:
+        print(f"EVAL REGRESSION ALERT: {regression.message}")
+
     return 0 if result.passed else 1
 
 

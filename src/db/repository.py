@@ -27,6 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from db.access_history import AccessEvent, merge_access_history
 from db.models import Adjustment as AdjustmentModel
 from db.models import AuditLog as AuditLogModel
 from db.models import Claim as ClaimModel
@@ -34,6 +35,7 @@ from db.models import Contract as ContractModel
 from db.models import ContractVersion as ContractVersionModel
 from db.models import FeeScheduleLine as FeeScheduleLineModel
 from db.models import Finding as FindingModel
+from db.models import PHIAccessLog as PHIAccessLogModel
 from db.models import RecoveryPacket as RecoveryPacketModel
 from db.models import Remittance as RemittanceModel
 from db.models import ServiceLine as ServiceLineModel
@@ -772,3 +774,110 @@ def list_recovery_packets_for_finding(
         .scalars()
         .all()
     )
+
+
+# --- PHI access log and the auditor-facing claim access history (Phase 8) ------
+
+
+def write_phi_access_log(
+    session: Session, tenant_id: uuid.UUID, *, actor: str, claim_id: uuid.UUID, purpose: str
+) -> PHIAccessLogModel:
+    entry = PHIAccessLogModel(tenant_id=tenant_id, actor=actor, claim_id=claim_id, purpose=purpose)
+    session.add(entry)
+    session.flush()
+    return entry
+
+
+def list_audit_log_by_resource_ids(
+    session: Session, tenant_id: uuid.UUID, resource_type: str, resource_ids: Sequence[str]
+) -> list[AuditLogModel]:
+    if not resource_ids:
+        return []
+    return list(
+        session.execute(
+            select(AuditLogModel).where(
+                AuditLogModel.tenant_id == tenant_id,
+                AuditLogModel.resource_type == resource_type,
+                AuditLogModel.resource_id.in_(resource_ids),
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+def get_claim_access_history(
+    session: Session, tenant_id: uuid.UUID, claim_id: uuid.UUID
+) -> tuple[AccessEvent, ...]:
+    """Auditor-facing report: "who accessed this claim's data, when, and
+    why." A claim's findings and recovery packets reference it only
+    indirectly, so this resolves their ids first, gathers `audit_log`
+    entries across all three resource types plus every `phi_access_log`
+    entry, converts each row to a plain `AccessEvent`, and hands off to
+    the pure `merge_access_history` for the chronological merge."""
+    finding_ids = list(
+        session.execute(
+            select(FindingModel.id).where(
+                FindingModel.tenant_id == tenant_id, FindingModel.claim_id == claim_id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    packet_ids = (
+        list(
+            session.execute(
+                select(RecoveryPacketModel.id).where(
+                    RecoveryPacketModel.tenant_id == tenant_id,
+                    RecoveryPacketModel.finding_id.in_(finding_ids),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if finding_ids
+        else []
+    )
+
+    audit_rows = (
+        list_audit_log_by_resource_ids(session, tenant_id, "claim", [str(claim_id)])
+        + list_audit_log_by_resource_ids(
+            session, tenant_id, "finding", [str(fid) for fid in finding_ids]
+        )
+        + list_audit_log_by_resource_ids(
+            session, tenant_id, "recovery_packet", [str(pid) for pid in packet_ids]
+        )
+    )
+    phi_rows = list(
+        session.execute(
+            select(PHIAccessLogModel).where(
+                PHIAccessLogModel.tenant_id == tenant_id, PHIAccessLogModel.claim_id == claim_id
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    audit_events = [
+        AccessEvent(
+            occurred_at=row.occurred_at,
+            actor=row.actor,
+            action=row.action,
+            resource_type=row.resource_type,
+            resource_id=row.resource_id,
+            purpose=None,
+        )
+        for row in audit_rows
+    ]
+    phi_events = [
+        AccessEvent(
+            occurred_at=row.accessed_at,
+            actor=row.actor,
+            action="phi_access",
+            resource_type="claim",
+            resource_id=str(row.claim_id),
+            purpose=row.purpose,
+        )
+        for row in phi_rows
+    ]
+    return merge_access_history(audit_events, phi_events)

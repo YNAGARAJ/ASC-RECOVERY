@@ -7,11 +7,13 @@ ever routing a dollar amount through a float-capable type.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
 from api.repository import (
+    AccessEventSummary,
     AuditLogEntry,
     ContractSummary,
     FindingDetail,
@@ -276,6 +278,35 @@ class PacketGenerationFailedOut(BaseModel):
     def from_domain(cls, failure: PacketGenerationFailed) -> PacketGenerationFailedOut:
         return cls(
             finding_id=failure.finding_id, attempts=failure.attempts, reasons=list(failure.reasons)
+        )
+
+
+class AccessEventOut(BaseModel):
+    occurred_at: datetime
+    actor: str
+    action: str
+    resource_type: str
+    resource_id: str
+    purpose: str | None
+
+
+class AccessHistoryOut(BaseModel):
+    items: list[AccessEventOut]
+
+    @classmethod
+    def from_domain(cls, events: Sequence[AccessEventSummary]) -> AccessHistoryOut:
+        return cls(
+            items=[
+                AccessEventOut(
+                    occurred_at=event.occurred_at,
+                    actor=event.actor,
+                    action=event.action,
+                    resource_type=event.resource_type,
+                    resource_id=event.resource_id,
+                    purpose=event.purpose,
+                )
+                for event in events
+            ]
         )
 
 

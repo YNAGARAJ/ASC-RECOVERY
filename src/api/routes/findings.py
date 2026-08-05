@@ -109,7 +109,7 @@ def get_finding(
     ctx: AuthContext = require_permission(Action.READ_FINDING),
     repository: Repository = Depends(get_repository),
 ) -> FindingDetailOut:
-    detail = repository.get_finding_detail(ctx.tenant_id, finding_id)
+    detail = repository.get_finding_detail(ctx.tenant_id, finding_id, actor=ctx.user_id)
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
     return FindingDetailOut.from_domain(detail)

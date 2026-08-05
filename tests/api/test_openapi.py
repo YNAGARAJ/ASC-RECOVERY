@@ -26,5 +26,6 @@ def test_openapi_covers_every_expected_path(app: FastAPI) -> None:
         "/findings/{finding_id}/packets",
         "/packets/{packet_id}/approve",
         "/packets/{packet_id}/reject",
+        "/claims/{claim_id}/access-history",
     }
     assert expected <= paths

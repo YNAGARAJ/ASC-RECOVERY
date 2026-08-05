@@ -10,14 +10,16 @@ same as the rest of tests/db/, and skips the same way without one.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
 from db import repository
 from domain.contract import ContractVersion
+from domain.variance import Finding
 from ingestion.plan import ClaimIngestionPlan, FileIngestionPlan
 
 ContractVersionIds = Mapping[tuple[str, date], uuid.UUID]
@@ -30,6 +32,7 @@ class IngestionOutcome:
     claims_created: int
     findings_created: int
     reconciliation_mismatches: int
+    dollars_detected: Decimal
 
 
 def _resolve_contract_version_id(
@@ -46,7 +49,7 @@ def _apply_claim(
     remittance_id: uuid.UUID,
     claim_plan: ClaimIngestionPlan,
     contract_version_ids: ContractVersionIds,
-) -> int:
+) -> Sequence[Finding]:
     claim = claim_plan.claim
     if claim_plan.date_of_service is None:
         # Callers only reach here when skip_reason is None, which plan.py
@@ -123,7 +126,7 @@ def _apply_claim(
             _resolve_contract_version_id(claim_plan.contract_version, contract_version_ids),
             persistable,
         )
-    return len(persistable)
+    return persistable
 
 
 def apply_ingestion_plan(
@@ -158,11 +161,13 @@ def apply_ingestion_plan(
             claims_created=0,
             findings_created=0,
             reconciliation_mismatches=0,
+            dollars_detected=Decimal("0"),
         )
 
     claims_created = 0
     findings_created = 0
     reconciliation_mismatches = 0
+    dollars_detected = Decimal("0")
 
     for transaction_plan in plan.transactions:
         if not transaction_plan.reconciliation.matches:
@@ -170,8 +175,12 @@ def apply_ingestion_plan(
         for claim_plan in transaction_plan.claims:
             if claim_plan.skip_reason is not None:
                 continue
-            findings_created += _apply_claim(
+            persisted_findings = _apply_claim(
                 session, tenant_id, remittance_id, claim_plan, contract_version_ids
+            )
+            findings_created += len(persisted_findings)
+            dollars_detected += sum(
+                (f.shortfall.as_decimal() for f in persisted_findings), Decimal("0")
             )
             claims_created += 1
 
@@ -191,4 +200,5 @@ def apply_ingestion_plan(
         claims_created=claims_created,
         findings_created=findings_created,
         reconciliation_mismatches=reconciliation_mismatches,
+        dollars_detected=dollars_detected,
     )

@@ -50,7 +50,7 @@ def list_packets(
     ctx: AuthContext = require_permission(Action.READ_FINDING),
     repository: Repository = Depends(get_repository),
 ) -> PacketListOut:
-    rows = repository.list_packets(ctx.tenant_id, finding_id)
+    rows = repository.list_packets(ctx.tenant_id, finding_id, actor=ctx.user_id)
     return PacketListOut(items=[RecoveryPacketOut.from_domain(row) for row in rows])
 
 

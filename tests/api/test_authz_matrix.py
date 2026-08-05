@@ -205,3 +205,31 @@ def test_decide_packet_matrix(client: TestClient, seed_ids: SeedIds, role: Role)
     assert approve_own.status_code == 200
     assert approve_own.json()["status"] == "approved"
     assert reject_other.status_code == 404
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_claim_access_history_matrix(client: TestClient, seed_ids: SeedIds, role: Role) -> None:
+    action = Action.READ_PHI_ACCESS_LOG
+    # Generate some access history first, independent of the role under
+    # test, so there's something to see when an allowed role asks for it.
+    client.get(f"/findings/{seed_ids.finding_a}", headers=auth_headers(Role.ADMIN, "a"))
+
+    own = client.get(
+        f"/claims/{seed_ids.claim_a}/access-history", headers=auth_headers(role, "a")
+    )
+    other = client.get(
+        f"/claims/{seed_ids.claim_b}/access-history", headers=auth_headers(role, "a")
+    )
+
+    if not can(role, action):
+        assert own.status_code == 403
+        assert other.status_code == 403
+        return
+
+    assert own.status_code == 200
+    assert len(own.json()["items"]) >= 1
+    # Tenant B's claim history is invisible to a tenant-A actor -- not a
+    # 404 (which would confirm the claim id "exists" for someone), just an
+    # empty result, the same shape as any other unmatched query.
+    assert other.status_code == 200
+    assert other.json()["items"] == []

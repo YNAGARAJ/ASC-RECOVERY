@@ -1,15 +1,17 @@
-"""GET /audit-log -- for the auditor role (and admin), per
-security/rbac.py's Action.READ_AUDIT_LOG grants."""
+"""GET /audit-log and GET /claims/{claim_id}/access-history -- both for
+the auditor role (and admin), per security/rbac.py's Action.READ_AUDIT_LOG
+and Action.READ_PHI_ACCESS_LOG grants."""
 
 from __future__ import annotations
 
 from datetime import date
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 
 from api.auth import AuthContext, get_repository, require_permission
 from api.repository import AuditLogFilters, Page, Repository
-from api.schemas import AuditLogListOut
+from api.schemas import AccessHistoryOut, AuditLogListOut
 from security.rbac import Action
 
 router = APIRouter()
@@ -46,3 +48,13 @@ def list_audit_log(
 ) -> AuditLogListOut:
     result = repository.list_audit_log(ctx.tenant_id, filters=filters, page=page)
     return AuditLogListOut.from_domain(result)
+
+
+@router.get("/claims/{claim_id}/access-history", response_model=AccessHistoryOut)
+def get_claim_access_history(
+    claim_id: UUID,
+    ctx: AuthContext = require_permission(Action.READ_PHI_ACCESS_LOG),
+    repository: Repository = Depends(get_repository),
+) -> AccessHistoryOut:
+    events = repository.get_claim_access_history(ctx.tenant_id, claim_id)
+    return AccessHistoryOut.from_domain(events)

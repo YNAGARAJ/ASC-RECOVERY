@@ -177,6 +177,16 @@ class PacketGenerationFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class AccessEventSummary:
+    occurred_at: datetime
+    actor: str
+    action: str
+    resource_type: str
+    resource_id: str
+    purpose: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RuleInput:
     """Bare, undecorated inputs for the rule sub-structures on a contract
     version -- the API's Pydantic schema (api.schemas) maps onto this
@@ -266,7 +276,7 @@ class Repository(Protocol):
     ) -> PagedResult[FindingSummary]: ...
 
     def get_finding_detail(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> FindingDetail | None: ...
 
     def list_contracts(
@@ -302,12 +312,16 @@ class Repository(Protocol):
     ) -> RecoveryPacketSummary | PacketGenerationFailed | None: ...
 
     def list_packets(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> list[RecoveryPacketSummary]: ...
 
     def decide_packet(
         self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
     ) -> RecoveryPacketSummary | None: ...
+
+    def get_claim_access_history(
+        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+    ) -> tuple[AccessEventSummary, ...]: ...
 
 
 def _packet_to_summary(row: RecoveryPacketModel) -> RecoveryPacketSummary:
@@ -407,12 +421,19 @@ class PostgresRepository:
         return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
 
     def get_finding_detail(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> FindingDetail | None:
         with tenant_session(self._session_factory, tenant_id) as session:
             detail = db_repository.get_finding_detail(session, tenant_id, finding_id)
             if detail is None:
                 return None
+            db_repository.write_phi_access_log(
+                session,
+                tenant_id,
+                actor=actor,
+                claim_id=detail.claim.id,
+                purpose="finding_detail_view",
+            )
             adjustments = [
                 AdjustmentInfo(
                     group_code=a.group_code, reason_code=a.reason_code, amount=str(a.amount)
@@ -533,6 +554,13 @@ class PostgresRepository:
             detail = db_repository.get_finding_detail(session, tenant_id, finding_id)
             if detail is None:
                 return None
+            db_repository.write_phi_access_log(
+                session,
+                tenant_id,
+                actor=generated_by,
+                claim_id=detail.claim.id,
+                purpose="packet_generation",
+            )
 
             timely_filing_days = _DEFAULT_TIMELY_FILING_DAYS
             template_override: PacketTemplate | None = None
@@ -613,11 +641,37 @@ class PostgresRepository:
             return _packet_to_summary(row)
 
     def list_packets(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID
+        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> list[RecoveryPacketSummary]:
         with tenant_session(self._session_factory, tenant_id) as session:
+            finding = session.get(FindingModel, finding_id)
+            if finding is not None:
+                db_repository.write_phi_access_log(
+                    session,
+                    tenant_id,
+                    actor=actor,
+                    claim_id=finding.claim_id,
+                    purpose="packet_list_view",
+                )
             rows = db_repository.list_recovery_packets_for_finding(session, tenant_id, finding_id)
             return [_packet_to_summary(row) for row in rows]
+
+    def get_claim_access_history(
+        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+    ) -> tuple[AccessEventSummary, ...]:
+        with tenant_session(self._session_factory, tenant_id) as session:
+            events = db_repository.get_claim_access_history(session, tenant_id, claim_id)
+            return tuple(
+                AccessEventSummary(
+                    occurred_at=event.occurred_at,
+                    actor=event.actor,
+                    action=event.action,
+                    resource_type=event.resource_type,
+                    resource_id=event.resource_id,
+                    purpose=event.purpose,
+                )
+                for event in events
+            )
 
     def decide_packet(
         self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
