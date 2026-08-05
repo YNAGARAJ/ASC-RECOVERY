@@ -1,0 +1,23 @@
+# gitleaks config for this repo. Extends gitleaks' default ruleset (don't
+# want to lose real detection coverage) and allowlists exactly two known
+# false positives -- both are synthetic, hardcoded test-only values, never
+# real credentials, per CLAUDE.md rule 1 (no real PHI/secrets in this
+# repo). Each is named `_TEST_...`/`_SECRET` and used only inside test
+# modules that construct a JWT/encryption key for assertions -- see the
+# surrounding test file for context.
+#
+# Adding a new allowlist entry should be rare and deliberate: confirm the
+# flagged value really is synthetic before adding it here, never as a way
+# to silence a finding you haven't actually checked.
+
+title = "asc-recovery"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic test-only secrets (JWT signing key, PHI encryption key) used to construct real objects under test -- not real credentials."
+regexes = [
+  '''test-secret-key-at-least-32-bytes-long-for-hs256''', # tests/security/test_session.py -- JWT HS256 test signing key
+  '''dGVzdC1rZXktbm90LXJlYWwtMzItYnl0ZXMtbG9uZyE=''', # tests/test_main.py -- base64 of "test-key-not-real-32-bytes-long!"
+]
