@@ -60,3 +60,23 @@ def test_otlp_exporter_path_constructs_cleanly_when_endpoint_configured(
     app = create_app_from_env()
 
     assert isinstance(app, FastAPI)
+
+
+def test_repository_is_wired_with_real_instruments_and_tracer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-08/F-09 (docs/audit/REGISTER.md): before this fix, every
+    ingestion metric and the one span in the codebase went to a no-op
+    provider because this exact construction call never passed
+    instruments=/tracer= -- a real deploy would look instrumented
+    (Phase 8 built all of it) while emitting nothing. Reaches into the
+    repository's own attributes rather than exercising an ingestion
+    end to end, since that needs a live Postgres this environment
+    doesn't have -- this is the wiring-level proof that the gap is closed."""
+    _set_all_required(monkeypatch)
+
+    app = create_app_from_env()
+
+    repository = app.state.repository
+    assert repository._instruments is not None
+    assert repository._tracer is not None

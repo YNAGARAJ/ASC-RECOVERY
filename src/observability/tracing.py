@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from opentelemetry import trace as trace_api
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
@@ -80,13 +81,32 @@ class PHIScrubbingSpanExporter(SpanExporter):
         return self._wrapped.force_flush(timeout_millis)
 
 
-def setup_tracing(exporter: SpanExporter, *, service_name: str = "asc-recovery") -> Tracer:
+def setup_tracing(
+    exporter: SpanExporter, *, service_name: str = "asc-recovery", set_global: bool = False
+) -> Tracer:
     """Wires `exporter` behind `PHIScrubbingSpanExporter` and a
     `TracerProvider`, returning a ready-to-use `Tracer`. Callers supply
     the underlying exporter -- an in-memory one in tests, a real OTLP
     exporter to a real backend once Phase 9 stands up infrastructure.
     That real exporter is not added or tested here, same deferral as
-    every other real-cloud-integration adapter in this codebase."""
+    every other real-cloud-integration adapter in this codebase.
+
+    `set_global=True` additionally registers the constructed provider as
+    the process-wide `TracerProvider` (F-09, docs/audit/REGISTER.md) --
+    every span this codebase actually creates gets its `Tracer` via
+    explicit dependency injection (see `ingestion.pipeline.ingest_file`'s
+    `tracer` parameter), never `opentelemetry.trace.get_tracer(__name__)`,
+    so nothing here strictly depends on the global registry today. It's
+    still real production wiring: any future code, or an
+    auto-instrumentation library, that reaches for the ambient global
+    tracer instead of explicit DI still finds a working one. Defaults to
+    `False` so this function stays safely callable more than once within
+    one test session -- the OTel API only honors the *first* ever
+    `set_tracer_provider` call in a process and logs a warning on every
+    call after that; tests use the returned `Tracer` directly and never
+    need the global registry, so they never opt in."""
     provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
     provider.add_span_processor(SimpleSpanProcessor(PHIScrubbingSpanExporter(exporter)))
+    if set_global:
+        trace_api.set_tracer_provider(provider)
     return provider.get_tracer(service_name)

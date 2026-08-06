@@ -9,6 +9,8 @@ used elsewhere in this codebase for synthetic PHI-shaped test data.
 
 from __future__ import annotations
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from observability.tracing import setup_tracing
@@ -73,3 +75,19 @@ def test_clean_spans_are_exported_unchanged() -> None:
     assert exported.attributes is not None
     assert exported.attributes["remittance_status"] == "ingested"
     assert exported.attributes["claims_created"] == 5
+
+
+def test_set_global_registers_a_real_sdk_tracer_provider() -> None:
+    """F-09 (docs/audit/REGISTER.md): `main.py` needs the constructed
+    provider to actually become the process-wide one, not just a
+    `Tracer` object nobody but the direct caller can reach. Checks
+    `isinstance(..., TracerProvider)` rather than identity against this
+    call's own provider -- the OTel API only honors the first-ever
+    `set_tracer_provider` call in a process, so if an earlier test in
+    this session already registered one, this call intentionally becomes
+    a no-op; either way, by this point the global provider must be a
+    real SDK-backed one, never the default no-op/proxy provider."""
+    exporter = InMemorySpanExporter()
+    setup_tracing(exporter, set_global=True)
+
+    assert isinstance(trace.get_tracer_provider(), TracerProvider)

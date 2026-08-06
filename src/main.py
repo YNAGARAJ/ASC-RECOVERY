@@ -86,7 +86,12 @@ def create_app_from_env() -> FastAPI:
     _require(secrets, "PHI_ENCRYPTION_KEY")  # validated eagerly by EnvKMS below
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
 
-    setup_tracing(_span_exporter(otlp_endpoint))
+    # F-08/F-09 (docs/audit/REGISTER.md): both `tracer` and `instruments`
+    # must actually reach `PostgresRepository` below, or every ingestion
+    # metric and the one span in this codebase silently go to a no-op
+    # provider -- a real deploy would look instrumented (Phase 8 built
+    # all of this) while emitting nothing.
+    tracer = setup_tracing(_span_exporter(otlp_endpoint), set_global=True)
     instruments = setup_metrics(
         PeriodicExportingMetricReader(_metric_exporter(otlp_endpoint))
     )
@@ -98,6 +103,12 @@ def create_app_from_env() -> FastAPI:
     # a named, deferred gap (docs/SECURITY.md), not yet built for lack of a
     # real cloud account to build it against.
     encryptor = EnvelopeEncryptor(EnvKMS(secrets))
-    repository = PostgresRepository(session_factory, drafter=drafter, encryptor=encryptor)
+    repository = PostgresRepository(
+        session_factory,
+        drafter=drafter,
+        encryptor=encryptor,
+        tracer=tracer,
+        instruments=instruments,
+    )
 
     return create_app(repository=repository, jwt_secret_key=jwt_secret_key)
