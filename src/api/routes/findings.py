@@ -14,9 +14,10 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from api.alerting import record_not_found
 from api.auth import AuthContext, get_repository, require_permission
 from api.rate_limit import enforce_rate_limit
 from api.repository import FindingFilters, Page, RecordOutcomeInput, Repository
@@ -112,11 +113,13 @@ def export_findings_csv(
 @router.get("/findings/{finding_id}", response_model=FindingDetailOut)
 def get_finding(
     finding_id: UUID,
+    request: Request,
     ctx: AuthContext = require_permission(Action.READ_FINDING),
     repository: Repository = Depends(get_repository),
 ) -> FindingDetailOut:
     detail = repository.get_finding_detail(ctx.tenant_id, finding_id, actor=ctx.user_id)
     if detail is None:
+        record_not_found(request, ctx.user_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
     return FindingDetailOut.from_domain(detail)
 
@@ -125,6 +128,7 @@ def get_finding(
 def record_outcome(
     finding_id: UUID,
     body: RecordOutcomeIn,
+    request: Request,
     ctx: AuthContext = require_permission(Action.RECORD_FINDING_OUTCOME),
     repository: Repository = Depends(get_repository),
 ) -> FindingSummaryOut:
@@ -143,5 +147,6 @@ def record_outcome(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     if row is None:
+        record_not_found(request, ctx.user_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
     return FindingSummaryOut.from_domain(row)

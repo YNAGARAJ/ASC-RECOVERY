@@ -42,6 +42,7 @@ from api.repository import PostgresRepository
 from db.base import make_engine, make_session_factory
 from observability.logging_config import configure_logging
 from observability.metrics import setup_metrics
+from observability.notifications import LoggingNotificationPort
 from observability.tracing import setup_tracing
 from packets.drafter import AnthropicPacketDrafter
 from security.encryption import EnvelopeEncryptor
@@ -108,12 +109,19 @@ def create_app_from_env() -> FastAPI:
     # a named, deferred gap (docs/SECURITY.md), not yet built for lack of a
     # real cloud account to build it against.
     encryptor = EnvelopeEncryptor(EnvKMS(secrets))
+    # F-11 (docs/audit/REGISTER.md): one shared notifier -- both the
+    # repository (unusual PHI access, ingestion failure rate) and the
+    # app's routes (auth anomaly, cross-tenant probe) dispatch alerts
+    # through the same real adapter, real paging vendor still deferred
+    # (see observability/notifications.py's docstring).
+    notifier = LoggingNotificationPort()
     repository = PostgresRepository(
         session_factory,
         drafter=drafter,
         encryptor=encryptor,
         tracer=tracer,
         instruments=instruments,
+        notifier=notifier,
     )
 
-    return create_app(repository=repository, jwt_secret_key=jwt_secret_key)
+    return create_app(repository=repository, jwt_secret_key=jwt_secret_key, notifier=notifier)

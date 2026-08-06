@@ -109,3 +109,12 @@ class AccountLockoutTracker:
 
     def record_success(self, account_id: str) -> None:
         self._attempts.pop(account_id, None)
+
+    def current_failure_count(self, account_id: str) -> int:
+        """Consecutive failures recorded so far -- feeds F-11's
+        `observability.alerts.evaluate_auth_anomaly_alert`
+        (docs/audit/REGISTER.md) a real count instead of nothing. Reuses
+        this tracker's own bookkeeping rather than adding a second,
+        separate counter alongside it."""
+        record = self._attempts.get(account_id)
+        return record.failures if record is not None else 0

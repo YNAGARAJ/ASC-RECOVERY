@@ -51,7 +51,10 @@ from domain.variance import RootCause
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.virus_scan import VirusScanner
+from observability.alert_state import IngestionOutcomeTracker, RollingWindowCounter
+from observability.alerts import evaluate_ingestion_failure_alert, evaluate_unusual_phi_access_alert
 from observability.metrics import Instruments
+from observability.notifications import NotificationPort
 from packets.drafter import PacketDrafter
 from packets.prompt import PromptInput
 from packets.service import generate_packet_draft
@@ -449,12 +452,37 @@ class PostgresRepository:
         encryptor: EnvelopeEncryptor,
         tracer: Tracer | None = None,
         instruments: Instruments | None = None,
+        notifier: NotificationPort | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._drafter = drafter
         self._encryptor = encryptor
         self._tracer = tracer
         self._instruments = instruments
+        # F-11 (docs/audit/REGISTER.md): `notifier` is None by default,
+        # same "additive, never required" contract `tracer`/`instruments`
+        # already have -- every test written before this fix keeps
+        # constructing a PostgresRepository without it. The two trackers
+        # below are always built (cheap, in-memory, no live effect until
+        # something actually calls .record()), not also optional --
+        # nothing needs to substitute a different one, only whether
+        # alerts get *dispatched* anywhere depends on `notifier`.
+        self._notifier = notifier
+        self._phi_access_tracker = RollingWindowCounter(window_seconds=300)
+        self._ingestion_alert_tracker = IngestionOutcomeTracker()
+
+    def _record_phi_access(self, actor: str) -> None:
+        """Call right after every `db_repository.write_phi_access_log` --
+        F-11's `evaluate_unusual_phi_access_alert`, fed a real rolling
+        count instead of nothing."""
+        if self._notifier is None:
+            return
+        count = self._phi_access_tracker.record(actor)
+        alert = evaluate_unusual_phi_access_alert(
+            actor=actor, access_count=count, window_description="in the last 5 minutes"
+        )
+        if alert is not None:
+            self._notifier.notify(alert)
 
     def ping(self) -> bool:
         """For GET /readyz -- no tenant context needed. Queries
@@ -500,7 +528,7 @@ class PostgresRepository:
         scanner: VirusScanner,
     ) -> IngestionOutcome | DuplicateOutcome:
         with tenant_session(self._session_factory, tenant_id) as session:
-            return ingest_file(
+            outcome = ingest_file(
                 session,
                 tenant_id,
                 content=content,
@@ -511,6 +539,21 @@ class PostgresRepository:
                 tracer=self._tracer,
                 instruments=self._instruments,
             )
+        # F-11 (docs/audit/REGISTER.md): outside the transaction -- this
+        # is pure in-memory bookkeeping, not a DB write, so there's no
+        # reason to hold the transaction open for it. DuplicateOutcome is
+        # excluded, matching record_ingestion_outcome's own metrics call
+        # a few lines up the stack in ingestion.pipeline.ingest_file.
+        if isinstance(outcome, IngestionOutcome) and self._notifier is not None:
+            quarantined_count, total_count = self._ingestion_alert_tracker.record(
+                str(tenant_id), quarantined=(outcome.status == "quarantined")
+            )
+            alert = evaluate_ingestion_failure_alert(
+                quarantined_count=quarantined_count, total_count=total_count
+            )
+            if alert is not None:
+                self._notifier.notify(alert)
+        return outcome
 
     def list_findings(
         self, tenant_id: uuid.UUID, *, filters: FindingFilters, page: Page
@@ -545,6 +588,7 @@ class PostgresRepository:
                 claim_id=detail.claim.id,
                 purpose="finding_detail_view",
             )
+            self._record_phi_access(actor)
             adjustments = [
                 AdjustmentInfo(
                     group_code=a.group_code, reason_code=a.reason_code, amount=str(a.amount)
@@ -690,6 +734,7 @@ class PostgresRepository:
                 claim_id=detail.claim.id,
                 purpose="packet_generation",
             )
+            self._record_phi_access(generated_by)
 
             timely_filing_days = _DEFAULT_TIMELY_FILING_DAYS
             template_override: PacketTemplate | None = None
@@ -786,6 +831,7 @@ class PostgresRepository:
                     claim_id=finding.claim_id,
                     purpose="packet_list_view",
                 )
+                self._record_phi_access(actor)
             rows = db_repository.list_recovery_packets_for_finding(session, tenant_id, finding_id)
             return [_packet_to_summary(row) for row in rows]
 

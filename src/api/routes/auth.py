@@ -23,6 +23,10 @@ retry) and updated on both outcomes. The general per-request
 `enforce_rate_limit` dependency (api/rate_limit.py) is *not* used on this
 route -- it requires an already-authenticated `AuthContext`, which by
 definition doesn't exist yet at login.
+
+F-11 (docs/audit/REGISTER.md) evaluates `evaluate_auth_anomaly_alert`
+after every failed attempt, reusing the lockout tracker's own
+consecutive-failure count rather than keeping a second, separate one.
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from api.auth import get_repository
 from api.repository import LoginCredentials, Repository
 from api.schemas import LoginIn, LoginOut
+from observability.alerts import evaluate_auth_anomaly_alert
+from observability.notifications import NotificationPort
 from security.mfa import verify_code
 from security.passwords import hash_password, verify_password
 from security.rate_limit import AccountLockoutTracker
@@ -57,6 +63,28 @@ def _lockout_tracker(request: Request) -> AccountLockoutTracker:
     return tracker
 
 
+def _notifier(request: Request) -> NotificationPort:
+    notifier: NotificationPort = request.app.state.notifier
+    return notifier
+
+
+def _fail(request: Request, lockout: AccountLockoutTracker, subject: str) -> HTTPException:
+    """Records the failure, evaluates F-11's auth-anomaly alert against
+    the lockout tracker's now-updated count, and returns (never raises
+    itself) the generic 401 the caller should raise -- keeping `raise` at
+    the call site makes each failure path's control flow explicit to a
+    reader, rather than hidden inside this helper."""
+    lockout.record_failure(subject)
+    alert = evaluate_auth_anomaly_alert(
+        actor=subject,
+        failed_attempts=lockout.current_failure_count(subject),
+        window_description="since the last successful login",
+    )
+    if alert is not None:
+        _notifier(request).notify(alert)
+    return _INVALID_CREDENTIALS
+
+
 @router.post("/auth/login", response_model=LoginOut)
 def login(
     body: LoginIn,
@@ -80,12 +108,10 @@ def login(
     # hash in the first place.
     password_matches = verify_password(body.password, stored_hash)
     if credentials is None or credentials.password_hash is None or not password_matches:
-        lockout.record_failure(body.subject)
-        raise _INVALID_CREDENTIALS
+        raise _fail(request, lockout, body.subject)
     # `credentials` is narrowed non-None from here on.
     if credentials.mfa_secret is None or not verify_code(credentials.mfa_secret, body.totp_code):
-        lockout.record_failure(body.subject)
-        raise _INVALID_CREDENTIALS
+        raise _fail(request, lockout, body.subject)
 
     lockout.record_success(body.subject)
     tokens = issue_session(
