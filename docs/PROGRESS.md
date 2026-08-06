@@ -6,7 +6,7 @@ the phase checklist, then `docs/audit/REGISTER.md` for the full findings
 list this checkpoint is tracking progress against — this file adds the
 texture that isn't in either.
 
-## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. 7 of 23 done.
+## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. 9 of 23 done.
 
 Phases 1-12 are code-complete (see `docs/PHASES.md`). A full three-wave
 audit found 82 real defects — 1 CRITICAL, 22 HIGH, 34 MEDIUM, 25 LOW —
@@ -14,190 +14,165 @@ written up in `docs/audit/`. `docs/audit/REGISTER.md`'s 23-row MUST-FIX
 table (all CRITICAL/HIGH) is the actual work list for *this* codebase;
 that's what this checkpoint tracks.
 
-**Percentage of the MUST-FIX list closed: 7/23** (F-01 through F-07 — see
-below). 16 HIGH findings remain open, plus the full 59-item BACKLOG
+**Percentage of the MUST-FIX list closed: 9/23** (F-01 through F-09 —
+see below). 14 HIGH findings remain open, plus the full 59-item BACKLOG
 (MEDIUM/LOW, each carrying its own one-line defer-justification in the
 register — not being worked yet, and that's fine, they're not blocking).
 
 ## Done (fixed this session, one line each on the actual change)
 
-- **F-01 (CRITICAL)** through **F-06** — see git log (`824b26a`,
-  `3d18d03`, `f51fb31`, `8d17361`, `5f8d462`) and the prior checkpoint for
-  detail; unchanged this session.
-- **F-07 (HIGH, this session)** — the AWS deployment target was
-  unreachable end to end: no `aws_lb_listener` resource existed at all
-  (not just missing TLS), no HSTS, and `make_engine` trusted whatever
-  `sslmode` (or lack of one) a `DATABASE_URL` happened to carry. Two
-  commits, register updated to FIXED in `e5df688`:
-  - **`cf6c3e4`** — `terraform/environments/aws/main.tf` gained the two
-    listener resources the module's own comment always said belonged at
-    that layer: an HTTPS listener on 443 (new required `certificate_arn`
-    variable, no default — needs a real domain's already-issued ACM
-    cert, which this build environment doesn't have) forwarding to the
-    app's target group, and an HTTP listener on 80 that only ever
-    redirects to 443, never forwards a plaintext request.
-    `terraform/modules/aws/outputs.tf` gained `alb_arn`/`target_group_arn`
-    outputs so the root can attach to them; `container_runtime.tf` gained
-    the matching port-80 security-group ingress rule (the redirect
-    listener needs an inbound path to answer on before it can redirect
-    anything). `.github/workflows/deploy.yml` + `docs/RUNBOOK.md` wired a
-    new `AWS_ACM_CERTIFICATE_ARN` repo secret through both AWS
-    `terraform apply` steps, added to the staging job's existing
-    `if: secrets.* != ''` guard so the AWS deploy jobs stay honestly
-    SKIPPED (not failed) until that secret exists too.
-    `src/db/base.py`'s `make_engine` now defaults to `sslmode=require`
-    whenever a `DATABASE_URL` doesn't already specify `sslmode`, instead
-    of trusting psycopg's own default (`prefer`, which silently falls
-    back to plaintext). AWS's own secret already carries an explicit
-    `?sslmode=require`, so this changes nothing for AWS's real path —
-    it's real defense in depth against exactly the gap B-43 documents
-    for *Azure's* `DATABASE_URL` secret today (B-43 itself stays open;
-    this doesn't fix it, just narrows its blast radius). Local dev and
-    CI's plain (non-TLS) `postgres:16` containers needed an explicit
-    `?sslmode=disable` added to their connection strings
-    (`docker-compose.yml`, `.github/workflows/ci.yml`,
-    `docs/DB_SETUP.md`) — an opt-out that's now visible in the
-    connection string instead of a silent absence. New
-    `tests/db/test_base.py` (4 cases, pure — `create_engine` never opens
-    a connection until first use, so this needed no live Postgres).
-  - **`f118ccf`** — a same-day follow-up closing the HSTS gap the same
-    finding named but the first commit hadn't yet addressed. New
-    `src/api/security_headers.py`: `SecurityHeadersMiddleware` (raw ASGI,
-    matching `RequestIDMiddleware`'s established pattern) adds
-    `Strict-Transport-Security: max-age=63072000; includeSubDomains` to
-    every response, wired into `api/app.py` alongside the existing
-    request-ID middleware. 3 new tests
-    (`tests/api/test_security_headers.py`) prove it's unconditional —
-    present on a 200, a 422, and an unauthenticated 401, not just the
-    happy path.
+- **F-01 (CRITICAL)** through **F-07** — see git log (`824b26a`,
+  `3d18d03`, `f51fb31`, `8d17361`, `5f8d462`, `cf6c3e4`, `f118ccf`) and
+  prior checkpoints for detail; unchanged this session.
+- **F-08 + F-09 (HIGH, this session)** — Phase 8 built real OTel metrics
+  and tracing, both fully unit-tested, but `main.py`'s
+  `PostgresRepository(...)` construction never passed `instruments=` or
+  `tracer=`, and `setup_tracing`'s returned `Tracer` was discarded
+  outright. A real deploy would look instrumented while every ingestion
+  metric and the one span in the codebase silently went to a no-op
+  provider. Both findings share this one fix site (the register says so
+  explicitly), fixed together like F-04/F-05. Commit `eafb9ca` (register
+  updated to FIXED in `b32f30e`):
+  - `observability/tracing.py` — `setup_tracing` gained
+    `set_global: bool = False`. When `True`, registers the constructed
+    provider as the process-wide `TracerProvider` via
+    `opentelemetry.trace.set_tracer_provider`. Every span this codebase
+    actually creates already gets its `Tracer` via explicit DI
+    (`ingestion.pipeline.ingest_file`'s `tracer` parameter, never the
+    ambient global), so nothing *functionally* depended on this — it's
+    still real, standard OTel production wiring for anything future (or
+    an auto-instrumentation library) that reaches for the global tracer
+    instead of explicit DI. Defaults to `False` specifically so the
+    function stays safely callable more than once per test session: the
+    OTel API only honors the first-ever `set_tracer_provider` call in a
+    process and logs a warning on every call after that.
+  - `main.py` — captures `setup_tracing`'s return value (previously
+    thrown away entirely), passes `set_global=True`, and threads both
+    `tracer=` and `instruments=` into the `PostgresRepository(...)`
+    construction that was missing them.
+  - New tests: `tests/observability/test_tracing.py` proves
+    `set_global=True` actually registers a real SDK `TracerProvider`
+    process-wide (checks `isinstance(trace.get_tracer_provider(),
+    TracerProvider)`, not identity against this call's own provider —
+    robust regardless of test execution order, since the OTel API only
+    lets the *first* registration in the process actually win).
+    `tests/test_main.py` proves the env-wired app's repository carries
+    non-None `_instruments`/`_tracer` — the literal regression this
+    fixes. The deeper "a span survives the PHI-scrubbing exporter given
+    real instrumentation" behavior already had DB-backed coverage
+    (`tests/ingestion/test_pipeline_observability_live_db.py`,
+    pre-existing, untouched by this change) — what was missing was proof
+    that `main.py` actually *supplies* that instrumentation in the first
+    place, which is what's new here. Deliberately did not add a new
+    end-to-end DB-backed test threading `create_app_from_env()` through
+    an HTTP upload down to a captured span — that would just re-prove
+    what the pre-existing ingestion-level test and the new wiring-level
+    test already separately cover, for no new signal.
 
-Same verification ceiling as every prior Terraform-touching fix this
-Wave: no Terraform CLI, no live AWS account in this environment, so the
-`.tf` changes are offline-verified only (brace/paren-balance-checked,
-matches every existing resource's HCL style, `certificate_arn`'s
-no-default choice deliberately makes a real `terraform plan` fail loudly
-and clearly rather than silently reference a nonexistent certificate).
-The Python (`make_engine`, `SecurityHeadersMiddleware`) and YAML
-(`deploy.yml`, `ci.yml`, `docker-compose.yml`) halves are genuinely,
-fully verified — pure Python needing no live DB, YAML parse-checked.
+This is the second Wave 3 fix (after F-06) with a fully, genuinely
+verified local gate and no Terraform/DB-only piece left unexecuted —
+`set_global`'s behavior and the repository-construction wiring are both
+pure Python, provably correct without a live Postgres.
 
 ## In progress
 
-Nothing mid-write. F-07 went through the full Wave 3 loop (state the
-finding → write/extend tests → minimal fix → show it passing locally →
-full local gate → mark FIXED in the register with the commit SHA(s) →
-commit) and is complete as a unit, same as F-01 through F-06. It happened
-to land as two commits instead of one because the HSTS third of the
-finding was caught on a second read-through of the finding text after
-the first commit — see "Traps" below.
+Nothing mid-write. F-08/F-09 went through the full Wave 3 loop (state the
+findings → write/extend tests → minimal fix → show it passing locally →
+full local gate → mark FIXED in the register with the commit SHA →
+commit) and is complete as a unit, same as every prior fix.
 
 ## Failing
 
 Nothing failing that this session caused. `ruff check .`, `mypy --strict .`
-(153 files), `pytest -q` (440 passed, 29 skipped — all DB-backed, none
+(153 files), `pytest -q` (442 passed, 29 skipped — all DB-backed, none
 newly broken), the `domain/variance.py` 100%-coverage gate
 (`pytest --cov=src/domain --cov-branch -q` then
 `coverage report --include="*/domain/variance.py" --fail-under=100`),
 `python -m evals.run` (GATE PASSED, 100% recall/precision/root-cause/dollar
 accuracy on 504 golden cases), and `bandit -r . -x ./tests,./evals` are all
-clean as of commit `e5df688`.
+clean as of commit `b32f30e`.
 
 **Pre-existing, unrelated, still present:** `mypy --strict .` reports two
 errors in `alembic/versions/0004_recovery_packets_and_timely_filing.py:65,82`
 (`Call to untyped function "JSONB" in typed context`). Predates Wave 3
-entirely (confirmed via `git stash` two sessions ago). Still not blocking,
-still out of scope for this checkpoint — flagging again so it doesn't get
-silently attributed to a future fix by mistake.
+entirely (confirmed via `git stash` three sessions ago). Still not
+blocking, still out of scope for this checkpoint — flagging again so it
+doesn't get silently attributed to a future fix by mistake.
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **`make_engine`'s new sslmode default only kicks in when `sslmode` is
-  completely absent from the URL** — it never overrides an explicit
-  value, including `sslmode=disable`. This was a deliberate choice to
-  keep local dev and CI working (their Postgres containers have no TLS
-  configured at all) without adding an environment-variable escape hatch
-  or a `require_ssl: bool` parameter that production code could
-  accidentally set to `False`. The opt-out is now a visible
-  `?sslmode=disable` in three specific, known, non-production connection
-  strings instead of an implicit absence — auditable by grepping for
-  `sslmode=disable` and confirming every hit is local/CI, not a silent
-  default anyone could quietly rely on in a real deployment.
-- **`certificate_arn` has no default value.** A tempting alternative was
-  a `null`-able variable with a `count = var.certificate_arn != null ? 1 : 0`
-  guard on the listener resources, so `terraform plan` would succeed
-  either way. Rejected: that would make "no certificate configured"
-  degrade silently back to exactly F-07's original bug (ALB with no
-  listener), just reachable again without anyone noticing. A required
-  variable with no default fails `terraform plan` immediately and
-  loudly instead — the correct failure mode for "this deployment is not
-  actually configured for HTTPS yet."
-- **B-43 (Azure's `DATABASE_URL` omitting `sslmode=require`) was
-  deliberately left open**, not folded into this fix even though
-  `make_engine`'s new default happens to blunt its practical impact
-  (Azure's connection now gets `sslmode=require` injected client-side
-  even though Terraform never states it explicitly). B-43 is really
-  about the Terraform secret itself being unclear/inconsistent with
-  AWS's, which is a real, separate documentation/explicitness gap this
-  session's fix doesn't address — recorded in the register as its own
-  backlog row and should stay that way until someone deliberately picks
-  it up.
-- **F-07 landed as two commits, not one** — a deliberate choice once the
-  gap was noticed, not a sign of rework. `cf6c3e4` closed the listener
-  and `sslmode` two-thirds of the finding; re-reading the finding's own
-  text afterward ("no HTTPS termination, no HSTS") surfaced that HSTS
-  had been silently dropped from scope during implementation. Rather
-  than amend `cf6c3e4` (this repo's own git-safety convention prefers a
-  new commit over amending), `f118ccf` closed the remaining third
-  same-day, and both SHAs are recorded together in the register's FIXED
-  cell. Worth knowing: always re-read a finding's *full* description
-  once more right before marking it FIXED, not just the "Fix" column's
-  summary — the summary and the "What breaks" column don't always list
-  every sub-part in the same words.
+- **`set_global` defaults to `False`, not `True`.** The tempting
+  alternative was making global registration unconditional inside
+  `setup_tracing` — simpler call site, one less parameter. Rejected:
+  `tests/observability/test_tracing.py` calls `setup_tracing(exporter)`
+  three separate times across existing tests in one pytest session; an
+  unconditional `set_tracer_provider` call would make the 2nd and 3rd
+  calls each log an OTel warning ("Overriding of current TracerProvider
+  is not allowed") on every future test run, forever, for no benefit —
+  none of those tests need or check the global registry, they use the
+  returned `Tracer` directly. Opt-in via a flag keeps the pure/testable
+  default behavior unchanged and confines the global side effect to
+  exactly the one real caller (`main.py`) that needs it — consistent
+  with this codebase's general discipline of keeping side effects at the
+  composition root.
+- **No new DB-backed test was added for F-08/F-09**, unlike most prior
+  Terraform/DB-touching Wave 3 fixes. Deliberate, not an oversight: the
+  actual regression here (main.py discarding tracer/instruments) is pure
+  Python composition-root wiring, fully provable without Postgres — the
+  DB-touching part of "does a span survive real ingestion" was already
+  covered by a pre-existing test
+  (`tests/ingestion/test_pipeline_observability_live_db.py`) that this
+  fix doesn't change or depend on. Adding a redundant end-to-end version
+  would have tested the same two facts twice instead of adding new
+  confidence.
+- **`isinstance(trace.get_tracer_provider(), TracerProvider)` was chosen
+  over an identity check** in the new tracing test specifically because
+  the global OTel tracer-provider registry is process-wide, mutable,
+  write-once state — asserting "this is *my* specific provider object"
+  would make the test's correctness depend on whether it happens to run
+  before any other test in the session that also registers one. The
+  `isinstance` check is true under either ordering: once *any*
+  `set_global=True` call succeeds anywhere in the process, the global
+  provider is and remains SDK-backed for the rest of that process.
 
 ## Traps for someone resuming cold
 
-- **Everything F-01 through F-06's checkpoints already flagged still
+- **Everything F-01 through F-07's checkpoints already flagged still
   applies** (CRLF warnings on `git add`, `docs/audit/`'s findings
   unverified against real infra/DB by construction of this environment,
   the `${VAR:?message}` bash-apostrophe gotcha, the PHI-content guardrail
-  hook rejecting two specific words landing next to each other or a
-  non-allowlisted synthetic email domain, the Makefile's
-  `domain/variance.py`-only coverage gate, and remembering
-  `dependencies=[Depends(enforce_rate_limit)]` on any new authenticated
-  router).
-- **A finding's "What breaks" / fix-column text can list more than one
-  distinct sub-fix** (F-07 named three: listener, HSTS, sslmode). Before
-  marking any future finding FIXED, re-read its full row one more time
-  against the actual diff, not just the todo list built from a first
-  pass — see this session's own near-miss above.
-- **`terraform/README.md`'s "every module exposes the same outputs"
-  table was intentionally *not* updated** for the new AWS-only
-  `alb_arn`/`target_group_arn` outputs, matching the precedent F-02/F-03
-  already set (AWS's `database_admin_secret_id`/`app_db_password` and
-  Azure's `database_admin_username`/`database_admin_password` are also
-  real, cloud-specific outputs never added to that shared table). If a
-  future session decides the table should actually be exhaustive, that's
-  a documentation-cleanup pass across all three fixes' outputs at once,
-  not something to do piecemeal on the next finding that happens to add
-  one more output.
+  hook's quirks, the Makefile's `domain/variance.py`-only coverage gate,
+  remembering `dependencies=[Depends(enforce_rate_limit)]` on any new
+  authenticated router, and re-reading a finding's *full* row — not just
+  its "Fix" column — once more right before marking it FIXED).
+- **`opentelemetry.trace.set_tracer_provider` is a write-once global per
+  process.** If a future session adds another `set_global=True` call
+  site anywhere (a second composition root, a script, a notebook), only
+  the first one to execute in that process actually takes effect; every
+  later attempt is silently downgraded to a no-op with a logged warning.
+  This is standard, documented OTel API behavior, not a bug in this
+  codebase's wrapper — but it's easy to be surprised by if you don't
+  already know the rule going in.
 
 ## Next 3 steps
 
-1. **F-08 and F-09 next, together** — the register itself notes they
-   share one fix site: `main.py`'s `PostgresRepository(...)` construction
-   never passes `instruments=`/`tracer=`, so every ingestion metric and
-   the one span in the codebase both go to no-op providers. Same
-   "do related findings together" call already made for F-04/F-05.
-   Should be a small, fully offline-verifiable Python fix (construct a
-   real in-memory exporter in a test, assert a metric/span actually
-   reaches it) — no Terraform/infra half this time.
-2. **After F-08/F-09**, continue F-10 through F-23 in `REGISTER.md`'s own
+1. **F-10 next** per `REGISTER.md`'s own listed order — PHI log scrubbing
+   is per-logger opt-in (`security/redaction.py`'s `PHIRedactionFilter`
+   is attached exactly once, in `api/errors.py`; any other logger,
+   including `api.request` in `api/request_context.py`, doesn't have it
+   and would leak PHI into its log lines unfiltered). The register's own
+   suggested fix is a single `logging.dictConfig` at startup installing
+   the filter on the root logger's handlers, structurally rather than
+   per-call-site — a fully offline-verifiable Python change (log via a
+   brand-new arbitrary logger name in a test, confirm the sink is clean).
+2. **After F-10**, continue F-11 through F-23 in `REGISTER.md`'s own
    listed order, same loop each time (state finding → test → fix → gate →
-   mark FIXED with SHA → commit) — and per the decision above, re-read
-   each finding's full row once more right before marking it FIXED.
+   mark FIXED with SHA → commit) — and keep re-reading each finding's
+   full row once more right before marking it FIXED (see F-07's near-miss
+   two checkpoints ago).
 3. **Once the MUST-FIX list is meaningfully further along**, update
    `docs/PHASES.md` to note Wave-3 remediation progress and re-run the
    Wave 0 baseline commands fresh across the accumulated batch, before
-   telling the user this phase of remediation is done. 7/23 still isn't
-   "meaningfully further along" territory by itself; revisit after
-   roughly F-12 or so lands.
+   telling the user this phase of remediation is done. 9/23 is closer but
+   still probably not there yet by itself; revisit after roughly F-12 or
+   so lands, per the original plan.
