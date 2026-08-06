@@ -41,11 +41,16 @@ def make_contract_version(
     effective_from: date = date(2023, 1, 1),
     effective_to: date | None = None,
     fee_schedule: dict[str, Money] | None = None,
+    implant_carveout_rule: ImplantCarveoutRule | None = None,
 ) -> ContractVersion:
     """A minimal fee-schedule contract with every optional rule disabled --
     ingestion tests only need pricing to run end to end deterministically,
     not to re-exercise MPPR/bilateral/implant logic (that's domain/'s job,
-    already gated in Phase 1)."""
+    already gated in Phase 1). `implant_carveout_rule` is the one
+    exception: F-17 (docs/audit/REGISTER.md) needs a real, enabled rule to
+    prove implant *detection* now works on the real ingestion path even
+    though implant *pricing* deliberately still doesn't (no invoice-cost
+    source exists yet -- see ingestion/plan.py's own docstring)."""
     return ContractVersion(
         payer_id=payer_id,
         effective_from=effective_from,
@@ -70,7 +75,9 @@ def make_contract_version(
             rate=Rate.percent(16),
             applicable_modifiers=frozenset(),
         ),
-        implant_carveout_rule=ImplantCarveoutRule(
+        implant_carveout_rule=implant_carveout_rule
+        if implant_carveout_rule is not None
+        else ImplantCarveoutRule(
             enabled=False,
             procedure_codes=frozenset(),
             revenue_codes=frozenset(),

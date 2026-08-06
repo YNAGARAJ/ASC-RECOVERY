@@ -9,15 +9,23 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
+from domain.contract import ImplantCarveoutRule
 from domain.money import Money
+from domain.variance import RootCause
 from domain.x835 import parse_835
 from ingestion.plan import PriorFinding, build_ingestion_plan
 from tests.domain.fixtures_x835 import (
+    ELEMENT_SEP,
+    SUB_ELEMENT_SEP,
+    assemble,
+    envelope_head,
+    envelope_tail,
     malformed_clp,
     malformed_missing_isa,
     minimal_valid_835,
     partial_batch_one_bad_claim,
     reversal_835,
+    seg,
 )
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
 
@@ -188,3 +196,68 @@ def test_no_contract_effective_skips_claim_without_failing_the_batch() -> None:
     (claim,) = transaction.claims
     assert claim.skip_reason is not None
     assert claim.findings == ()
+
+
+def test_implant_line_is_detected_via_revenue_code_but_stays_unpriced() -> None:
+    """F-17 (docs/audit/REGISTER.md): documents the deliberate, remaining
+    half of this finding. B-16's revenue-code fix (this same session)
+    means an implant line is now correctly *detected* on the real
+    ingestion path via SVC04 -- but pricing it still requires
+    invoice_cost, which has no real data source anywhere in this
+    codebase (no purchasing-feed integration exists; see
+    ingestion/plan.py's own docstring). The line correctly surfaces as
+    UNPRICED_CODE with zero shortfall -- never a wrong dollar figure,
+    which is what CLAUDE.md actually requires -- and that's the intended
+    behavior until a real invoice-cost source is built (tracked
+    separately from Wave 3's bug-fix scope)."""
+    implant_revenue_code = "0278"
+    contract = make_contract_version(
+        fee_schedule={},
+        implant_carveout_rule=ImplantCarveoutRule(
+            enabled=True,
+            procedure_codes=frozenset(),
+            revenue_codes=frozenset({implant_revenue_code}),
+        ),
+    )
+    segments = [
+        *envelope_head(),
+        seg(ELEMENT_SEP, "LX", "1"),
+        seg(
+            ELEMENT_SEP,
+            "CLP",
+            "CLAIM0200",
+            "1",
+            "1750.00",
+            "1750.00",
+            "0.00",
+            "12",
+            "PAYERCTRL0200",
+            "11",
+        ),
+        seg(ELEMENT_SEP, "DTM", "232", "20230110"),
+        seg(
+            ELEMENT_SEP,
+            "SVC",
+            f"HC{SUB_ELEMENT_SEP}L8699",
+            "1750.00",
+            "1750.00",
+            implant_revenue_code,
+            "1",
+        ),
+        seg(ELEMENT_SEP, "DTM", "472", "20230110"),
+        *envelope_tail(segment_count="7"),
+    ]
+    result = parse_835(assemble(segments))
+
+    plan = build_ingestion_plan(
+        result,
+        contract_versions_by_payer={TEST_PAYER: (contract,)},
+        prior_findings_by_control_number={},
+    )
+
+    (transaction,) = plan.transactions
+    (claim,) = transaction.claims
+    assert claim.skip_reason is None
+    (finding,) = claim.findings
+    assert finding.root_cause == RootCause.UNPRICED_CODE
+    assert finding.shortfall == Money.zero()

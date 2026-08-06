@@ -469,12 +469,18 @@ def parse_835(text: str) -> ParseResult:
                 modifiers = tuple(composite[2:])
                 charge = Money(elements[2])
                 paid_reported = Money(_safe_element(elements, 3) or "0")
+                # SVC04 -- NUBC revenue code. Was hardcoded None (B-16,
+                # docs/audit/REGISTER.md): domain.contract._is_implant
+                # matches on revenue code as well as procedure code, so
+                # discarding this silently weakened implant detection on
+                # the real ingestion path.
+                revenue_code = _safe_element(elements, 4) or None
                 units_str = _safe_element(elements, 5)
                 units = Decimal(units_str) if units_str else Decimal(1)
                 claim_ctx.current_line = _LineBuilder(
                     procedure_code=procedure_code,
                     modifiers=modifiers,
-                    revenue_code=None,
+                    revenue_code=revenue_code,
                     charge=charge,
                     paid_reported=paid_reported,
                     units=units,

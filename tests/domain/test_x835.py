@@ -139,6 +139,47 @@ def test_svc_composite_procedure_and_single_modifier() -> None:
     assert line.modifiers == ("50",)
 
 
+def test_svc04_revenue_code_parsed() -> None:
+    """B-16 (docs/audit/REGISTER.md): SVC04 (NUBC revenue code) was
+    parsed then discarded, hardcoded to None regardless of what the
+    segment actually carried -- domain.contract._is_implant matches an
+    implant line by revenue code as well as procedure code, so this
+    silently weakened implant detection on the real ingestion path."""
+    segments = [
+        *envelope_head(),
+        seg(ELEMENT_SEP, "LX", "1"),
+        seg(
+            ELEMENT_SEP,
+            "CLP",
+            "CLAIM0101",
+            "1",
+            "1750.00",
+            "1750.00",
+            "0.00",
+            "12",
+            "PAYERCTRL0101",
+            "11",
+        ),
+        seg(ELEMENT_SEP, "DTM", "232", "20230110"),
+        seg(ELEMENT_SEP, "SVC", f"HC{SUB_ELEMENT_SEP}L8699", "1750.00", "1750.00", "0278", "1"),
+        seg(ELEMENT_SEP, "DTM", "472", "20230110"),
+        *envelope_tail(segment_count="8"),
+    ]
+    result = parse_835(assemble(segments))
+    line = result.transactions[0].claims[0].service_lines[0]
+    assert line.revenue_code == "0278"
+
+
+def test_svc04_absent_revenue_code_is_none_not_empty_string() -> None:
+    """Existing fixtures (claim_segments(), used by minimal_valid_835())
+    leave SVC04 blank -- must parse as None, not an empty string,
+    matching every other optional string field's convention in this
+    parser (see _safe_element's `or None` callers)."""
+    result = parse_835(minimal_valid_835())
+    line = result.transactions[0].claims[0].service_lines[0]
+    assert line.revenue_code is None
+
+
 def test_claim_level_cas_multiple_triplets_single_segment() -> None:
     segments = [
         *envelope_head(),

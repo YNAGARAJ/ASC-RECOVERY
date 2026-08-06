@@ -151,10 +151,22 @@ def _plan_claim(
             ),
         )
 
-    # Implant invoice cost isn't carried on the 835 itself -- it comes from
-    # a separate purchasing feed this phase doesn't have. Lines that need
-    # it price as UNPRICED until that feed exists (Phase 1 behavior,
-    # unchanged here).
+    # invoice_cost is always None here -- KNOWN, DELIBERATE, and still
+    # open (F-17, docs/audit/REGISTER.md). An implant's invoice cost (what
+    # the ASC itself paid its supplier for the device) is not carried on
+    # the 835 remittance at all -- it can only come from a separate
+    # purchasing-feed integration, and no phase of this build has ever
+    # built one; there is no table, no upload mechanism, no API surface
+    # for it anywhere in this codebase. domain.contract.price_claim's
+    # implant carve-out is fully correct and unit-tested (see
+    # tests/domain/test_contract.py) but cannot fire for real until that
+    # integration exists -- until then, an implant line correctly surfaces
+    # as an UNPRICED_CODE finding with shortfall=0 (see
+    # tests/ingestion/test_plan.py, "detected via revenue code but stays
+    # unpriced"), never a wrong dollar figure. `revenue_code` below IS real now
+    # (B-16, fixed alongside F-17's triage this session) -- implant
+    # *detection* works on the real path even though implant *pricing*
+    # deliberately still doesn't.
     lines = tuple(
         ClaimLineInput(
             procedure_code=sl.procedure_code,
