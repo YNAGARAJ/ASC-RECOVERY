@@ -214,6 +214,43 @@ def test_generate_and_approve_packet_round_trip_against_real_postgres(
     assert approved_count == 1
 
 
+def test_recording_a_finding_outcome_writes_an_audit_entry(
+    app_session_factory: sessionmaker[Session],
+) -> None:
+    """F-12 (docs/audit/REGISTER.md): record_finding_outcome writes to
+    findings.outcome/amount_recovered -- a PHI-bearing table, including a
+    dollar amount -- with no audit_log call at all before this fix, a
+    direct CLAUDE.md rule 5 violation ("every write to a PHI-bearing
+    table goes through the audit log, no exceptions")."""
+    tenant_id, subject = _seed_tenant(app_session_factory, "outcome-audit-a")
+    repository = PostgresRepository(
+        app_session_factory, drafter=ScriptedPacketDrafter([]), encryptor=_TEST_ENCRYPTOR
+    )
+    app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
+    client = TestClient(app)
+
+    findings = client.get("/findings", headers=_auth_headers(subject))
+    finding_id = findings.json()["items"][0]["id"]
+
+    recorded = client.post(
+        f"/findings/{finding_id}/outcome",
+        json={"outcome": "recovered", "amount_recovered": "45.00"},
+        headers=_auth_headers(subject),
+    )
+    assert recorded.status_code == 200
+    assert recorded.json()["outcome"] == "recovered"
+
+    with tenant_session(app_session_factory, tenant_id) as session:
+        entries, count = db_repository.list_audit_log(
+            session, tenant_id, action="finding_outcome_recorded", limit=10, offset=0
+        )
+    assert count == 1
+    assert entries[0].actor == subject
+    assert entries[0].resource_type == "finding"
+    assert entries[0].resource_id == finding_id
+    assert entries[0].phi_accessed is True
+
+
 def test_viewing_a_finding_shows_up_in_its_claim_access_history(
     app_session_factory: sessionmaker[Session],
 ) -> None:

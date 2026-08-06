@@ -874,6 +874,19 @@ class PostgresRepository:
                 amount_recovered=data.amount_recovered,
                 recorded_by=recorded_by,
             )
+            # F-12 (docs/audit/REGISTER.md): this writes findings.outcome/
+            # amount_recovered -- a PHI-bearing table, including a dollar
+            # amount -- CLAUDE.md rule 5 has no exceptions. Same pattern
+            # decide_packet already uses right after its own DB write.
+            db_repository.write_audit_log(
+                session,
+                tenant_id,
+                actor=recorded_by,
+                action="finding_outcome_recorded",
+                resource_type="finding",
+                resource_id=str(finding_id),
+                phi_accessed=True,
+            )
             return _finding_to_summary(updated)
 
     def decide_packet(
