@@ -6,7 +6,7 @@ the phase checklist, then `docs/audit/REGISTER.md` for the full findings
 list this checkpoint is tracking progress against — this file adds the
 texture that isn't in either.
 
-## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. 5 of 23 done.
+## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. 6 of 23 done.
 
 Phases 1-12 are code-complete (see `docs/PHASES.md`). A full three-wave
 audit found 82 real defects — 1 CRITICAL, 22 HIGH, 34 MEDIUM, 25 LOW —
@@ -14,202 +14,184 @@ written up in `docs/audit/`. `docs/audit/REGISTER.md`'s 23-row MUST-FIX
 table (all CRITICAL/HIGH) is the actual work list for *this* codebase;
 that's what this checkpoint tracks.
 
-**Percentage of the MUST-FIX list closed: 5/23** (F-01, F-02, F-03, F-04,
-F-05 — see below). 18 HIGH findings remain open, plus the full 59-item
-BACKLOG (MEDIUM/LOW, each carrying its own one-line defer-justification in
-the register — not being worked yet, and that's fine, they're not blocking).
+**Percentage of the MUST-FIX list closed: 6/23** (F-01 through F-06 — see
+below). 17 HIGH findings remain open, plus the full 59-item BACKLOG
+(MEDIUM/LOW, each carrying its own one-line defer-justification in the
+register — not being worked yet, and that's fine, they're not blocking).
 
 ## Done (fixed this session, one line each on the actual change)
 
-- **F-01 (CRITICAL)** through **F-03** — see git log (`824b26a`, `3d18d03`,
-  `f51fb31`) and prior checkpoints for detail; unchanged this session.
-- **F-04 + F-05 (HIGH, this session)** — nobody could log into this
-  system: `issue_session`'s MFA-cannot-be-bypassed guarantee (Phase 4) had
-  zero production callers, and `users` had nowhere to store a password or
-  an MFA secret even if a login route existed. Fixed together as one real
-  subsystem, commit `8d17361` (register updated to FIXED in `3b17c4a`):
-  - `alembic/versions/0006_user_login_credentials.py` — adds
-    `users.password_hash` / `users.mfa_secret_encrypted`, both nullable
-    (a user row can exist before credentials are provisioned; the login
-    route treats NULL identically to "wrong" — no partial-credential
-    login path). Guarded add-column, same pattern as 0002-0005.
-  - `src/security/passwords.py` (new) — `hash_password`/`verify_password`
-    via `hashlib.scrypt` (stdlib, avoided adding bcrypt/argon2 as a new
-    dependency for one call site).
-  - `api.repository.LoginCredentials` + `Repository.get_login_credentials`
-    — same non-tenant-scoped lookup shape as `get_user_by_subject`;
-    `PostgresRepository` decrypts the stored MFA secret itself, same
-    convention as patient name/member id already being decrypted at the
-    repository boundary, never in a route handler.
-  - `src/api/routes/auth.py` (new) — `POST /auth/login`. Verifies
-    password then TOTP code, then is the sole caller of `issue_session`.
-    Every failure (unknown subject, no password provisioned, wrong
-    password, not enrolled in MFA, wrong code) returns the identical
-    generic 401. A real scrypt verification runs even for an unknown
-    subject (against a fixed dummy hash) so response timing can't be used
-    to enumerate valid subjects — see the file's own docstring for why
-    this has to be unconditional, not short-circuited.
-  - `src/api/errors.py` — added a `RequestValidationError` handler.
-    Login is the first route anywhere in this API whose request body
-    carries a credential; FastAPI's default 422 handler echoes each
-    field's raw submitted value, which would otherwise put a malformed
-    request's password in the response body. New handler strips
-    submitted values, keeps only `loc`/`type`/`msg`.
-  - `tests/api/fakes.py` — `FakeRepository.seed_login_credentials` +
-    `get_login_credentials`, so the login route is testable without
-    Postgres.
-  - New tests: `tests/security/test_passwords.py` (8 cases — round trip,
-    wrong password, every malformed/foreign `encoded` shape),
-    `tests/api/test_login.py` (8 cases — success; wrong password; wrong
-    TOTP; unknown subject; no password provisioned; not enrolled in MFA;
-    proves `issue_session` is never called on a wrong password; proves a
-    422 never echoes the submitted password).
+- **F-01 (CRITICAL)** through **F-05** — see git log (`824b26a`,
+  `3d18d03`, `f51fb31`, `8d17361`) and the prior checkpoint for detail;
+  unchanged this session.
+- **F-06 (HIGH, this session)** — `enforce_rate_limit`
+  (`api/rate_limit.py`) and `AccountLockoutTracker`
+  (`security/rate_limit.py`) were both complete and unit-tested since
+  Phase 4, wired to zero routes: every endpoint (including PHI-decrypting
+  reads) was unthrottled, and F-04's new login route had no lockout to
+  hit even after it existed. Commit `5f8d462` (register updated to FIXED
+  in `357910e`):
+  - `api/rate_limit.py` — `enforce_rate_limit` now reads its limiter off
+    `request.app.state.rate_limiter` instead of a module-level singleton.
+    A module-level limiter would have persisted across every
+    `create_app()`/`TestClient` built during a test session, so an
+    earlier test could silently exhaust a later, unrelated test's budget
+    for the same `(tenant, user)` key purely from run order — moved to
+    per-app state for the same reason `app.state.repository`/
+    `jwt_secret_key` already are, not only to dodge that specific risk.
+  - `api/app.py` — `create_app()` now builds a fresh `RateLimiter` and
+    `AccountLockoutTracker` per call, both accepted as optional override
+    params so a test can inject a tiny-capacity/tiny-threshold instance
+    instead of sending dozens of real requests to exercise the
+    429/lockout paths.
+  - `api/routes/{audit,contracts,findings,packets,remittances}.py` —
+    each router now carries `dependencies=[Depends(enforce_rate_limit)]`.
+    `health.py` and `auth.py` (login) are deliberately excluded:
+    `enforce_rate_limit` requires an already-authenticated
+    `AuthContext`, which doesn't exist for either — health checks carry
+    no bearer token by design, and login is the thing that *produces*
+    an `AuthContext`, not something that can require one first.
+  - `api/routes/auth.py` — `POST /auth/login` now checks
+    `AccountLockoutTracker.is_locked_out(subject)` before any password
+    verification (a cheap dict lookup, so a locked-out subject doesn't
+    also pay for a scrypt hash on every retry), and calls
+    `record_failure`/`record_success` after. A locked-out account gets
+    the same generic 401 as every other failure mode — consistent with
+    the route's existing never-disclose-which-check-failed design
+    (see F-04/F-05's checkpoint entry).
+  - New tests: `tests/api/test_rate_limit.py` (4 cases — 429 once
+    capacity is exhausted, independent budgets per `tenant:user`, a
+    shared budget across different routes on the same router, health
+    endpoints unaffected by even a capacity-1 limiter), plus 5 new cases
+    appended to `tests/api/test_login.py` (lockout after 5 failures — the
+    tracker's own default `max_failures` — a locked-out account never
+    reaches `issue_session` even with fully correct credentials, a
+    success resets the failure count, lockout is scoped per-subject).
 
-None of F-01 through F-05's DB-backed pieces have been verified against a
-real Postgres — no Terraform CLI, no live database, no cloud account exist
-in this environment (same ceiling every phase has had since Phase 9). The
-new migration is `bash`/syntax-checked and follows 0005's exact pattern,
-not executed. The Python-side gate (ruff, mypy --strict, pytest, bandit,
-`python -m evals.run`) is genuinely green after every single change,
-re-run in full each time — that part is real, not just claimed.
+Same verification ceiling as every prior fix this Wave: no live Postgres/
+Terraform/cloud account in this environment, so nothing DB- or infra-
+backed here was exercised against the real thing. F-06 itself has no
+DB-backed piece though — both `RateLimiter` and `AccountLockoutTracker`
+are pure in-memory Python, so this fix is fully, genuinely verified
+end-to-end (route wiring included), not just offline-checked like the
+Terraform/migration-heavy fixes were.
 
 ## In progress
 
-Nothing mid-write. F-04/F-05 went through the full Wave 3 loop (state the
+Nothing mid-write. F-06 went through the full Wave 3 loop (state the
 finding → write/extend tests → minimal fix → show it passing locally →
 full local gate → mark FIXED in the register with the commit SHA →
-commit) and is complete as a unit, same as F-01 through F-03.
+commit) and is complete as a unit, same as F-01 through F-05.
 
 ## Failing
 
 Nothing failing that this session caused. `ruff check .`, `mypy --strict .`
-(149 files), `pytest -q` (425 passed, 29 skipped — all DB-backed, none
+(150 files), `pytest -q` (433 passed, 29 skipped — all DB-backed, none
 newly broken), the `domain/variance.py` 100%-coverage gate
 (`pytest --cov=src/domain --cov-branch -q` then
 `coverage report --include="*/domain/variance.py" --fail-under=100`),
 `python -m evals.run` (GATE PASSED, 100% recall/precision/root-cause/dollar
 accuracy on 504 golden cases), and `bandit -r . -x ./tests,./evals` are all
-clean as of commit `3b17c4a`.
+clean as of commit `357910e`.
 
-**Pre-existing, unrelated to this session:** `mypy --strict .` reports two
+**Pre-existing, unrelated, still present:** `mypy --strict .` reports two
 errors in `alembic/versions/0004_recovery_packets_and_timely_filing.py:65,82`
 (`Call to untyped function "JSONB" in typed context`). Confirmed via
-`git stash` that these predate this session's changes — not something F-04/
-F-05 introduced or should fix incidentally. Not blocking (mypy's overall
-exit is still driven by whether *new* strict-mode regressions appear; this
-pair has evidently been tolerated since 0004 was written). Worth a real fix
-eventually (likely a `sa.Column("template", JSONB(), ...)` needing a type
-annotation on the `JSONB()` call site or a `# type: ignore[no-untyped-call]`
-with a reason), but out of scope for this checkpoint.
+`git stash` in the F-04/F-05 session that these predate Wave 3 entirely.
+Still not blocking, still out of scope for this checkpoint — flagging again
+so it doesn't get silently attributed to a future fix by mistake.
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **Went with credential+TOTP, not OIDC**, for F-04's login route. The
-  register's fix text allowed either ("OIDC or credential+MFA"). OIDC
-  would need a real external IdP (Auth0/Okta/Azure AD/etc.) this
-  environment can't stand up or test against — same "no real cloud
-  account" ceiling as the deferred KMS adapters (F-20) and real
-  `AnthropicPacketDrafter` calls. Credential+TOTP is fully testable
-  offline and is what `security/mfa.py` (already built, Phase 4) is
-  actually shaped for — an OIDC design wouldn't store MFA secrets locally
-  at all, so F-05's own fix text ("add an encrypted mfa_secret column")
-  only makes sense under this choice.
-- **`password_hash` was added even though only F-05 explicitly asked for
-  an MFA-secret column.** F-04's login route needs *some* first-factor
-  credential to check before TOTP; there was no existing password storage
-  anywhere in the schema. Treated as necessary infrastructure for F-04,
-  not scope creep — called out explicitly here in case a future reviewer
-  wonders why the migration touches more than F-05's own row describes.
-- **Both new columns are nullable**, not `NOT NULL`. The `users` table is
-  deliberately ungated (see its own docstring) and three live-DB test
-  files already call `db_repository.create_user(...)` without password/
-  MFA args (`tests/api/test_endpoints_live_db.py`,
-  `tests/api/test_pilot_workflow_live_db.py`). Making either column
-  `NOT NULL` would have broken those call sites and forced touching
-  DB-backed tests that can't be run in this environment to verify the
-  change didn't break something else. `create_user` grew two new
-  *optional* keyword args instead (default `None`), so every existing
-  call site is untouched.
-- **No self-service enrollment endpoint was built.** Only login. Once a
-  user's `mfa_secret_encrypted` is NULL, the only way to set it today is
-  direct repository/tooling access (`db_repository.create_user`'s new
-  optional args) — there is no `POST /auth/enroll-mfa` route. This
-  mirrors Phase 6's own explicit scope boundary ("No user-management HTTP
-  endpoint either — out of this phase's explicit scope") and keeps this
-  fix to exactly what F-04/F-05 asked for. If a real pilot needs
-  self-service enrollment, that's new scope, not a gap in this fix.
-- **Login does not write an audit log entry.** CLAUDE.md rule 5 ("every
-  write to a PHI-bearing table goes through the audit log") doesn't apply
-  here — login is a read (credential lookup) plus a JWT mint, no
-  persistence occurs. Auth-anomaly alerting on login attempts is F-11's
-  explicit scope (`observability/alerts.py`'s unwired "auth anomaly"
-  evaluator), not this fix's.
-- **Account lockout (F-06, `security/rate_limit.py`'s
-  `AccountLockoutTracker`) is deliberately not wired into `/auth/login`
-  yet.** The register lists it as a separate finding, next in ordering
-  ("Depends on F-04 for lockout" — F-04 now exists, so F-06 is unblocked
-  and should be next). Landing it in this same change would have mixed
-  two findings' worth of testing/review into one commit.
-- **Fixed a real bug in my own first draft before committing it**: the
-  initial version of the login route's `password_ok` boolean
-  short-circuited past `verify_password()` entirely when the subject was
-  unknown (`credentials is not None and ... and verify_password(...)`),
-  which silently defeated the timing-consistency goal the route's
-  docstring claims (comparing against a dummy hash so an unknown-subject
-  response takes the same time as a wrong-password one). Caught by
-  reading my own code against my own stated intent, not by a test — there
-  is no timing-oracle test in this repo (hard to write reliably without
-  flaking). Rewritten so `verify_password` always runs unconditionally
-  before any None-checks decide whether the result counts. Worth knowing
-  if the login route is ever refactored: this property is easy to
-  silently reintroduce by adding an early return.
+- **`enforce_rate_limit` was moved off a module-level singleton onto
+  `app.state` as part of this fix**, not left as originally written. The
+  register's fix text only said "attach `enforce_rate_limit` as a
+  router-level dependency" — it didn't flag the module-level `_limiter`
+  as a problem. It became one the moment the dependency was actually
+  attached to routes: `tests/api/conftest.py`'s `app`/`client` fixtures
+  are function-scoped (a fresh `FastAPI` app per test), but a
+  module-level limiter is process-wide and would have been shared and
+  slowly drained across every single test in the whole pytest session
+  regardless of which app instance served the request — a real, if slow-
+  building, source of order-dependent flakiness the register's fix text
+  didn't anticipate because nothing had exercised the dependency end to
+  end yet. Caught by reasoning through the test suite's fixture scoping
+  before writing tests, not by a failure — worth knowing in case this
+  pattern reappears somewhere else `Depends(...)` wraps mutable
+  module-level state.
+- **`enforce_rate_limit` is intentionally *not* applied to `POST
+  /auth/login`.** It structurally can't be — it depends on
+  `get_auth_context`, i.e. it requires the very token that login is the
+  thing producing. Brute-force protection on login is `AccountLockoutTracker`
+  alone (per-subject), not the general request limiter. A horizontal
+  attack trying many *different* subjects from one source isn't covered
+  by either mechanism — that would need IP-based limiting, which isn't
+  what F-06's fix text asked for and isn't built here. Worth a future
+  finding if it matters, not silently assumed covered.
+- **A locked-out login attempt skips password verification entirely**
+  (checked first, before the scrypt hash), trading a small amount of
+  timing-side-channel purity (a locked-out response is now faster than a
+  not-locked-out wrong-password response) for not spending a real scrypt
+  computation on every retry against an account already known to be
+  locked. This is a different, accepted trade-off from the unknown-
+  subject-vs-wrong-password timing consistency F-04/F-05 specifically
+  built in — that one was about not leaking *subject existence*; lockout
+  state being somewhat observable via timing is a standard, accepted
+  property of basically every real-world account-lockout system, not an
+  oversight.
+- **Both `RateLimiter` and `AccountLockoutTracker` remain in-memory,
+  single-process**, exactly as the register's own fix text flagged
+  ("need a shared store before >1 replica"). Both clouds' Terraform
+  already defaults `desired_count`/`min_replicas` to 2 (backlog item
+  B-46) — meaning this in-memory state silently stops being a real limit
+  the moment a second replica exists, since each replica has its own
+  independent budget/lockout state. Not solved here; solving it needs a
+  Redis (or equivalent) adapter behind the same `RateLimiter`
+  Protocol/`AccountLockoutTracker`-shaped port, which needs a real
+  deployment target to build against — same "no live infra in this
+  environment" ceiling as F-07/F-19/F-20/F-21.
 
 ## Traps for someone resuming cold
 
-- **Everything F-01/F-02/F-03's checkpoint already flagged still applies**
-  (CRLF warnings on `git add`, `docs/audit/`'s findings unverified against
-  real infra/DB by construction of this environment, the `${VAR:?message}`
-  bash-apostrophe gotcha, the PHI-content guardrail hook rejecting two
-  specific words landing next to each other).
-- **`scripts/hooks/block_phi.sh` also blocks synthetic-looking email
-  addresses outside an allowlist** (`@example.com`, `@test`, `@localhost`
-  only) — hit this once this session writing `tests/api/test_login.py`
-  with a `@example.test` address; fixed by switching to `@example.com`.
-  Same category of guardrail-friction as the two-words-adjacent PHI rule,
-  just a different pattern.
-- **The Makefile's coverage gate is narrower than it looks.**
-  `make test` only enforces 100% coverage on `domain/variance.py`
-  specifically (`coverage report --include="*/domain/variance.py"
-  --fail-under=100`), not all of `src/domain/`. Running
-  `pytest --cov=src/domain --cov-fail-under=100` directly (as if the gate
-  applied repo-wide across `domain/`) fails at ~91% and is the wrong
-  check — `domain/money.py` and `domain/x835.py` are well under 100% and
-  that's expected, not a regression. Always run the exact three lines
-  from the `test:` target, not an approximation.
-- **mypy's error count went from 144 files checked to 149** simply from
-  adding new modules (`security/passwords.py`, `api/routes/auth.py`,
-  `tests/api/test_login.py`, `tests/security/test_passwords.py`) — the
-  file count in any future checkpoint's "mypy --strict . (N files)" isn't
-  a meaningful trend signal by itself, it just tracks how many `.py`
-  files exist under `mypy_path`.
+- **Everything F-01 through F-05's checkpoints already flagged still
+  applies** (CRLF warnings on `git add`, `docs/audit/`'s findings
+  unverified against real infra/DB by construction of this environment,
+  the `${VAR:?message}` bash-apostrophe gotcha, the PHI-content guardrail
+  hook rejecting two specific words landing next to each other or a
+  non-allowlisted synthetic email domain, and the Makefile's
+  `domain/variance.py`-only coverage gate being much narrower than
+  `pytest --cov=src/domain --cov-fail-under=100` would suggest).
+- **If a future finding adds another authenticated router**, remember to
+  add `dependencies=[Depends(enforce_rate_limit)]` to its `APIRouter(...)`
+  construction explicitly — there's no central registry enforcing this,
+  and nothing will fail loudly if a new router forgets it (the route will
+  simply be unthrottled, silently, the same failure mode F-06 just fixed
+  for the existing five). Worth a structural test (parametrized over
+  `app.routes`, similar in spirit to `test_tenant_param_absence.py`)
+  if a sixth authenticated router is ever added — not written this
+  session since there's nothing yet to test it against beyond the
+  five that already carry it by construction.
 
 ## Next 3 steps
 
-1. **F-06 next** (rate limiting wiring, `api/rate_limit.py`,
-   `security/rate_limit.py`) — M effort, no new subsystem, and now
-   genuinely unblocked since F-04's login route exists to wire
-   `AccountLockoutTracker` into. Attach `enforce_rate_limit` as a
-   router-level dependency across the API; wire `AccountLockoutTracker`
-   into `POST /auth/login` specifically for lockout-after-N-failed-
-   attempts. Note both are in-memory/single-process (register's own
-   caveat) — fine for now, a shared store is a separate concern the
-   register doesn't ask this finding to solve.
-2. **After F-06**, continue F-07 through F-23 in `REGISTER.md`'s own
+1. **F-07 next** per `REGISTER.md`'s own listed order — AWS deployment
+   target is unreachable end to end (no `aws_lb_listener` resource
+   exists at all in `terraform/modules/aws/container_runtime.tf`), plus
+   `make_engine` should defensively require `sslmode=require`. The
+   Terraform half is genuinely infra-shaped (needs a real domain/ACM
+   cert to fully verify) but the `sslmode` half of the fix is a small,
+   fully offline-verifiable Python change — worth splitting those two
+   halves explicitly when picking this one up, same way F-01's DB-backed
+   and pure-logic halves were split.
+2. **After F-07**, continue F-08 through F-23 in `REGISTER.md`'s own
    listed order, same loop each time (state finding → test → fix → gate →
-   mark FIXED with SHA → commit).
+   mark FIXED with SHA → commit). F-08/F-09 are noted in the register as
+   sharing one fix site (`main.py`'s `PostgresRepository(...)`
+   construction missing `instruments=`/`tracer=`) — worth doing together
+   like F-04/F-05 were.
 3. **Once the MUST-FIX list is meaningfully further along**, update
    `docs/PHASES.md` to note Wave-3 remediation progress and re-run the
    Wave 0 baseline commands fresh across the accumulated batch, before
-   telling the user this phase of remediation is done. Not yet — 5/23
-   isn't "meaningfully further along" territory by itself; revisit this
-   after F-06 through roughly F-12 or so land.
+   telling the user this phase of remediation is done. 6/23 still isn't
+   "meaningfully further along" territory by itself; revisit after
+   roughly F-12 or so lands.
