@@ -208,6 +208,33 @@ database — not done here, no such database exists in this environment):
    only be produced by doing this for real.
 5. Tear down the restored instance once verified (avoid double-billing).
 
+`scripts/db/restore_drill.sh` (F-21, `docs/audit/REGISTER.md`) automates
+steps 1–5 above end to end — restore, wait, verify, print the elapsed
+time, tear down (via a `trap` so a failed verification still cleans up).
+It has never been run against a real AWS or Azure account, same
+disclosure as every other real-cloud script in this repo; running it for
+real, once a provisioned database exists, is what actually closes F-21:
+
+```
+CLOUD=aws \
+AWS_SOURCE_DB_IDENTIFIER=asc-recovery-prod-postgres \
+DATABASE_URL_TEMPLATE='postgresql://asc_owner:PASSWORD@%s:5432/asc_recovery?sslmode=require' \
+  ./scripts/db/restore_drill.sh
+```
+
+or for Azure:
+
+```
+CLOUD=azure \
+AZURE_SOURCE_SERVER_NAME=asc-recovery-prod-postgres \
+AZURE_RESOURCE_GROUP=asc-recovery-prod-rg \
+DATABASE_URL_TEMPLATE='postgresql://asc_owner:PASSWORD@%s:5432/asc_recovery?sslmode=require' \
+  ./scripts/db/restore_drill.sh
+```
+
+Record the printed elapsed-time result in this section and in F-21's
+`docs/audit/REGISTER.md` row once run for real.
+
 ## CI/CD pipeline
 
 Phase 10 added three GitHub Actions workflows. Unlike everything else in
