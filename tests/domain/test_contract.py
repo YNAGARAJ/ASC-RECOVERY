@@ -159,6 +159,83 @@ def test_bilateral_modifier_150_percent_single_line(make_contract_version: Contr
     assert priced.lines[0].pricing_method_used == PricingMethodUsed.BILATERAL
 
 
+def test_bilateral_two_line_split_pays_100_then_50_percent(
+    make_contract_version: ContractFactory,
+) -> None:
+    """F-16 (docs/audit/REGISTER.md): TWO_LINE_SPLIT was a storable enum
+    value with no pricing branch at all -- a contract configured with it
+    silently priced both bilateral lines at 100% (no reduction
+    whatsoever), a direct money error. The same procedure billed on two
+    lines, both modifier 50: one line at 100% of base, the other at the
+    remainder of total_rate above 100% (150% total -> 100% + 50%)."""
+    contract = make_contract_version(
+        fee_schedule={"27447": Money("1000.00")},
+        bilateral_rule=BilateralRule(
+            enabled=True,
+            total_rate=Rate.percent(Decimal("150")),
+            convention=BilateralConvention.TWO_LINE_SPLIT,
+        ),
+    )
+    lines = [
+        ClaimLineInput("27447", ("50",), None, Money("1000.00"), None, Decimal("1")),
+        ClaimLineInput("27447", ("50",), None, Money("1000.00"), None, Decimal("1")),
+    ]
+    priced = price_claim(lines, contract)
+    allowed_amounts = sorted(
+        (p.allowed for p in priced.lines if p.allowed is not None), reverse=True
+    )
+    assert allowed_amounts == [Money("1000.00"), Money("500.00")]
+    assert all(p.pricing_method_used == PricingMethodUsed.BILATERAL for p in priced.lines)
+
+
+def test_bilateral_two_line_split_higher_valued_line_gets_100_percent(
+    make_contract_version: ContractFactory,
+) -> None:
+    """The 100%/reduced split is by value, not input order -- the second
+    line submitted (higher fee-schedule amount here) still gets 100%."""
+    contract = make_contract_version(
+        fee_schedule={"A": Money("800.00"), "B": Money("1000.00")},
+        bilateral_rule=BilateralRule(
+            enabled=True,
+            total_rate=Rate.percent(Decimal("150")),
+            convention=BilateralConvention.TWO_LINE_SPLIT,
+        ),
+    )
+    lines = [
+        ClaimLineInput("A", ("50",), None, Money("800.00"), None, Decimal("1")),
+        ClaimLineInput("B", ("50",), None, Money("1000.00"), None, Decimal("1")),
+    ]
+    priced = price_claim(lines, contract)
+    by_code = {p.procedure_code: p for p in priced.lines}
+    assert by_code["B"].allowed == Money("1000.00")
+    assert by_code["A"].allowed == Money("400.00")
+
+
+def test_bilateral_lines_are_excluded_from_mppr_ranking(
+    make_contract_version: ContractFactory,
+) -> None:
+    """A bilateral pair is one procedure occurrence for MPPR purposes, not
+    two competing ones -- without this exclusion, a two-line-split claim
+    would trigger a second, spurious MPPR reduction purely from having 2
+    lines on the claim, on top of the bilateral reduction itself. Found
+    while adding TWO_LINE_SPLIT's own test, since that convention can't
+    be exercised with fewer than two lines."""
+    contract = make_contract_version(
+        fee_schedule={"27447": Money("1000.00")},
+        bilateral_rule=BilateralRule(
+            enabled=True,
+            total_rate=Rate.percent(Decimal("150")),
+            convention=BilateralConvention.TWO_LINE_SPLIT,
+        ),
+    )
+    lines = [
+        ClaimLineInput("27447", ("50",), None, Money("1000.00"), None, Decimal("1")),
+        ClaimLineInput("27447", ("50",), None, Money("1000.00"), None, Decimal("1")),
+    ]
+    priced = price_claim(lines, contract)
+    assert all(p.mppr_rank is None for p in priced.lines)
+
+
 def test_bilateral_disabled_via_payer_override(make_contract_version: ContractFactory) -> None:
     contract = make_contract_version(
         fee_schedule={"27447": Money("1000.00")},

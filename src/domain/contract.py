@@ -179,19 +179,45 @@ def price_claim(lines: Sequence[ClaimLineInput], contract: ContractVersion) -> P
             allowed[i] = None
             method[i] = PricingMethodUsed.UNPRICED
 
-    # 3. Bilateral modifier 50: single line at total_rate (150% by convention/default).
+    # 3. Bilateral modifier 50, one of two payer conventions:
+    #    - SINGLE_LINE_150_PCT: one line, paid at total_rate (150% by
+    #      convention/default) of its base price.
+    #    - TWO_LINE_SPLIT (F-16, docs/audit/REGISTER.md): the same
+    #      procedure billed on two separate lines, each carrying
+    #      modifier 50. The higher-valued line (ties broken by original
+    #      line order, same stable-sort convention step 6's MPPR ranking
+    #      already uses) is paid at 100% of its base price; the other is
+    #      paid at the remainder of total_rate above 100% (150% total ->
+    #      100% + 50%) -- this is what most payers actually mean by
+    #      "bilateral, billed on two lines," not a second 150% payment.
+    # A bilateral pair is one procedure occurrence for MPPR ranking
+    # purposes (step 6) -- MPPR reduces *additional distinct* procedures
+    # in the same session, not the two sides of the same one. Without
+    # this exclusion, a two-line-split claim with no other procedures at
+    # all would still trigger a second, spurious MPPR reduction on top of
+    # the bilateral one (rank 2 in the MPPR pool, purely from having 2
+    # lines) -- caught while adding TWO_LINE_SPLIT's own test, since that
+    # convention can't be exercised with fewer than two lines.
     bilateral_rule = contract.bilateral_rule
-    if (
-        bilateral_rule.enabled
-        and bilateral_rule.convention == BilateralConvention.SINGLE_LINE_150_PCT
-    ):
-        for i, line in enumerate(line_list):
-            if is_implant_line[i] or allowed[i] is None:
-                continue
-            if "50" not in line.modifiers:
-                continue
-            allowed[i] = allowed[i].times(bilateral_rule.total_rate)  # type: ignore[union-attr]
-            method[i] = PricingMethodUsed.BILATERAL
+    if bilateral_rule.enabled:
+        bilateral_indices = [
+            i
+            for i, line in enumerate(line_list)
+            if not is_implant_line[i] and allowed[i] is not None and "50" in line.modifiers
+        ]
+        for i in bilateral_indices:
+            excluded_from_mppr[i] = True
+        if bilateral_rule.convention == BilateralConvention.SINGLE_LINE_150_PCT:
+            for i in bilateral_indices:
+                allowed[i] = allowed[i].times(bilateral_rule.total_rate)  # type: ignore[union-attr]
+                method[i] = PricingMethodUsed.BILATERAL
+        elif bilateral_rule.convention == BilateralConvention.TWO_LINE_SPLIT:
+            remainder_rate = Rate(bilateral_rule.total_rate.as_decimal() - Decimal("1"))
+            ranked = sorted(bilateral_indices, key=lambda i: allowed[i], reverse=True)  # type: ignore[arg-type, return-value]
+            for rank, i in enumerate(ranked, start=1):
+                if rank >= 2:
+                    allowed[i] = allowed[i].times(remainder_rate)  # type: ignore[union-attr]
+                method[i] = PricingMethodUsed.BILATERAL
 
     # 4. Assistant surgeon: priced off the primary line's already-computed allowed.
     assistant_rule = contract.assistant_surgeon_rule
