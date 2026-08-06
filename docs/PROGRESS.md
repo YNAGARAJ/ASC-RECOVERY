@@ -21,16 +21,18 @@ context):
    unbuilt features, not bugs. Don't start this while register items
    remain open.
 
-**Established pattern from F-17 and F-18 (both in a prior session)**:
+**Established pattern from F-17 and F-18 (both from prior sessions)**:
 not every MUST-FIX row is a clean wiring fix. Some findings' "real" fix
 requires inventing infrastructure/data storage that was never part of
 any of the 12 original phases. **When a finding looks like this, ask the
-user how to scope it before proceeding** — don't guess. F-19 (this
-session) turned out NOT to be one of these — it was a clean, fully
-in-scope, fully offline-plus-DB-testable fix, confirming the "ask when
-uncertain" rule doesn't mean "ask about everything."
+user how to scope it before proceeding** — don't guess. F-20/F-21 (this
+session) both hit this squarely: real cloud KMS accounts and a real
+provisioned database don't exist in this environment, so "the real fix"
+and "what's actually buildable here" are different things — asked the
+user for both before writing code, see "Decisions" below for what was
+chosen.
 
-## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. 18 of 23 done.
+## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. 19 of 23 fully closed, 1 more partially addressed.
 
 Phases 1-12 are code-complete (see `docs/PHASES.md`). A full three-wave
 audit found 82 real defects — 1 CRITICAL, 22 HIGH, 34 MEDIUM, 25 LOW —
@@ -38,67 +40,110 @@ written up in `docs/audit/`. `docs/audit/REGISTER.md`'s 23-row MUST-FIX
 table (all CRITICAL/HIGH) is the actual work list for *this* codebase;
 that's what this checkpoint tracks.
 
-**Percentage of the MUST-FIX list closed: 18/23** (F-01 through F-16,
-F-18, F-19 — F-17 remains deliberately open, see the prior checkpoint).
-5 HIGH findings remain open (F-17, F-20 through F-23).
+**Percentage of the MUST-FIX list closed: 19/23 FIXED** (F-01 through
+F-16, F-18, F-19, F-20). **F-21 is partially addressed but stays OPEN**
+(the drill script exists; it's never been run for real). **F-17 remains
+deliberately open** (see prior checkpoints — no purchasing-feed
+integration exists to thread real `invoice_cost` through). **F-22, F-23
+remain OPEN**, both explicitly last per the register's own ordering.
 
 ## Done (fixed this session, one line each on the actual change)
 
-- **F-01 (CRITICAL)** through **F-18**, plus **B-16** — see git log
-  (`824b26a` through `febdf6e`) and prior checkpoints for detail;
-  unchanged this session.
-- **F-19 (HIGH, this session)** — `_TENANT_SCOPED_TABLES`
-  (`alembic/versions/0001_initial_schema.py`) is a hardcoded tuple that
-  doesn't track `db/models.py`, and it already drifted once for real:
-  `recovery_packets` needed its own migration (0004) to get RLS at all,
-  since 0001 predates that table's existence and nothing ever re-checked
-  the list afterward. The existing RLS cross-tenant proof
-  (`tests/db/test_rls_tenant_isolation.py`) is well-designed but only
-  ever exercises `claims` — a future PHI-bearing table could ship with a
-  `tenant_id` column and no RLS policy at all, and nothing would fail.
-  Commit `52ba255` (register updated to FIXED in `02c3683`):
-  - New `tests/db/test_rls_coverage.py` — walks `Base.metadata` directly
-    for every table carrying a `tenant_id` column, then queries
-    `pg_class`/`pg_policies` to confirm each one has RLS enabled, forced,
-    and an actual policy. A future `tenant_id`-bearing table with no RLS
-    migration now fails this test instead of silently shipping
-    unprotected. `users` is the one deliberate exception (already
-    explained in `db.models.User`'s own docstring: resolving a bearer
-    token's subject to a `tenant_id` is how a tenant-scoped session gets
-    bootstrapped in the first place, so this lookup can't itself require
-    `app.tenant_id` to already be set) — kept in a small, explicit
-    exclusion set that its own separate test guards against silent
-    future growth.
-  - Complementary to, not a replacement for,
-    `test_rls_tenant_isolation.py`: that file proves RLS actually
-    *blocks* a cross-tenant read where present; this one proves
-    *coverage* — that every table which should have RLS does.
-  - 3 new tests: 2 fully offline (the tenant-scoped table list isn't
-    accidentally empty; the exclusion list is exactly `{"users"}`), 1
-    DB-backed (the actual `pg_class`/`pg_policies` check) that skips
-    locally same as every other live-Postgres test in this repo.
-  - This was the fastest MUST-FIX fix in several sessions — no scoping
-    conversation needed, no infrastructure gap, pure test-writing against
-    already-correct production code (every existing table's RLS was
-    already right; only the *proof* of coverage was missing).
+- **F-01 (CRITICAL)** through **F-19** — see git log and prior
+  checkpoints for detail; unchanged this session.
+- **F-20 (HIGH, this session)** — `AwsKmsAdapter`
+  (`src/security/kms_aws.py`) and `AzureKeyVaultAdapter`
+  (`src/security/kms_azure.py`) implemented behind the existing
+  `KeyManagementService` port (`security/kms.py`). Wired into
+  `main.py`'s new `_build_kms()`, selected by a new `KMS_PROVIDER` env
+  var (`"env"`/unset → today's `EnvKMS`, unchanged default;
+  `"aws-kms"` → `AwsKmsAdapter`, requires `AWS_KMS_KEY_ID`;
+  `"azure-keyvault"` → `AzureKeyVaultAdapter`, requires
+  `AZURE_KEY_VAULT_KEY_ID`). Commit `02c6e38`, register updated in
+  `5ba2b60`.
+  - **AWS**: `key_id` is meant to be a KMS *alias*
+    (`alias/asc-recovery-kek`), not a raw key id — aliases are what let
+    AWS's own automatic annual rotation (`enable_key_rotation = true`,
+    already in Terraform) take effect with zero redeploys, since the
+    alias reference stays valid across rotation.
+  - **Azure**: fundamentally asymmetric with AWS here, documented at
+    length in `kms_azure.py`'s docstring — a Key Vault key *version* is
+    a distinct cryptographic object, not an alias. `current_kek_id()`
+    is a *pinned* version id; picking up a rotation means redeploying
+    with a new `AZURE_KEY_VAULT_KEY_ID` and running
+    `EnvelopeEncryptor.rotate_kek()`, not something that happens
+    automatically. `wrap_key` rejects any `kek_id` other than the
+    pinned current version; `unwrap_key` deliberately does not, since
+    it must keep working for a DEK wrapped under an older version
+    that's still enabled in the vault (the per-payload `kek_id` on
+    `EncryptedPayload` is exactly what makes that safe).
+  - `AzureKeyVaultAdapter` takes an injectable `crypto_client_factory`
+    (defaulting to a real lazy-importing factory) specifically so it's
+    unit-testable without the real `azure-keyvault-keys` SDK installed.
+    The wrap algorithm is passed as the literal string `"RSA-OAEP-256"`
+    rather than importing `KeyWrapAlgorithm.rsa_oaep_256`, so the
+    module has zero SDK imports at class-definition time.
+  - `boto3`/`azure-identity`/`azure-keyvault-keys` added as a new
+    `cloud-kms` optional-dependency group (`pyproject.toml`) — not a
+    base dependency; neither is installed in this dev environment,
+    which is itself the proof the lazy-import design works (tests pass
+    with neither package present).
+  - Tests: `tests/security/test_kms_aws.py` (5 tests, fake boto3-shaped
+    client), `tests/security/test_kms_azure.py` (5 tests, fake
+    Key-Vault-crypto-client via `crypto_client_factory`),
+    `tests/test_main.py` (+5 tests: unset/`"env"` default, invalid
+    `KMS_PROVIDER` value, missing `AWS_KMS_KEY_ID`/
+    `AZURE_KEY_VAULT_KEY_ID` — both provider branches only test the
+    pre-SDK-import validation path, since `boto3`/`azure-identity`
+    genuinely aren't installed here; that's consistent with every other
+    real-cloud adapter in this codebase, not a shortcut specific to
+    this fix).
+  - **Neither adapter has ever been exercised against a real AWS
+    account or Azure Key Vault** — no live credentials exist in this
+    build environment. This is disclosed in both modules' own
+    docstrings, matching the SFTP/S3 poller adapters from F-18.
+  - Documented in `docs/RUNBOOK.md`'s "Key rotation" section and
+    `docs/SECURITY.md`'s control matrix + "Not yet built" list.
+- **F-21 (HIGH, this session) — partially addressed, register entry
+  stays OPEN.** `scripts/db/restore_drill.sh` automates every step of
+  `docs/RUNBOOK.md`'s "Restore (backup verification)" procedure for
+  either cloud: restore the latest automated backup to a throwaway
+  instance (`aws rds restore-db-instance-to-point-in-time` /
+  `az postgres flexible-server restore`), wait for it, verify
+  `alembic_version` matches head, print row counts on
+  `claims`/`findings`/`recovery_packets`, confirm RLS
+  (`relrowsecurity`) survived the restore on all three, print the
+  elapsed wall-clock time, tear the instance down via a `trap` (so a
+  failed verification still cleans up, `SKIP_TEARDOWN=1` escape hatch
+  for manual inspection). Commit `7397b3d`, register updated in
+  `5ba2b60`.
+  - **User explicitly chose to leave this OPEN** rather than mark it
+    FIXED: the finding's actual requirement is "execute this for real
+    and record the actual wall-clock number," and no AWS/Azure account
+    exists in this environment to do that. Writing the script closes
+    "the procedure only exists as prose someone has to manually
+    transcribe" — it does not, and cannot, close the finding itself.
+  - Shell-syntax-checked (`bash -n`) only — never actually run, by
+    construction (no cloud account, no live database).
 
 ## In progress
 
-Nothing mid-write. F-19 went through the full Wave 3 loop (state the
-finding → write the test → show it passing locally where possible → full
-local gate → mark FIXED in the register with the commit SHA → commit)
-and is complete as a unit.
+Nothing mid-write. Both F-20 and F-21 went through the full Wave 3 loop
+(re-read the full row → ask the user to scope, since both hit the
+"needs infrastructure never built in any phase" pattern → implement →
+test → full local gate → register update with commit SHAs → commit) and
+are complete as units, in the state the user asked for.
 
 ## Failing
 
 Nothing failing that this session caused. `ruff check .`, `mypy --strict .`
-(167 files), `pytest -q` (480 passed, 35 skipped — all DB-backed, none
+(171 files), `pytest -q` (495 passed, 35 skipped — all DB-backed, none
 newly broken), the `domain/variance.py` 100%-coverage gate
-(`pytest --cov=src/domain --cov-branch -q` then
+(`pytest -q --cov --cov-report=` then
 `coverage report --include="*/domain/variance.py" --fail-under=100`),
 `python -m evals.run` (GATE PASSED, 100% recall/precision/root-cause/dollar
 accuracy on 504 golden cases), and `bandit -r . -x ./tests,./evals` are all
-clean as of commit `02c3683`.
+clean as of commit `5ba2b60`.
 
 **Pre-existing, unrelated, still present:** `mypy --strict .` reports two
 errors in `alembic/versions/0004_recovery_packets_and_timely_filing.py:65,82`
@@ -108,66 +153,91 @@ doesn't get silently attributed to a future fix by mistake.
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **The exclusion list (`_DELIBERATELY_UNGATED_TABLES`) is enforced by
-  its own dedicated test**, not just a comment. `test_deliberately_ungated_tables_list_is_exactly_the_justified_one`
-  fails loudly if the set ever grows without someone deliberately editing
-  that assertion too — the whole point of F-19 is "don't let a gap grow
-  silently," and an unenforced exclusion list would just relocate the
-  exact same silent-drift risk one file over.
-- **Chose `pg_class`/`pg_policies` system-catalog queries over
-  `information_schema`** — Postgres's RLS-specific flags
-  (`relrowsecurity`, `relforcerowsecurity`) and `pg_policies` are the
-  authoritative, Postgres-native source for this; `information_schema`
-  doesn't expose RLS status at all (it's not part of the SQL standard).
-  No real alternative existed here, just noting it wasn't a close call.
-- **Did not touch `alembic/versions/0001_initial_schema.py`'s
-  `_TENANT_SCOPED_TABLES` itself.** The finding's fix text asks
-  specifically for "a data-driven test," not for migrations to somehow
-  dynamically derive their own DDL from current ORM state (which would
-  be a strange, fragile thing for a migration to do anyway — migration
-  DDL is supposed to be a frozen historical record). The hardcoded list
-  stays exactly as-is; the new test is what keeps it honest going
-  forward.
+- **F-20 and F-21 both got a two-question `AskUserQuestion` before any
+  code was written**, per the established F-17/F-18 pattern. Both times
+  the user picked the "build what's buildable, be honest about what
+  isn't, opt-in only" option over the alternatives (skip entirely, or
+  force a fake success):
+  - F-20: **"Build both adapters, opt-in only via env var"** — not
+    "build one," not "leave it deferred," not "make it the new
+    default."
+  - F-21: **"Build the restore-drill script, leave finding open"** —
+    not "mark it FIXED since the script exists," not "skip the script
+    since it can't be run here."
+- **`KMS_PROVIDER` defaults preserve F-04-through-F-19's status quo
+  exactly.** No existing deployment env or test fixture needed to
+  change for this fix to land — `_build_kms()`'s `"env"` branch is
+  byte-for-byte the same `EnvKMS(secrets)` construction `main.py` did
+  before this session, just factored out. This was a deliberate
+  constraint going in, not a discovery.
+- **`AzureKeyVaultAdapter`'s first draft was not unit-testable** —
+  initial version imported `CryptographyClient`/`KeyWrapAlgorithm`
+  lazily *inside* `wrap_key`/`unwrap_key`, which meant even a
+  fake-client-based test would hit a real SDK import line. Redesigned
+  with an injectable `crypto_client_factory` constructor parameter and
+  the wrap algorithm as a literal string instead of an enum import —
+  worth knowing if another adapter in this codebase ever needs the same
+  "lazy-import SDK, but still unit-testable" treatment.
+- **`restore_drill.sh` restores to "use latest restorable time," not a
+  named snapshot** — matches what an actual disaster-recovery restore
+  would use (latest automated backup + WAL replay), not a specific
+  point that could be stale by the time someone runs the drill.
 
 ## Traps for someone resuming cold
 
 - **Read the "IMPORTANT" section at the top of this file before doing
-  anything else** — the two-stage work order, and the reminder that "ask
-  before assuming new infrastructure is in scope" doesn't mean every
-  finding needs a scoping conversation. F-19 didn't.
-- **Everything F-01 through F-18's checkpoints already flagged still
+  anything else** — the two-stage work order, and the reminder that
+  "ask before assuming new infrastructure is in scope" is now confirmed
+  by three separate findings (F-17, F-18, F-20/F-21), not just one.
+- **Everything F-01 through F-19's checkpoints already flagged still
   applies** (CRLF warnings on `git add`, `docs/audit/`'s findings
   unverified against real infra/DB by construction of this environment,
-  the `${VAR:?message}` bash-apostrophe gotcha, the PHI-content guardrail
-  hook's quirks, the Makefile's `domain/variance.py`-only coverage gate,
-  `mypy --strict .` actually sweeping the whole repo (not just
-  `src`+`tests`) because of the `.` CLI argument, remembering
+  the `${VAR:?message}` bash-apostrophe gotcha, the PHI-content
+  guardrail hook's quirks, the Makefile's `domain/variance.py`-only
+  coverage gate, `mypy --strict .` actually sweeping the whole repo
+  (not just `src`+`tests`) because of the `.` CLI argument — this is
+  exactly why `kms_aws.py`/`kms_azure.py` needed their own
+  `[[tool.mypy.overrides]]` entries even though `boto3`/`azure-identity`
+  are never installed here, remembering
   `dependencies=[Depends(enforce_rate_limit)]` on any new authenticated
   router, remembering `api.alerting.record_not_found(...)` on any new
   direct-id-lookup route, `required_figure_lines()` on any new scripted
   packet-draft fixture, `FakeRepository`'s audit-write gaps, OTel's
-  global-provider write-once-per-process rule, and re-reading a finding's
-  *full* row — not just its "Fix" column — once more right before
-  marking it FIXED).
-- **If a brand-new tenant-scoped table is ever added**, its own migration
-  must grant RLS (matching 0004's `_grant_and_secure_recovery_packets()`
-  pattern) *and* nothing further needs updating in
-  `tests/db/test_rls_coverage.py` itself — the new test picks it up
-  automatically via `Base.metadata`. That's the whole point; don't
-  reflexively go add it to a list somewhere.
+  global-provider write-once-per-process rule, and re-reading a
+  finding's *full* row — not just its "Fix" column — once more right
+  before marking it FIXED).
+- **If a real AWS or Azure account ever becomes available**, the very
+  first useful thing to do with it is run `scripts/db/restore_drill.sh`
+  for real (closes F-21) and separately exercise `KMS_PROVIDER=aws-kms`
+  / `KMS_PROVIDER=azure-keyvault` end to end against a real KMS/Key
+  Vault (upgrades F-20 from "built and unit-tested" to "verified") —
+  neither has ever touched real infrastructure, and both docstrings say
+  so explicitly.
+- **`pyproject.toml` now has two extras that both pull in `boto3`**
+  (`[poller]` from F-18, `[cloud-kms]` from F-20) — deliberately not
+  factored into a shared group, since they're for unrelated concerns
+  (SFTP/S3 polling vs. KMS) that happen to both touch AWS.
+  `pip install -e ".[poller,cloud-kms]"` if a real environment ever
+  needs both.
 
 ## Next 3 steps
 
-1. **F-20 (real cloud KMS adapters) and F-21 (a real, timed backup/
-   restore drill) are next per `REGISTER.md`'s order, and both are
-   explicitly, structurally blocked on real cloud infrastructure this
-   environment has never had** — the register says so plainly for both.
-   Follow the F-17/F-18 pattern: read the full row, work out what (if
-   anything) is genuinely fixable without real infrastructure, and ask
-   the user how to scope it before writing code. Don't force either.
-2. **F-22/F-23 must come last**, not before F-01–F-21 are triaged (F-23
-   literally depends on that).
-3. **Once the MUST-FIX list is as closed as this environment allows**,
-   stage 2 begins — see the IMPORTANT section. Worth explicitly checking
-   in with the user at that point about how close is "close enough" given
-   F-20/F-21's infrastructure ceiling, rather than assuming.
+1. **F-22 and F-23 are next per `REGISTER.md`'s order.** F-22 (every
+   cross-seam integration test gated behind `TEST_DATABASE_URL`, so
+   this environment's runnable suite proves no integration behavior) is
+   itself a real-infrastructure-shaped finding — read its full row
+   before assuming there's code to write; it may turn out to be another
+   "ask the user how to scope it" case, or it may turn out to be
+   genuinely just a Docker-based dev-container Postgres setup task.
+2. **F-23 must come last, after F-01 through F-22 are triaged** — it
+   literally depends on that (re-running the `adversarial-reviewer`
+   subagent against a tree where every other finding has a final
+   disposition).
+3. **Once F-22/F-23 land, the MUST-FIX list is as closed as this
+   environment allows** (19 FIXED, F-17/F-21 honestly partial/open on
+   infrastructure grounds, F-22/F-23 whatever they turn out to be).
+   That's the point to explicitly check in with the user about how
+   close is "close enough" before declaring Wave 3 done and starting
+   stage 2 (the unbuilt product-completeness gaps in
+   `docs/MASTER-BUILD-PROMPT-V2.md`) — per the IMPORTANT section, don't
+   assume.
