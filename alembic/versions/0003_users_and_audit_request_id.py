@@ -1,9 +1,10 @@
-"""Add `users` (ungated, like `tenants` -- see src/db/models.py's User
-docstring for why) and `audit_log.request_id`, needed for Phase 6's API
-layer: resolving a bearer token's subject to a tenant_id requires a lookup
-that can't itself be tenant-scoped, and "request ID propagated into every
-log line and audit entry" (docs/MASTER-BUILD-PROMPT.md, Phase 6) needs
-somewhere on `audit_log` to put it.
+"""Add `users` (ungated, like `organizations`/`facilities` -- see
+src/db/models.py's User docstring for why) and `audit_log.request_id`,
+needed for Phase 6's API layer: resolving a bearer token's subject to a
+user id requires a lookup that can't itself be access-scoped, and
+"request ID propagated into every log line and audit entry"
+(docs/MASTER-BUILD-PROMPT.md, Phase 6) needs somewhere on `audit_log` to
+put it.
 
 Revision ID: 0003
 Revises: 0002

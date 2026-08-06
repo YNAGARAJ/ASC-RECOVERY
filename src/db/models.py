@@ -1,22 +1,28 @@
-"""SQLAlchemy 2.0 ORM models for the Phase 3 persistence layer.
+"""SQLAlchemy 2.0 ORM models for the organization/facility/membership
+access model (Phase 4, `MASTER-BUILD-PROMPT-V2.md`).
 
-Every PHI-bearing table carries `tenant_id`, non-null, foreign-keyed to
-`tenants` -- per CLAUDE.md rule 8, there is no global read. The Alembic
-migration (alembic/versions/0001_initial_schema.py) is what actually
-enables Row-Level Security and creates the tenant-isolation policy; this
+Replaces the earlier flat `tenant_id`-per-table model outright (see
+`alembic/versions/0001_initial_schema.py`'s module docstring for why this
+is a clean-cut schema replacement rather than a data migration -- no real
+customer/PHI data has ever existed in this system).
+
+Every table that previously carried `tenant_id` now carries either
+`facility_id` (claims and everything that hangs off a claim, plus
+remittances/audit/PHI-access/recovery-packet rows -- one remittance file
+still maps to exactly one facility, same denormalization shape as before)
+or `org_id` (contracts/contract_versions/fee_schedule_lines -- payer
+contracts are negotiated per organization, so one ASC_GROUP's facilities
+share one rate card instead of each needing its own).
+
+`organizations` is self-referencing (`parent_org_id`) to represent
+PLATFORM -> BILLING_COMPANY/ASC_GROUP -> ASC hierarchies. Access is never
+a bare id comparison: a user's `memberships` row grants a role within one
+org (plus, by the recursive access rule, every descendant org), narrowed
+to specific facilities only if `scope=SPECIFIC_FACILITIES` via
+`membership_facilities`. See `alembic/versions/0001_initial_schema.py`'s
+`resolve_accessible_facility_ids`/`resolve_accessible_org_ids` SQL
+functions for how this is actually enforced at the database level -- this
 module only defines table shape.
-
-Enum-like columns (claim status, root cause, pricing method, etc.) are
-plain bounded strings, not native Postgres ENUM types -- adding a new
-RootCause value would otherwise require an ALTER TYPE migration every time
-domain.variance changes. Validity is enforced at the Python/domain layer,
-which already has typed enums for all of these.
-
-Rule sub-structures on contract_versions (MPPR, bilateral, assistant
-surgeon, implant carve-out) are stored as JSONB rather than normalized into
-four more tables -- they're small, nested, and never queried directly; the
-repository layer is the single place that (de)serializes them into the
-Phase 1 domain dataclasses.
 """
 
 from __future__ import annotations
@@ -43,35 +49,71 @@ from sqlalchemy.orm import Mapped, mapped_column
 from db.base import Base
 
 
-class Tenant(Base):
-    __tablename__ = "tenants"
+class Organization(Base):
+    """Self-referencing hierarchy: PLATFORM -> BILLING_COMPANY | ASC_GROUP
+    -> ASC. `parent_org_id` is nullable only for root nodes (a standalone
+    ASC with no parent, or the one PLATFORM node). RLS-protected like any
+    other resolved-access table (see the migration) -- readable only for
+    orgs the connected user's memberships resolve to, walking descendants
+    from their active org."""
+
+    __tablename__ = "organizations"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
+    parent_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True
+    )
+    type: Mapped[str] = mapped_column(String(20), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'active'"))
+    settings: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class Facility(Base):
+    """One physical ASC location. Every PHI-bearing table's `facility_id`
+    points here; `org_id` (and therefore the org hierarchy) is derived by
+    joining through this table, never denormalized further."""
+
+    __tablename__ = "facilities"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    npi: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    tax_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'active'"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 
 
 class User(Base):
-    """Deliberately ungated like Tenant, not tenant-scoped/RLS-protected --
-    resolving `subject` (a bearer token's `sub` claim) to a `tenant_id` is
-    how a tenant-scoped session gets bootstrapped in the first place
-    (src/api/auth.py), so this lookup can't itself require `app.tenant_id`
-    to already be set. See alembic/versions/0003_users_and_audit_request_id.py."""
+    """Deliberately ungated like Organization/Facility, not RLS-protected
+    -- resolving a bearer token's `sub` claim to a user row is how a
+    session gets bootstrapped in the first place (src/api/auth.py), so
+    this lookup can't itself require `app.user_id` to already be set. No
+    `tenant_id`/`facility_id`/`org_id` column here at all: a user's access
+    is entirely defined by their `Membership` rows, not a column on this
+    table -- the same person can hold different roles in different orgs."""
 
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
-    )
     subject: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
-    role: Mapped[str] = mapped_column(String(20), nullable=False)
     # Both nullable: a user row can exist (e.g. provisioned by an admin)
     # before credentials are set up. api/routes/auth.py's login route
     # treats a NULL password_hash or mfa_secret_encrypted the same as a
@@ -86,14 +128,61 @@ class User(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class Membership(Base):
+    """One role, held by one user, within one org (plus every descendant
+    org, by the recursive access rule). `scope=ALL_FACILITIES` grants
+    every facility under the org tree rooted at `org_id`;
+    `scope=SPECIFIC_FACILITIES` narrows to whatever's listed in
+    `MembershipFacility`. RLS-protected by a bootstrap-safe *self-only*
+    policy (`user_id = current_setting('app.user_id')`) -- not the
+    recursive resolution function, since resolving that function's own
+    org-hierarchy walk must not itself depend on a membership row already
+    being visible. Broader visibility (an org_admin listing every
+    membership within their own org, for user management) is a Phase 5
+    concern layered on as an *additional* policy, not a replacement for
+    this one -- Postgres combines multiple permissive USING policies on
+    the same table with OR."""
+
+    __tablename__ = "memberships"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class MembershipFacility(Base):
+    """Narrows a `scope=SPECIFIC_FACILITIES` membership to specific
+    facilities. No surrogate id -- the pair is the identity."""
+
+    __tablename__ = "membership_facilities"
+
+    membership_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memberships.id"), primary_key=True
+    )
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), primary_key=True
+    )
+
+
 class Contract(Base):
     __tablename__ = "contracts"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
     )
     payer_id: Mapped[str] = mapped_column(String(100), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -119,8 +208,8 @@ class ContractVersion(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
     )
     contract_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("contracts.id"), nullable=False
@@ -150,8 +239,8 @@ class FeeScheduleLine(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
     )
     contract_version_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("contract_versions.id"), nullable=False
@@ -163,14 +252,14 @@ class FeeScheduleLine(Base):
 class Remittance(Base):
     __tablename__ = "remittances"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "file_hash", name="uq_remittance_tenant_file_hash"),
+        UniqueConstraint("facility_id", "file_hash", name="uq_remittance_facility_file_hash"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     source: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -189,8 +278,8 @@ class Claim(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     remittance_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("remittances.id"), nullable=False
@@ -205,7 +294,10 @@ class Claim(Base):
     # AES-256-GCM envelope-encrypted (security.encryption.EnvelopeEncryptor)
     # before this column is ever written -- see security.phi_columns for the
     # JSON serialization format and ingestion.apply for the write path.
-    # Never store patient name/member id in plaintext here.
+    # Never store patient name/member id in plaintext here. Also subject to
+    # field-level PHI masking at read time for roles lacking the unmasked-
+    # PHI permission (security/phi_masking.py) -- a separate mechanism from
+    # encryption-at-rest, enforced in the repository query layer.
     patient_name_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     patient_member_id_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -223,8 +315,8 @@ class ServiceLine(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     claim_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("claims.id"), nullable=False
@@ -248,8 +340,8 @@ class Adjustment(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     claim_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("claims.id"), nullable=False
@@ -268,8 +360,8 @@ class Finding(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     claim_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("claims.id"), nullable=False
@@ -312,8 +404,8 @@ class AuditLog(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     actor: Mapped[str] = mapped_column(String(200), nullable=False)
     action: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -338,8 +430,8 @@ class PHIAccessLog(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     actor: Mapped[str] = mapped_column(String(200), nullable=False)
     claim_id: Mapped[uuid.UUID] = mapped_column(
@@ -365,8 +457,8 @@ class RecoveryPacket(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
     )
     finding_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("findings.id"), nullable=False

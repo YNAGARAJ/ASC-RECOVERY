@@ -1,4 +1,4 @@
-"""Phase 7 schema: `recovery_packets` (tenant-scoped, RLS-enabled -- the
+"""Phase 7 schema: `recovery_packets` (facility-scoped, RLS-enabled -- the
 human-approval state machine for LLM-drafted appeal letters) plus
 `contracts.timely_filing_days` / `contracts.packet_template` (payer-level
 appeal-window and letter-template attributes; deliberately not on
@@ -36,16 +36,20 @@ def _grant_and_secure_recovery_packets() -> None:
     # this migration's upgrade() runs at most once per database. This is
     # the *only* place recovery_packets gets any of the four -- 0001's
     # create_all() creates the table but its grant/RLS loops only know
-    # about the tables hardcoded in `_MUTABLE_TABLES`/`_TENANT_SCOPED_TABLES`
-    # at the time 0001 was written, which predates this table.
+    # about the tables hardcoded in `_MUTABLE_TABLES`/`_FACILITY_SCOPED_TABLES`
+    # at the time 0001 was written, which predates this table. Policy
+    # shape (Phase 4, `docs/MASTER-BUILD-PROMPT-V2.md`) matches every other
+    # facility-scoped table -- see 0001's `resolve_accessible_facility_ids`.
     op.execute(text(f"GRANT SELECT, INSERT, UPDATE ON recovery_packets TO {_APP_ROLE}"))
     op.execute(text("ALTER TABLE recovery_packets ENABLE ROW LEVEL SECURITY"))
     op.execute(text("ALTER TABLE recovery_packets FORCE ROW LEVEL SECURITY"))
     op.execute(
         text(
-            "CREATE POLICY tenant_isolation ON recovery_packets "
-            "USING (tenant_id = current_setting('app.tenant_id')::uuid) "
-            "WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid)"
+            "CREATE POLICY facility_access ON recovery_packets "
+            "USING (facility_id IN (SELECT facility_id FROM "
+            "resolve_accessible_facility_ids(current_setting('app.user_id')::uuid))) "
+            "WITH CHECK (facility_id IN (SELECT facility_id FROM "
+            "resolve_accessible_facility_ids(current_setting('app.user_id')::uuid)))"
         )
     )
 
@@ -88,7 +92,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(text("DROP POLICY IF EXISTS tenant_isolation ON recovery_packets"))
+    op.execute(text("DROP POLICY IF EXISTS facility_access ON recovery_packets"))
     Base.metadata.tables["recovery_packets"].drop(bind=op.get_bind())
     op.drop_column("contracts", "packet_template")
     op.drop_column("contracts", "timely_filing_days")
