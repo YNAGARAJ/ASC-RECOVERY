@@ -46,6 +46,7 @@ from observability.notifications import LoggingNotificationPort
 from observability.tracing import setup_tracing
 from packets.drafter import AnthropicPacketDrafter
 from security.encryption import EnvelopeEncryptor
+from security.kms import KeyManagementService
 from security.kms_env import EnvKMS
 from security.secrets import EnvSecretStore, SecretNotFoundError
 
@@ -61,6 +62,32 @@ def _require(secrets: EnvSecretStore, name: str) -> str:
         raise MissingConfigurationError(
             f"required environment variable {name} is not set"
         ) from exc
+
+
+def _build_kms(secrets: EnvSecretStore) -> KeyManagementService:
+    """F-20 (docs/audit/REGISTER.md): opt-in only -- KMS_PROVIDER unset
+    or "env" behaves exactly as before this fix (EnvKMS, PHI_ENCRYPTION_KEY
+    required). Neither real cloud adapter has ever been exercised against
+    a real KMS/Key Vault (see security/kms_aws.py, security/kms_azure.py's
+    own docstrings), so switching a real deployment onto one is a
+    deliberate operator choice, never a silent default change."""
+    provider = os.environ.get("KMS_PROVIDER", "env")
+    if provider == "env":
+        _require(secrets, "PHI_ENCRYPTION_KEY")  # validated eagerly by EnvKMS below
+        return EnvKMS(secrets)
+    if provider == "aws-kms":
+        from security.kms_aws import build_aws_kms_adapter
+
+        key_id = _require(secrets, "AWS_KMS_KEY_ID")
+        return build_aws_kms_adapter(key_id=key_id, region=os.environ.get("AWS_REGION"))
+    if provider == "azure-keyvault":
+        from security.kms_azure import build_azure_keyvault_adapter
+
+        key_id = _require(secrets, "AZURE_KEY_VAULT_KEY_ID")
+        return build_azure_keyvault_adapter(key_id=key_id)
+    raise MissingConfigurationError(
+        f"KMS_PROVIDER must be 'env', 'aws-kms', or 'azure-keyvault', got {provider!r}"
+    )
 
 
 def _span_exporter(otlp_endpoint: str | None) -> SpanExporter:
@@ -89,7 +116,6 @@ def create_app_from_env() -> FastAPI:
     database_url = _require(secrets, "DATABASE_URL")
     jwt_secret_key = _require(secrets, "JWT_SECRET_KEY")
     anthropic_api_key = _require(secrets, "ANTHROPIC_API_KEY")
-    _require(secrets, "PHI_ENCRYPTION_KEY")  # validated eagerly by EnvKMS below
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
 
     # F-08/F-09 (docs/audit/REGISTER.md): both `tracer` and `instruments`
@@ -110,11 +136,7 @@ def create_app_from_env() -> FastAPI:
     # vendor. Do not point ANTHROPIC_API_KEY at a real account for a real
     # tenant until one exists (docs/compliance/README.md's checklist).
     drafter = AnthropicPacketDrafter(anthropic_api_key, instruments=instruments)
-    # EnvKMS is a stopgap KEK store (see security/kms_env.py's docstring) --
-    # a real cloud KMS adapter behind the same KeyManagementService port is
-    # a named, deferred gap (docs/SECURITY.md), not yet built for lack of a
-    # real cloud account to build it against.
-    encryptor = EnvelopeEncryptor(EnvKMS(secrets))
+    encryptor = EnvelopeEncryptor(_build_kms(secrets))
     # F-11 (docs/audit/REGISTER.md): one shared notifier -- both the
     # repository (unusual PHI access, ingestion failure rate) and the
     # app's routes (auth anomaly, cross-tenant probe) dispatch alerts

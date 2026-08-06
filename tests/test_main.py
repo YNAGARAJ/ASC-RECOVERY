@@ -62,6 +62,68 @@ def test_otlp_exporter_path_constructs_cleanly_when_endpoint_configured(
     assert isinstance(app, FastAPI)
 
 
+def test_kms_provider_unset_defaults_to_envkms_and_still_requires_phi_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-20 (docs/audit/REGISTER.md): KMS_PROVIDER unset must behave
+    exactly as before this fix -- PHI_ENCRYPTION_KEY still required, no
+    new env var demanded. Already covered indirectly by the
+    missing-PHI_ENCRYPTION_KEY case in test_missing_required_env_var_raises_a_clear_error,
+    this asserts the same default explicitly under the new KMS_PROVIDER
+    branch rather than relying on that coincidence."""
+    _set_all_required(monkeypatch)
+    monkeypatch.delenv("KMS_PROVIDER", raising=False)
+
+    app = create_app_from_env()
+
+    assert isinstance(app, FastAPI)
+
+
+def test_kms_provider_env_explicit_behaves_the_same_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("KMS_PROVIDER", "env")
+
+    app = create_app_from_env()
+
+    assert isinstance(app, FastAPI)
+
+
+def test_kms_provider_invalid_value_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("KMS_PROVIDER", "some-other-cloud")
+
+    with pytest.raises(MissingConfigurationError, match="KMS_PROVIDER"):
+        create_app_from_env()
+
+
+def test_kms_provider_aws_kms_without_key_id_raises_before_touching_boto3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AWS_KMS_KEY_ID is validated by _require() before
+    build_aws_kms_adapter's lazy `import boto3` runs -- proven here by the
+    fact this passes without boto3 installed in this dev environment at
+    all (pyproject.toml's [cloud-kms] extra)."""
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("KMS_PROVIDER", "aws-kms")
+    monkeypatch.delenv("AWS_KMS_KEY_ID", raising=False)
+
+    with pytest.raises(MissingConfigurationError, match="AWS_KMS_KEY_ID"):
+        create_app_from_env()
+
+
+def test_kms_provider_azure_keyvault_without_key_id_raises_before_touching_azure_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_all_required(monkeypatch)
+    monkeypatch.setenv("KMS_PROVIDER", "azure-keyvault")
+    monkeypatch.delenv("AZURE_KEY_VAULT_KEY_ID", raising=False)
+
+    with pytest.raises(MissingConfigurationError, match="AZURE_KEY_VAULT_KEY_ID"):
+        create_app_from_env()
+
+
 def test_repository_is_wired_with_real_instruments_and_tracer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -300,10 +300,35 @@ key rotation is enabled (`enable_key_rotation = true` in
 `terraform/modules/aws/secrets_and_kms.tf`) and rotates automatically
 annually; Azure Key Vault's key has an explicit `rotation_policy`
 (`terraform/modules/azure/secrets_and_kms.tf`, 30 days before a 1-year
-expiry). Neither cloud's automatic key rotation is connected to a real
-`KeyManagementService` adapter yet — that adapter is a named, deferred
-gap (`docs/SECURITY.md`), so today this rotates the cloud-managed key
-material but nothing in the running application calls it.
+expiry).
+
+By default the app still runs on `EnvKMS` (a static in-secret KEK, see
+`src/security/kms_env.py`), so today's cloud key rotation described above
+rotates key material that nothing in the running application actually
+calls. Real adapters exist to close that gap (F-20, `docs/audit/REGISTER.md`;
+`src/security/kms_aws.py`, `src/security/kms_azure.py`) but neither has
+ever been exercised against a real AWS or Azure account — enabling one is
+a deliberate, opt-in operator choice, not a default:
+
+- **`KMS_PROVIDER` unset or `"env"`** (default, unchanged): `EnvKMS`,
+  requires `PHI_ENCRYPTION_KEY`.
+- **`KMS_PROVIDER=aws-kms`**: `AwsKmsAdapter`. Requires
+  `AWS_KMS_KEY_ID` — set this to a KMS *alias* (e.g.
+  `alias/asc-recovery-kek`), not a raw key id, so AWS's own annual
+  rotation takes effect with zero redeploys. `AWS_REGION` optional
+  (falls back to the SDK's normal resolution). Install
+  `pip install -e ".[cloud-kms]"` first — `boto3` is not a base
+  dependency.
+- **`KMS_PROVIDER=azure-keyvault`**: `AzureKeyVaultAdapter`. Requires
+  `AZURE_KEY_VAULT_KEY_ID`, the full versioned key id
+  (`https://<vault>.vault.azure.net/keys/<name>/<version>`) — unlike an
+  AWS alias, an Azure Key Vault key *version* is a distinct
+  cryptographic object, so picking up a rotation means redeploying with
+  the new version's id and running `EnvelopeEncryptor.rotate_kek()`
+  against it; there is no automatic "use whatever's current" option.
+  Credentials come from `DefaultAzureCredential` (managed identity in a
+  real deployment), never a static secret this codebase stores. Install
+  `pip install -e ".[cloud-kms]"` first.
 
 ## Incident response
 

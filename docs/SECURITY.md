@@ -17,7 +17,7 @@ Every control below is written to that bar.
 | Control | HIPAA citation | Implementation | Status |
 |---|---|---|---|
 | Encryption at rest for PHI columns (AES-256) | §164.312(a)(2)(iv) | `src/security/encryption.py` — `EnvelopeEncryptor`, AES-256-GCM; wired onto `claims.patient_name_encrypted`/`patient_member_id_encrypted` in `ingestion/apply.py` (write) and `api/repository.py` (read) as of Phase 10 | Implemented and wired end to end, tested (`tests/db/test_patient_columns_are_encrypted.py`, `tests/api/test_endpoints_live_db.py`). Previously the primitive existed but nothing called it — patient columns were plaintext in practice; closed as a Phase 10 adversarial-review HIGH finding |
-| Key management, envelope encryption | §164.312(a)(2)(iv), §164.308(a)(5)(ii)(D) | `src/security/kms.py` (port) + `src/security/kms_local.py` (dev/test adapter) + `src/security/kms_env.py` (`EnvKMS`, a static-KEK-from-secret stopgap wired into `main.py` for real deployments) | Port, local adapter, and `EnvKMS` stopgap all implemented and tested. **Real AWS KMS / Azure Key Vault / GCP KMS / Vault adapters remain a named, deferred gap** — no cloud credentials available in this build environment. `EnvKMS` is meaningfully weaker (no per-operation KMS-side audit trail, no automatic rotation) but is a real, working encryption-at-rest mechanism today, not a placeholder |
+| Key management, envelope encryption | §164.312(a)(2)(iv), §164.308(a)(5)(ii)(D) | `src/security/kms.py` (port) + `src/security/kms_local.py` (dev/test adapter) + `src/security/kms_env.py` (`EnvKMS`, static-KEK-from-secret stopgap, still `main.py`'s default) + `src/security/kms_aws.py`/`src/security/kms_azure.py` (F-20, real adapters, opt-in via `KMS_PROVIDER`) | Port, local adapter, and `EnvKMS` implemented and tested. Real `AwsKmsAdapter`/`AzureKeyVaultAdapter` added in F-20, unit-tested against fake SDK clients (`tests/security/test_kms_aws.py`, `test_kms_azure.py`), wired into `main.py` behind `KMS_PROVIDER` (unset/`"env"` keeps today's `EnvKMS` default unchanged) — but **neither has ever been exercised against a real AWS account or Azure Key Vault**, no cloud credentials available in this build environment. `EnvKMS` is meaningfully weaker (no per-operation KMS-side audit trail, no automatic rotation) but is a real, working encryption-at-rest mechanism today, not a placeholder |
 | Key rotation without re-encrypting data | §164.308(a)(5)(ii)(D) | `EnvelopeEncryptor.rotate_kek()` re-wraps only the DEK | Implemented, tested — proves ciphertext bytes are unchanged after rotation |
 | Transmission encryption (TLS 1.2+) | §164.312(e)(1), §164.312(e)(2)(ii) | Enforced at the ingress/load-balancer layer | **Not yet built** — no network-facing service exists until Phase 6/9 |
 | Multi-factor authentication, mandatory, no bypass | §164.312(d) (2026 rule: MFA required) | `src/security/mfa.py` (TOTP) + `src/security/session.py` (`issue_session` refuses without `mfa_verified=True`) | Implemented, tested — see `tests/security/test_session.py::test_only_issue_session_can_mint_a_token_from_a_bare_role` for the no-bypass proof |
@@ -44,9 +44,11 @@ Every control below is written to that bar.
   *after* a successful login (MFA-gated token issuance, refresh, and
   validation); the actual OIDC handshake needs a real IdP and a hosting
   API, both of which arrive in Phase 6.
-- **Real cloud KMS adapters** (AWS KMS, Azure Key Vault, GCP KMS, Vault) —
-  named, deferred; `security/kms_env.py`'s `EnvKMS` is the real-but-weaker
-  stopgap in the meantime (see the key management row above).
+- **GCP KMS / Vault adapters** — still named, deferred; AWS KMS and Azure
+  Key Vault adapters exist now (F-20, `docs/audit/REGISTER.md`, opt-in via
+  `KMS_PROVIDER`) but only those two clouds. `security/kms_env.py`'s
+  `EnvKMS` remains the default in the meantime (see the key management
+  row above).
 - **TLS termination / network segmentation** — Phase 9 (Terraform layer);
   Phase 10 added explicit RDS-to-app encryption in transit
   (`terraform/modules/aws/database.tf`'s `rds.force_ssl` parameter group —
