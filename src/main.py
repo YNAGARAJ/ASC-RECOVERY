@@ -40,6 +40,7 @@ from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SpanExporter
 from api.app import create_app
 from api.repository import PostgresRepository
 from db.base import make_engine, make_session_factory
+from observability.logging_config import configure_logging
 from observability.metrics import setup_metrics
 from observability.tracing import setup_tracing
 from packets.drafter import AnthropicPacketDrafter
@@ -79,6 +80,10 @@ def _metric_exporter(otlp_endpoint: str | None) -> MetricExporter:
 
 
 def create_app_from_env() -> FastAPI:
+    # F-10 (docs/audit/REGISTER.md): first, before anything else has a
+    # chance to log a line that isn't covered by any filter yet.
+    configure_logging()
+
     secrets = EnvSecretStore()
     database_url = _require(secrets, "DATABASE_URL")
     jwt_secret_key = _require(secrets, "JWT_SECRET_KEY")
