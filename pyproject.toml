@@ -40,6 +40,15 @@ dev = [
     "bandit>=1.9",
     "pip-audit>=2.10",
 ]
+# F-18 (docs/audit/REGISTER.md): only scripts/ingestion/poll_remittances.py
+# needs these -- deliberately not in the base `dependencies` list, so the
+# main API image (and everything else that imports `ingestion.sources`)
+# never carries a hard dependency on either SDK. `pip install -e ".[poller]"`
+# before running that script.
+poller = [
+    "paramiko>=3.4",
+    "boto3>=1.34",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -58,6 +67,17 @@ mypy_path = "src"
 strict = true
 warn_unused_ignores = true
 files = ["src", "tests"]
+
+# F-18 (docs/audit/REGISTER.md): scripts/ingestion/poll_remittances.py
+# imports these lazily, and they're deliberately not a dev dependency
+# (pyproject.toml's [poller] extra, installed only where that one script
+# actually runs) -- ignore_missing_imports here, not a stub package,
+# since installing paramiko/boto3 (or their stubs) into the main dev
+# environment for one optional script's sake would defeat the point of
+# keeping them optional in the first place.
+[[tool.mypy.overrides]]
+module = ["paramiko", "boto3"]
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py312"

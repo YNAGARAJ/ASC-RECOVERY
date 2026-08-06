@@ -114,6 +114,64 @@ direct-DB-access, operator-run step rather than an endpoint.
    config validation without a live connection; get a real run against a
    provisioned database before trusting it for an actual pilot customer.
 
+## Scheduling remittance polling (SFTP/S3)
+
+`scripts/ingestion/poll_remittances.py` (F-18, `docs/audit/REGISTER.md`)
+polls one tenant's configured SFTP directory or S3 prefix once, ingesting
+whatever's new, then exits. It is a script, not a service this codebase
+runs continuously -- there is no job queue or scheduler anywhere in this
+build (that's tracked as a larger, separate gap; see
+`docs/MASTER-BUILD-PROMPT-V2.md`'s Phase 7). A real deployment schedules
+it with whatever it already has: a Kubernetes `CronJob`, a cloud
+provider's scheduled task (ECS Scheduled Task, Azure Container Apps Jobs,
+etc.), or plain cron on a long-lived host. Direct upload
+(`POST /remittances`) needs none of this and keeps working regardless --
+polling is for payers that only ever push files to a mailbox, never a
+person uploading through the UI.
+
+1. Install the extra SDKs this one script needs (deliberately not in the
+   main application's dependencies -- see `pyproject.toml`'s `[poller]`
+   extra):
+   ```
+   pip install -e ".[poller]"
+   ```
+
+2. Run it once, by hand, to prove the configuration is right, e.g. for S3:
+   ```
+   TENANT_ID="<tenant uuid>" SOURCE_KIND=s3 \
+     S3_BUCKET="acme-remittances" S3_PREFIX="incoming/" AWS_REGION=us-east-1 \
+     DATABASE_URL="<asc_app connection string>" \
+     PHI_ENCRYPTION_KEY="<same value main.py uses>" \
+     PYTHONPATH=src python scripts/ingestion/poll_remittances.py
+   ```
+   or for SFTP:
+   ```
+   TENANT_ID="<tenant uuid>" SOURCE_KIND=sftp \
+     SFTP_HOST="sftp.payer.example" SFTP_USERNAME="..." SFTP_PASSWORD="..." \
+     SFTP_DIR="/outgoing" \
+     DATABASE_URL="<asc_app connection string>" \
+     PHI_ENCRYPTION_KEY="<same value main.py uses>" \
+     PYTHONPATH=src python scripts/ingestion/poll_remittances.py
+   ```
+   Prints one line per file it found (ingested, quarantined, or
+   duplicate). A file already ingested on a prior run is re-fetched and
+   re-hashed every time (there's no persisted "already seen" state across
+   invocations -- the `remittances` table stores a content hash, not the
+   original filename) and correctly comes back a duplicate; this is
+   wasteful on a very large mailbox, never incorrect.
+
+3. Point your scheduler at the same command, on whatever interval matches
+   the payer's actual delivery cadence (hourly is a reasonable default
+   for most payers). One scheduled job per tenant per source.
+
+Not run against a real SFTP server or a real AWS account in the
+environment this was authored in -- the two real client adapters in that
+script (`_ParamikoSFTPClient`, `_Boto3S3Client`) are verified only via
+`ruff`/`mypy --strict` and the fully-tested, fake-client-backed
+`SFTPPollSource`/`S3PollSource`/`poll_and_ingest` underneath them (see
+`tests/ingestion/test_sources.py`, `test_poller.py`); get a real run
+against a real mailbox before trusting this for a live payer feed.
+
 ## Rollback
 
 Re-run step 5 above with the previous image tag — both Terraform modules
