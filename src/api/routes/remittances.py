@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, UploadFile
 
-from api.auth import AuthContext, get_repository, require_permission
+from api.auth import AuthContext, get_repository, require_facility, require_permission
 from api.rate_limit import enforce_rate_limit
 from api.repository import Repository
 from api.schemas import IngestionOutcomeOut
@@ -25,10 +25,11 @@ async def upload_remittance(
 ) -> IngestionOutcomeOut:
     content = await file.read()
     outcome = repository.ingest_remittance(
-        ctx.tenant_id,
+        ctx.user_id,
+        require_facility(ctx),
         content=content,
         source="upload",
-        uploaded_by=ctx.user_id,
+        uploaded_by=ctx.subject,
         scanner=_scanner,
     )
     if isinstance(outcome, DuplicateOutcome):

@@ -2,11 +2,12 @@
 security.kms/ingestion.sources: route handlers depend on the `Repository`
 Protocol, never on SQLAlchemy directly.
 
-`PostgresRepository` wraps `db.repository` + `db.tenancy.tenant_session`.
+`PostgresRepository` wraps `db.repository` + `db.access.access_session`.
 A `FakeRepository` (tests/api/fakes.py, test-only) is the other adapter --
-tenant-partitioned in-memory storage, so the full role x endpoint x tenant
-authorization matrix can run as real, passing tests in an environment with
-no live Postgres, the same trick ingestion.plan/apply used in Phase 5.
+facility-partitioned in-memory storage, so the full role x endpoint x
+facility authorization matrix can run as real, passing tests in an
+environment with no live Postgres, the same trick ingestion.plan/apply
+used in Phase 5.
 
 Every dataclass here carries money as `str`, never `float`
 (CLAUDE.md rule 2) -- these are what route handlers serialize directly.
@@ -25,11 +26,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository as db_repository
+from db.access import access_session
 from db.models import Contract as ContractORM
 from db.models import ContractVersion as ContractVersionORM
 from db.models import Finding as FindingModel
 from db.models import RecoveryPacket as RecoveryPacketModel
-from db.tenancy import tenant_session
 from domain.contract import (
     AssistantSurgeonRule,
     BilateralConvention,
@@ -61,6 +62,8 @@ from packets.service import generate_packet_draft
 from packets.templates import PacketTemplate, select_template
 from security.encryption import EnvelopeEncryptor
 from security.phi_columns import decrypt_phi_field
+from security.phi_masking import mask_patient_fields
+from security.rbac import Role
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
 
@@ -81,8 +84,7 @@ class Page:
 
 @dataclass(frozen=True, slots=True)
 class UserRecord:
-    tenant_id: uuid.UUID
-    role: str
+    id: uuid.UUID
     subject: str
 
 
@@ -93,12 +95,24 @@ class LoginCredentials:
     `mfa_secret` is already decrypted (PostgresRepository does that
     itself, same convention as patient name/member id on FindingDetail);
     either field is None if that credential was never provisioned, which
-    the login route treats identically to "wrong"."""
+    the login route treats identically to "wrong". No `role` here (Phase
+    4, `docs/MASTER-BUILD-PROMPT-V2.md`) -- role is per-membership, not a
+    single value a login step can carry, and is resolved fresh from
+    `memberships` on every request instead (`api/auth.py`).
+    `default_org_id` is `None` only for a user with zero memberships at
+    all (not yet provisioned onto any org) -- the login route must refuse
+    to issue a session in that case, since there is nothing to scope it
+    to. Picking *which* org becomes active at login is a real UX decision
+    (a user may hold several memberships) that Phase 5's login/switch-org
+    flow owns; this is a deliberate, documented stopgap that always picks
+    one deterministically rather than blocking Phase 4 on building that
+    flow early."""
 
+    user_id: uuid.UUID
     subject: str
-    role: str
     password_hash: str | None
     mfa_secret: str | None
+    default_org_id: uuid.UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,15 +314,36 @@ def _rule_input_to_contract_version(data: ContractVersionInput) -> ContractVersi
 
 
 class Repository(Protocol):
+    """`user_id` (first positional param on every access-scoped method) is
+    who this call runs as -- it's what `access_session` sets `app.user_id`
+    to, which RLS's resolution functions key off. `facility_id`/`org_id`
+    is the specific target within that user's resolved-accessible set
+    (`AuthContext.facility_id`/`.org_id`, `api/auth.py`) -- required, not
+    optional: Phase 4 does not build a "query across every facility I can
+    reach in one call" API, only per-facility/per-org calls (see
+    `docs/PROGRESS.md` for why that's a deliberate, documented scope
+    limit, not an oversight). RLS still narrows *within* that target
+    correctly even so -- a facility_id the caller can't actually reach
+    returns nothing, never another org's data."""
+
     def ping(self) -> bool: ...
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None: ...
 
     def get_login_credentials(self, subject: str) -> LoginCredentials | None: ...
 
+    def resolve_membership_role(
+        self, user_id: uuid.UUID, org_id: uuid.UUID
+    ) -> Role | None: ...
+
+    def resolve_default_facility_id(
+        self, user_id: uuid.UUID, org_id: uuid.UUID
+    ) -> uuid.UUID | None: ...
+
     def ingest_remittance(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         *,
         content: bytes,
         source: str,
@@ -317,32 +352,43 @@ class Repository(Protocol):
     ) -> IngestionOutcome | DuplicateOutcome: ...
 
     def list_findings(
-        self, tenant_id: uuid.UUID, *, filters: FindingFilters, page: Page
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: FindingFilters, page: Page
     ) -> PagedResult[FindingSummary]: ...
 
     def get_finding_detail(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        actor: str,
+        role: Role,
     ) -> FindingDetail | None: ...
 
     def list_contracts(
-        self, tenant_id: uuid.UUID, *, page: Page
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
     ) -> PagedResult[ContractSummary]: ...
 
     def create_contract(
-        self, tenant_id: uuid.UUID, *, payer_id: str, name: str
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
     ) -> ContractSummary: ...
 
     def create_contract_version(
-        self, tenant_id: uuid.UUID, contract_id: uuid.UUID, data: ContractVersionInput
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        contract_id: uuid.UUID,
+        data: ContractVersionInput,
     ) -> uuid.UUID: ...
 
     def list_audit_log(
-        self, tenant_id: uuid.UUID, *, filters: AuditLogFilters, page: Page
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: AuditLogFilters, page: Page
     ) -> PagedResult[AuditLogEntry]: ...
 
     def write_audit_log(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         *,
         actor: str,
         action: str,
@@ -353,24 +399,36 @@ class Repository(Protocol):
     ) -> None: ...
 
     def generate_packet(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, generated_by: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        generated_by: str,
     ) -> RecoveryPacketSummary | PacketGenerationFailed | None: ...
 
     def list_packets(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> list[RecoveryPacketSummary]: ...
 
     def decide_packet(
-        self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        packet_id: uuid.UUID,
+        *,
+        approve: bool,
+        decided_by: str,
     ) -> RecoveryPacketSummary | None: ...
 
     def get_claim_access_history(
-        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, claim_id: uuid.UUID
     ) -> tuple[AccessEventSummary, ...]: ...
 
     def record_finding_outcome(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         finding_id: uuid.UUID,
         *,
         data: RecordOutcomeInput,
@@ -438,11 +496,14 @@ def _finding_to_summary(row: FindingModel) -> FindingSummary:
 
 
 class PostgresRepository:
-    """Real adapter. Every tenant-scoped method opens its own
-    `tenant_session` -- callers pass a `sessionmaker`, not an open
+    """Real adapter. Every resolved-access method opens its own
+    `access_session` -- callers pass a `sessionmaker`, not an open
     `Session`, so each call gets a fresh transaction scoped to the
-    caller-supplied tenant_id (never a client-supplied one -- see
-    api/auth.py)."""
+    caller-supplied user_id (never a client-supplied one -- see
+    api/auth.py). Facility/org id parameters below are what the caller
+    already resolved access to; RLS (`resolve_accessible_facility_ids`/
+    `resolve_accessible_org_ids`) is what actually enforces that the
+    connected user may reach them at all."""
 
     def __init__(
         self,
@@ -504,33 +565,49 @@ class PostgresRepository:
             user = db_repository.get_user_by_subject(session, subject)
             if user is None:
                 return None
-            return UserRecord(tenant_id=user.tenant_id, role=user.role, subject=user.subject)
+            return UserRecord(id=user.id, subject=user.subject)
 
     def get_login_credentials(self, subject: str) -> LoginCredentials | None:
         with self._session_factory() as session:
             user = db_repository.get_user_by_subject(session, subject)
             if user is None:
                 return None
-            return LoginCredentials(
-                subject=user.subject,
-                role=user.role,
-                password_hash=user.password_hash,
-                mfa_secret=decrypt_phi_field(self._encryptor, user.mfa_secret_encrypted),
-            )
+            mfa_secret = decrypt_phi_field(self._encryptor, user.mfa_secret_encrypted)
+        with access_session(self._session_factory, user.id) as session:
+            default_org_id = db_repository.get_default_membership_org_id(session, user.id)
+        return LoginCredentials(
+            user_id=user.id,
+            subject=user.subject,
+            password_hash=user.password_hash,
+            mfa_secret=mfa_secret,
+            default_org_id=default_org_id,
+        )
+
+    def resolve_membership_role(self, user_id: uuid.UUID, org_id: uuid.UUID) -> Role | None:
+        with access_session(self._session_factory, user_id) as session:
+            role = db_repository.resolve_membership_role(session, user_id, org_id)
+            return None if role is None else Role(role)
+
+    def resolve_default_facility_id(
+        self, user_id: uuid.UUID, org_id: uuid.UUID
+    ) -> uuid.UUID | None:
+        with access_session(self._session_factory, user_id) as session:
+            return db_repository.get_default_facility_id_for_org(session, user_id, org_id)
 
     def ingest_remittance(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         *,
         content: bytes,
         source: str,
         uploaded_by: str,
         scanner: VirusScanner,
     ) -> IngestionOutcome | DuplicateOutcome:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             outcome = ingest_file(
                 session,
-                tenant_id,
+                facility_id,
                 content=content,
                 source=source,
                 uploaded_by=uploaded_by,
@@ -546,7 +623,7 @@ class PostgresRepository:
         # a few lines up the stack in ingestion.pipeline.ingest_file.
         if isinstance(outcome, IngestionOutcome) and self._notifier is not None:
             quarantined_count, total_count = self._ingestion_alert_tracker.record(
-                str(tenant_id), quarantined=(outcome.status == "quarantined")
+                str(facility_id), quarantined=(outcome.status == "quarantined")
             )
             alert = evaluate_ingestion_failure_alert(
                 quarantined_count=quarantined_count, total_count=total_count
@@ -556,12 +633,12 @@ class PostgresRepository:
         return outcome
 
     def list_findings(
-        self, tenant_id: uuid.UUID, *, filters: FindingFilters, page: Page
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: FindingFilters, page: Page
     ) -> PagedResult[FindingSummary]:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             rows, total = db_repository.list_findings(
                 session,
-                tenant_id,
+                facility_id,
                 root_cause=filters.root_cause,
                 date_from=filters.date_from,
                 date_to=filters.date_to,
@@ -575,15 +652,21 @@ class PostgresRepository:
         return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
 
     def get_finding_detail(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        actor: str,
+        role: Role,
     ) -> FindingDetail | None:
-        with tenant_session(self._session_factory, tenant_id) as session:
-            detail = db_repository.get_finding_detail(session, tenant_id, finding_id)
+        with access_session(self._session_factory, user_id) as session:
+            detail = db_repository.get_finding_detail(session, facility_id, finding_id)
             if detail is None:
                 return None
             db_repository.write_phi_access_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=actor,
                 claim_id=detail.claim.id,
                 purpose="finding_detail_view",
@@ -608,7 +691,7 @@ class PostgresRepository:
             confidence_score = None
             if payer_id is not None:
                 historical_rows = db_repository.list_historical_outcomes(
-                    session, tenant_id, payer_id, detail.finding.root_cause
+                    session, facility_id, payer_id, detail.finding.root_cause
                 )
                 historical = [
                     HistoricalOutcome(Outcome(row.outcome))
@@ -617,29 +700,37 @@ class PostgresRepository:
                 ]
                 confidence = calculate_confidence(historical)
                 confidence_score = None if confidence is None else str(confidence.as_decimal())
-            return FindingDetail(
-                summary=_finding_to_summary(detail.finding),
-                evidence=detail.finding.evidence,
-                patient_control_number=detail.claim.patient_control_number,
-                payer_claim_control_number=detail.claim.payer_claim_control_number,
-                date_of_service=detail.claim.date_of_service,
+            # Phase 4 field-level PHI masking (security/phi_masking.py):
+            # analyst reads amounts/codes but never unmasked patient
+            # name/member id -- applied once, here, not per-route.
+            patient_name, patient_member_id = mask_patient_fields(
+                role,
                 patient_name=decrypt_phi_field(
                     self._encryptor, detail.claim.patient_name_encrypted
                 ),
                 patient_member_id=decrypt_phi_field(
                     self._encryptor, detail.claim.patient_member_id_encrypted
                 ),
+            )
+            return FindingDetail(
+                summary=_finding_to_summary(detail.finding),
+                evidence=detail.finding.evidence,
+                patient_control_number=detail.claim.patient_control_number,
+                payer_claim_control_number=detail.claim.payer_claim_control_number,
+                date_of_service=detail.claim.date_of_service,
+                patient_name=patient_name,
+                patient_member_id=patient_member_id,
                 service_line=service_line,
                 adjustments=adjustments,
                 confidence_score=confidence_score,
             )
 
     def list_contracts(
-        self, tenant_id: uuid.UUID, *, page: Page
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
     ) -> PagedResult[ContractSummary]:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             rows, total = db_repository.list_contracts(
-                session, tenant_id, limit=page.limit, offset=page.offset
+                session, org_id, limit=page.limit, offset=page.offset
             )
             items = [
                 ContractSummary(
@@ -650,29 +741,33 @@ class PostgresRepository:
         return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
 
     def create_contract(
-        self, tenant_id: uuid.UUID, *, payer_id: str, name: str
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
     ) -> ContractSummary:
-        with tenant_session(self._session_factory, tenant_id) as session:
-            row = db_repository.create_contract(session, tenant_id, payer_id, name)
+        with access_session(self._session_factory, user_id) as session:
+            row = db_repository.create_contract(session, org_id, payer_id, name)
             return ContractSummary(
                 id=row.id, payer_id=row.payer_id, name=row.name, created_at=row.created_at
             )
 
     def create_contract_version(
-        self, tenant_id: uuid.UUID, contract_id: uuid.UUID, data: ContractVersionInput
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        contract_id: uuid.UUID,
+        data: ContractVersionInput,
     ) -> uuid.UUID:
         version = _rule_input_to_contract_version(data)
-        with tenant_session(self._session_factory, tenant_id) as session:
-            row = db_repository.create_contract_version(session, tenant_id, contract_id, version)
+        with access_session(self._session_factory, user_id) as session:
+            row = db_repository.create_contract_version(session, org_id, contract_id, version)
             return row.id
 
     def list_audit_log(
-        self, tenant_id: uuid.UUID, *, filters: AuditLogFilters, page: Page
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: AuditLogFilters, page: Page
     ) -> PagedResult[AuditLogEntry]:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             rows, total = db_repository.list_audit_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=filters.actor,
                 action=filters.action,
                 resource_type=filters.resource_type,
@@ -699,7 +794,8 @@ class PostgresRepository:
 
     def write_audit_log(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         *,
         actor: str,
         action: str,
@@ -708,10 +804,10 @@ class PostgresRepository:
         phi_accessed: bool,
         request_id: str | None,
     ) -> None:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             db_repository.write_audit_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=actor,
                 action=action,
                 resource_type=resource_type,
@@ -721,15 +817,20 @@ class PostgresRepository:
             )
 
     def generate_packet(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, generated_by: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        generated_by: str,
     ) -> RecoveryPacketSummary | PacketGenerationFailed | None:
-        with tenant_session(self._session_factory, tenant_id) as session:
-            detail = db_repository.get_finding_detail(session, tenant_id, finding_id)
+        with access_session(self._session_factory, user_id) as session:
+            detail = db_repository.get_finding_detail(session, facility_id, finding_id)
             if detail is None:
                 return None
             db_repository.write_phi_access_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=generated_by,
                 claim_id=detail.claim.id,
                 purpose="packet_generation",
@@ -775,7 +876,7 @@ class PostgresRepository:
             for _rejection in result.rejections:
                 db_repository.write_audit_log(
                     session,
-                    tenant_id,
+                    facility_id,
                     actor=generated_by,
                     action="packet_draft_rejected",
                     resource_type="finding",
@@ -786,7 +887,7 @@ class PostgresRepository:
             if not result.success or result.final_text is None:
                 db_repository.write_audit_log(
                     session,
-                    tenant_id,
+                    facility_id,
                     actor=generated_by,
                     action="packet_generation_failed",
                     resource_type="finding",
@@ -801,7 +902,7 @@ class PostgresRepository:
 
             row = db_repository.create_recovery_packet(
                 session,
-                tenant_id,
+                facility_id,
                 finding_id,
                 draft_text=result.final_text,
                 deadline=deadline,
@@ -809,7 +910,7 @@ class PostgresRepository:
             )
             db_repository.write_audit_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=generated_by,
                 action="packet_generated",
                 resource_type="recovery_packet",
@@ -819,27 +920,29 @@ class PostgresRepository:
             return _packet_to_summary(row)
 
     def list_packets(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> list[RecoveryPacketSummary]:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             finding = session.get(FindingModel, finding_id)
             if finding is not None:
                 db_repository.write_phi_access_log(
                     session,
-                    tenant_id,
+                    facility_id,
                     actor=actor,
                     claim_id=finding.claim_id,
                     purpose="packet_list_view",
                 )
                 self._record_phi_access(actor)
-            rows = db_repository.list_recovery_packets_for_finding(session, tenant_id, finding_id)
+            rows = db_repository.list_recovery_packets_for_finding(
+                session, facility_id, finding_id
+            )
             return [_packet_to_summary(row) for row in rows]
 
     def get_claim_access_history(
-        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, claim_id: uuid.UUID
     ) -> tuple[AccessEventSummary, ...]:
-        with tenant_session(self._session_factory, tenant_id) as session:
-            events = db_repository.get_claim_access_history(session, tenant_id, claim_id)
+        with access_session(self._session_factory, user_id) as session:
+            events = db_repository.get_claim_access_history(session, facility_id, claim_id)
             return tuple(
                 AccessEventSummary(
                     occurred_at=event.occurred_at,
@@ -854,21 +957,22 @@ class PostgresRepository:
 
     def record_finding_outcome(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         finding_id: uuid.UUID,
         *,
         data: RecordOutcomeInput,
         recorded_by: str,
     ) -> FindingSummary | None:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             row = session.get(FindingModel, finding_id)
-            if row is None or row.tenant_id != tenant_id:
+            if row is None or row.facility_id != facility_id:
                 return None
             existing_outcome = Outcome(row.outcome) if row.outcome is not None else None
             validate_outcome_recording(RootCause[row.root_cause], existing_outcome)
             updated = db_repository.record_finding_outcome(
                 session,
-                tenant_id,
+                facility_id,
                 finding_id,
                 outcome=data.outcome,
                 amount_recovered=data.amount_recovered,
@@ -880,7 +984,7 @@ class PostgresRepository:
             # decide_packet already uses right after its own DB write.
             db_repository.write_audit_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=recorded_by,
                 action="finding_outcome_recorded",
                 resource_type="finding",
@@ -890,18 +994,24 @@ class PostgresRepository:
             return _finding_to_summary(updated)
 
     def decide_packet(
-        self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        packet_id: uuid.UUID,
+        *,
+        approve: bool,
+        decided_by: str,
     ) -> RecoveryPacketSummary | None:
-        with tenant_session(self._session_factory, tenant_id) as session:
+        with access_session(self._session_factory, user_id) as session:
             existing = session.get(RecoveryPacketModel, packet_id)
-            if existing is None or existing.tenant_id != tenant_id:
+            if existing is None or existing.facility_id != facility_id:
                 return None
             row = db_repository.decide_recovery_packet(
-                session, tenant_id, packet_id, approve=approve, decided_by=decided_by
+                session, facility_id, packet_id, approve=approve, decided_by=decided_by
             )
             db_repository.write_audit_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=decided_by,
                 action="packet_approved" if approve else "packet_rejected",
                 resource_type="recovery_packet",

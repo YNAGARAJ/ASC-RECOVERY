@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from api.alerting import record_not_found
-from api.auth import AuthContext, get_repository, require_permission
+from api.auth import AuthContext, get_repository, require_facility, require_permission
 from api.rate_limit import enforce_rate_limit
 from api.repository import FindingFilters, Page, RecordOutcomeInput, Repository
 from api.schemas import FindingDetailOut, FindingListOut, FindingSummaryOut, RecordOutcomeIn
@@ -61,7 +61,9 @@ def list_findings(
     ctx: AuthContext = require_permission(Action.READ_FINDING),
     repository: Repository = Depends(get_repository),
 ) -> FindingListOut:
-    result = repository.list_findings(ctx.tenant_id, filters=filters, page=page)
+    result = repository.list_findings(
+        ctx.user_id, require_facility(ctx), filters=filters, page=page
+    )
     return FindingListOut.from_domain(result)
 
 
@@ -72,7 +74,10 @@ def export_findings_csv(
     repository: Repository = Depends(get_repository),
 ) -> StreamingResponse:
     result = repository.list_findings(
-        ctx.tenant_id, filters=filters, page=Page(limit=_EXPORT_ROW_LIMIT, offset=0)
+        ctx.user_id,
+        require_facility(ctx),
+        filters=filters,
+        page=Page(limit=_EXPORT_ROW_LIMIT, offset=0),
     )
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -117,9 +122,11 @@ def get_finding(
     ctx: AuthContext = require_permission(Action.READ_FINDING),
     repository: Repository = Depends(get_repository),
 ) -> FindingDetailOut:
-    detail = repository.get_finding_detail(ctx.tenant_id, finding_id, actor=ctx.user_id)
+    detail = repository.get_finding_detail(
+        ctx.user_id, require_facility(ctx), finding_id, actor=ctx.subject, role=ctx.role
+    )
     if detail is None:
-        record_not_found(request, ctx.user_id)
+        record_not_found(request, ctx.subject)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
     return FindingDetailOut.from_domain(detail)
 
@@ -138,7 +145,7 @@ def record_outcome(
     )
     try:
         row = repository.record_finding_outcome(
-            ctx.tenant_id, finding_id, data=data, recorded_by=ctx.user_id
+            ctx.user_id, require_facility(ctx), finding_id, data=data, recorded_by=ctx.subject
         )
     except OutcomeAlreadyRecordedError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -147,6 +154,6 @@ def record_outcome(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     if row is None:
-        record_not_found(request, ctx.user_id)
+        record_not_found(request, ctx.subject)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="finding not found")
     return FindingSummaryOut.from_domain(row)

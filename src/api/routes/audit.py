@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 
-from api.auth import AuthContext, get_repository, require_permission
+from api.auth import AuthContext, get_repository, require_facility, require_permission
 from api.rate_limit import enforce_rate_limit
 from api.repository import AuditLogFilters, Page, Repository
 from api.schemas import AccessHistoryOut, AuditLogListOut
@@ -47,7 +47,9 @@ def list_audit_log(
     ctx: AuthContext = require_permission(Action.READ_AUDIT_LOG),
     repository: Repository = Depends(get_repository),
 ) -> AuditLogListOut:
-    result = repository.list_audit_log(ctx.tenant_id, filters=filters, page=page)
+    result = repository.list_audit_log(
+        ctx.user_id, require_facility(ctx), filters=filters, page=page
+    )
     return AuditLogListOut.from_domain(result)
 
 
@@ -57,5 +59,5 @@ def get_claim_access_history(
     ctx: AuthContext = require_permission(Action.READ_PHI_ACCESS_LOG),
     repository: Repository = Depends(get_repository),
 ) -> AccessHistoryOut:
-    events = repository.get_claim_access_history(ctx.tenant_id, claim_id)
+    events = repository.get_claim_access_history(ctx.user_id, require_facility(ctx), claim_id)
     return AccessHistoryOut.from_domain(events)

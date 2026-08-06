@@ -8,10 +8,15 @@ same reason: a JSON number is parsed back as `float` by every standard
 JSON decoder, silently reintroducing the exact class of bug `domain.money`
 exists to make impossible.
 
-Every function here expects to run inside a `db.tenancy.tenant_session()`
-transaction -- RLS enforces tenant isolation at the database level; nothing
-here adds its own `WHERE tenant_id = ...` filtering on top, since Phase 3's
-whole point is that RLS is the actual boundary, not app-level filtering.
+Every function here expects to run inside a `db.access.access_session()`
+transaction -- RLS enforces access isolation at the database level;
+nothing here adds its own `WHERE facility_id = ...`/`WHERE org_id = ...`
+filtering on top of what the caller already scopes queries to, since
+Phase 4's whole point is that RLS (via `resolve_accessible_facility_ids`/
+`resolve_accessible_org_ids`) is the actual boundary, not app-level
+filtering. Business/PHI tables are scoped by `facility_id`; payer
+contracts (negotiated per organization, not per facility) are scoped by
+`org_id` -- see `db/models.py`'s module docstring.
 """
 
 from __future__ import annotations
@@ -33,13 +38,16 @@ from db.models import AuditLog as AuditLogModel
 from db.models import Claim as ClaimModel
 from db.models import Contract as ContractModel
 from db.models import ContractVersion as ContractVersionModel
+from db.models import Facility as FacilityModel
 from db.models import FeeScheduleLine as FeeScheduleLineModel
 from db.models import Finding as FindingModel
+from db.models import Membership as MembershipModel
+from db.models import MembershipFacility as MembershipFacilityModel
+from db.models import Organization as OrganizationModel
 from db.models import PHIAccessLog as PHIAccessLogModel
 from db.models import RecoveryPacket as RecoveryPacketModel
 from db.models import Remittance as RemittanceModel
 from db.models import ServiceLine as ServiceLineModel
-from db.models import Tenant as TenantModel
 from db.models import User as UserModel
 from db.rules_version import RULES_VERSION
 from domain.contract import (
@@ -55,6 +63,14 @@ from domain.contract import (
 )
 from domain.money import Money, Rate
 from domain.variance import Finding
+
+# Generous bound on how many levels of the org hierarchy
+# resolve_membership_role() will walk before giving up -- well beyond the
+# "five-level hierarchy resolves without looping" requirement, just a
+# hard stop against a corrupted parent_org_id cycle (RLS's own
+# resolution functions guard the same risk with an explicit visited-array
+# CTE; this is the equivalent guard for the Python-side ancestor walk).
+_MAX_HIERARCHY_DEPTH = 20
 
 # --- JSONB (de)serialization for the contract rule sub-structures ------------
 
@@ -181,23 +197,141 @@ def _contract_version_to_domain(
     )
 
 
-# --- Tenants -------------------------------------------------------------------
+# --- Organizations, facilities, memberships (Phase 4) ---------------------------
 
 
-def create_tenant(session: Session, name: str) -> TenantModel:
-    tenant = TenantModel(name=name)
-    session.add(tenant)
+def create_organization(
+    session: Session,
+    *,
+    parent_org_id: uuid.UUID | None,
+    type: str,
+    name: str,
+    settings: dict[str, Any] | None = None,
+) -> OrganizationModel:
+    org = OrganizationModel(
+        parent_org_id=parent_org_id, type=type, name=name, settings=settings or {}
+    )
+    session.add(org)
     session.flush()
-    return tenant
+    return org
 
 
-# --- Users (ungated, like tenants -- see db.models.User's docstring) -----------
+def create_facility(
+    session: Session,
+    org_id: uuid.UUID,
+    *,
+    name: str,
+    npi: str | None = None,
+    tax_id: str | None = None,
+    address: str | None = None,
+) -> FacilityModel:
+    facility = FacilityModel(org_id=org_id, name=name, npi=npi, tax_id=tax_id, address=address)
+    session.add(facility)
+    session.flush()
+    return facility
+
+
+def create_membership(
+    session: Session,
+    user_id: uuid.UUID,
+    org_id: uuid.UUID,
+    *,
+    role: str,
+    scope: str,
+    facility_ids: Sequence[uuid.UUID] = (),
+) -> MembershipModel:
+    """`facility_ids` is only meaningful (and should be non-empty) when
+    `scope="SPECIFIC_FACILITIES"` -- ignored for `scope="ALL_FACILITIES"`,
+    where access is the full resolved subtree instead
+    (`resolve_accessible_facility_ids`, `alembic/versions/0001_initial_schema.py`)."""
+    membership = MembershipModel(user_id=user_id, org_id=org_id, role=role, scope=scope)
+    session.add(membership)
+    session.flush()
+    for facility_id in facility_ids:
+        session.add(
+            MembershipFacilityModel(membership_id=membership.id, facility_id=facility_id)
+        )
+    session.flush()
+    return membership
+
+
+def get_default_membership_org_id(session: Session, user_id: uuid.UUID) -> uuid.UUID | None:
+    """The org of this user's oldest membership, or `None` if they hold
+    none at all. A deliberate, documented Phase 4 stopgap for "which org
+    becomes active at login" -- picking among several memberships is a
+    real UX decision (a Phase 5 login/switch-org flow's job); this just
+    needs to pick *something* deterministic so login can issue a token at
+    all. Must run inside an `access_session` scoped to `user_id`, same as
+    `resolve_membership_role`."""
+    return session.execute(
+        select(MembershipModel.org_id)
+        .where(MembershipModel.user_id == user_id)
+        .order_by(MembershipModel.created_at.asc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def get_default_facility_id_for_org(
+    session: Session, user_id: uuid.UUID, org_id: uuid.UUID
+) -> uuid.UUID | None:
+    """The single facility a resolved-accessible set narrows to, if
+    exactly one -- `None` if there are zero or more than one (an
+    ambiguous case that needs a real facility switcher, Phase 5/12's
+    job, not a guess). Common case this resolves cleanly: an `ASC`-type
+    org with exactly one facility, the large majority of real customers
+    at Phase 4's stage. Must run inside an `access_session` scoped to
+    `user_id`, same as `resolve_membership_role`."""
+    rows = session.execute(
+        select(FacilityModel.id)
+        .join(OrganizationModel, FacilityModel.org_id == OrganizationModel.id)
+        .where(OrganizationModel.id == org_id)
+        .limit(2)
+    ).scalars().all()
+    return rows[0] if len(rows) == 1 else None
+
+
+def resolve_membership_role(
+    session: Session, user_id: uuid.UUID, org_id: uuid.UUID
+) -> str | None:
+    """Walks from `org_id` up through `parent_org_id` looking for the
+    nearest membership this user holds -- "a user may access a record if
+    they hold a membership in the org owning it *or an ancestor org*"
+    (the one access rule) applies to role resolution the same way it
+    applies to row visibility. Returns `None` if no qualifying membership
+    exists anywhere up the chain (revoked, never existed, or the org
+    itself is gone) -- callers must treat that as unauthenticated, not as
+    "assume some default role."
+
+    Must run inside an `access_session` already scoped to `user_id`
+    (`app.user_id` set) -- `memberships`/`organizations` RLS depends on
+    it, same bootstrap ordering as every other resolved-access query."""
+    current_org_id: uuid.UUID | None = org_id
+    visited: set[uuid.UUID] = set()
+    for _ in range(_MAX_HIERARCHY_DEPTH):
+        if current_org_id is None or current_org_id in visited:
+            return None
+        visited.add(current_org_id)
+        membership = session.execute(
+            select(MembershipModel).where(
+                MembershipModel.user_id == user_id, MembershipModel.org_id == current_org_id
+            )
+        ).scalar_one_or_none()
+        if membership is not None:
+            return membership.role
+        org = session.get(OrganizationModel, current_org_id)
+        if org is None:
+            return None
+        current_org_id = org.parent_org_id
+    return None
+
+
+# --- Users (ungated, like organizations/facilities -- see db.models.User's docstring) --
 
 
 def get_user_by_subject(session: Session, subject: str) -> UserModel | None:
-    """Plain, non-tenant-scoped lookup -- this is how a request's tenant
-    context gets bootstrapped in the first place (src/api/auth.py), so it
-    must run outside `tenant_session` rather than inside it."""
+    """Plain, non-access-scoped lookup -- this is how a request's
+    identity gets bootstrapped in the first place (src/api/auth.py), so
+    it must run outside `access_session` rather than inside it."""
     return session.execute(
         select(UserModel).where(UserModel.subject == subject, UserModel.deleted_at.is_(None))
     ).scalar_one_or_none()
@@ -205,17 +339,16 @@ def get_user_by_subject(session: Session, subject: str) -> UserModel | None:
 
 def create_user(
     session: Session,
-    tenant_id: uuid.UUID,
     *,
     subject: str,
-    role: str,
     password_hash: str | None = None,
     mfa_secret_encrypted: str | None = None,
 ) -> UserModel:
+    """No role/org/facility here -- a user's access is entirely defined
+    by their `Membership` rows, created separately via
+    `create_membership`."""
     user = UserModel(
-        tenant_id=tenant_id,
         subject=subject,
-        role=role,
         password_hash=password_hash,
         mfa_secret_encrypted=mfa_secret_encrypted,
     )
@@ -228,34 +361,34 @@ def create_user(
 
 
 def create_contract(
-    session: Session, tenant_id: uuid.UUID, payer_id: str, name: str
+    session: Session, org_id: uuid.UUID, payer_id: str, name: str
 ) -> ContractModel:
-    contract = ContractModel(tenant_id=tenant_id, payer_id=payer_id, name=name)
+    contract = ContractModel(org_id=org_id, payer_id=payer_id, name=name)
     session.add(contract)
     session.flush()
     return contract
 
 
 def get_contract_by_payer_id(
-    session: Session, tenant_id: uuid.UUID, payer_id: str
+    session: Session, org_id: uuid.UUID, payer_id: str
 ) -> ContractModel | None:
     """For Phase 7's `timely_filing_days`/`packet_template` -- both live on
     `Contract`, not `ContractVersion` (see that model's docstring)."""
     return session.execute(
         select(ContractModel).where(
-            ContractModel.tenant_id == tenant_id, ContractModel.payer_id == payer_id
+            ContractModel.org_id == org_id, ContractModel.payer_id == payer_id
         )
     ).scalar_one_or_none()
 
 
 def create_contract_version(
     session: Session,
-    tenant_id: uuid.UUID,
+    org_id: uuid.UUID,
     contract_id: uuid.UUID,
     version: ContractVersion,
 ) -> ContractVersionModel:
     row = ContractVersionModel(
-        tenant_id=tenant_id,
+        org_id=org_id,
         contract_id=contract_id,
         effective_from=version.effective_from,
         effective_to=version.effective_to,
@@ -276,7 +409,7 @@ def create_contract_version(
     for procedure_code, amount in version.fee_schedule.items():
         session.add(
             FeeScheduleLineModel(
-                tenant_id=tenant_id,
+                org_id=org_id,
                 contract_version_id=row.id,
                 procedure_code=procedure_code,
                 allowed_amount=amount.as_decimal(),
@@ -287,9 +420,9 @@ def create_contract_version(
 
 
 def get_effective_contract_version(
-    session: Session, tenant_id: uuid.UUID, payer_id: str, date_of_service: date
+    session: Session, org_id: uuid.UUID, payer_id: str, date_of_service: date
 ) -> ContractVersion | None:
-    """Loads every version of `payer_id`'s contract for this tenant and
+    """Loads every version of `payer_id`'s contract for this org and
     hands off to the already-tested domain.contract.find_effective_contract
     -- Phase 3 adds no new date-effective logic, it only proves the Phase 1
     logic still picks the right version when the data comes from Postgres."""
@@ -297,7 +430,7 @@ def get_effective_contract_version(
         session.execute(
             select(ContractVersionModel)
             .join(ContractModel, ContractVersionModel.contract_id == ContractModel.id)
-            .where(ContractModel.tenant_id == tenant_id, ContractModel.payer_id == payer_id)
+            .where(ContractModel.org_id == org_id, ContractModel.payer_id == payer_id)
             .order_by(ContractVersionModel.effective_from.desc())
         )
         .scalars()
@@ -308,9 +441,9 @@ def get_effective_contract_version(
 
 
 def list_contract_versions(
-    session: Session, tenant_id: uuid.UUID, payer_id: str
+    session: Session, org_id: uuid.UUID, payer_id: str
 ) -> list[tuple[uuid.UUID, ContractVersion]]:
-    """Every version of `payer_id`'s contract for this tenant, undated --
+    """Every version of `payer_id`'s contract for this org, undated --
     callers that need to price several claims against possibly-different
     dates of service (ingestion) load once and pick per-claim via
     domain.contract.find_effective_contract themselves, rather than paying
@@ -323,7 +456,7 @@ def list_contract_versions(
         session.execute(
             select(ContractVersionModel)
             .join(ContractModel, ContractVersionModel.contract_id == ContractModel.id)
-            .where(ContractModel.tenant_id == tenant_id, ContractModel.payer_id == payer_id)
+            .where(ContractModel.org_id == org_id, ContractModel.payer_id == payer_id)
             .order_by(ContractVersionModel.effective_from.desc())
         )
         .scalars()
@@ -333,19 +466,19 @@ def list_contract_versions(
 
 
 def list_contracts(
-    session: Session, tenant_id: uuid.UUID, *, limit: int = 20, offset: int = 0
+    session: Session, org_id: uuid.UUID, *, limit: int = 20, offset: int = 0
 ) -> tuple[list[ContractModel], int]:
-    """All contracts for this tenant across every payer -- unlike
+    """All contracts for this org across every payer -- unlike
     `list_contract_versions`/`get_effective_contract_version`, which are
     scoped to one payer at a time for pricing lookups. For contract
     management's list view."""
     total = session.execute(
-        select(func.count()).select_from(ContractModel).where(ContractModel.tenant_id == tenant_id)
+        select(func.count()).select_from(ContractModel).where(ContractModel.org_id == org_id)
     ).scalar_one()
     rows = (
         session.execute(
             select(ContractModel)
-            .where(ContractModel.tenant_id == tenant_id)
+            .where(ContractModel.org_id == org_id)
             .order_by(ContractModel.created_at.desc())
             .limit(limit)
             .offset(offset)
@@ -361,25 +494,25 @@ def list_contracts(
 
 def record_remittance_if_new(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     file_hash: str,
     *,
     source: str,
     uploaded_by: str,
 ) -> tuple[RemittanceModel, bool]:
     """Returns (row, is_new). `is_new is False` means this exact file was
-    already ingested for this tenant -- the caller must not create any new
-    claims or findings from it."""
+    already ingested for this facility -- the caller must not create any
+    new claims or findings from it."""
     stmt = (
         pg_insert(RemittanceModel)
         .values(
-            tenant_id=tenant_id,
+            facility_id=facility_id,
             file_hash=file_hash,
             source=source,
             uploaded_by=uploaded_by,
             status="received",
         )
-        .on_conflict_do_nothing(index_elements=["tenant_id", "file_hash"])
+        .on_conflict_do_nothing(index_elements=["facility_id", "file_hash"])
         .returning(RemittanceModel.id)
     )
     inserted_id = session.execute(stmt).scalar_one_or_none()
@@ -394,7 +527,7 @@ def record_remittance_if_new(
 
     existing = session.execute(
         select(RemittanceModel).where(
-            RemittanceModel.tenant_id == tenant_id, RemittanceModel.file_hash == file_hash
+            RemittanceModel.facility_id == facility_id, RemittanceModel.file_hash == file_hash
         )
     ).scalar_one()
     return existing, False
@@ -405,7 +538,7 @@ def record_remittance_if_new(
 
 def create_claim(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     remittance_id: uuid.UUID,
     *,
     patient_control_number: str,
@@ -422,7 +555,7 @@ def create_claim(
     # layer only ever persists opaque strings, never plaintext PHI. See
     # ingestion.apply for the encryption call site.
     claim = ClaimModel(
-        tenant_id=tenant_id,
+        facility_id=facility_id,
         remittance_id=remittance_id,
         patient_control_number=patient_control_number,
         payer_claim_control_number=payer_claim_control_number,
@@ -441,7 +574,7 @@ def create_claim(
 
 def create_service_line(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     claim_id: uuid.UUID,
     *,
     line_index: int,
@@ -454,7 +587,7 @@ def create_service_line(
     service_date: date | None,
 ) -> ServiceLineModel:
     line = ServiceLineModel(
-        tenant_id=tenant_id,
+        facility_id=facility_id,
         claim_id=claim_id,
         line_index=line_index,
         procedure_code=procedure_code,
@@ -472,7 +605,7 @@ def create_service_line(
 
 def create_adjustment(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     claim_id: uuid.UUID,
     service_line_id: uuid.UUID | None,
     *,
@@ -481,7 +614,7 @@ def create_adjustment(
     amount: Decimal,
 ) -> AdjustmentModel:
     adjustment = AdjustmentModel(
-        tenant_id=tenant_id,
+        facility_id=facility_id,
         claim_id=claim_id,
         service_line_id=service_line_id,
         group_code=group_code,
@@ -495,7 +628,7 @@ def create_adjustment(
 
 def update_remittance_status(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     remittance_id: uuid.UUID,
     *,
     status: str,
@@ -503,7 +636,7 @@ def update_remittance_status(
 ) -> RemittanceModel:
     row = session.execute(
         select(RemittanceModel).where(
-            RemittanceModel.tenant_id == tenant_id, RemittanceModel.id == remittance_id
+            RemittanceModel.facility_id == facility_id, RemittanceModel.id == remittance_id
         )
     ).scalar_one()
     row.status = status
@@ -514,7 +647,7 @@ def update_remittance_status(
 
 def save_findings(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     claim_id: uuid.UUID,
     service_line_ids: Mapping[int, uuid.UUID],
     contract_version_id: uuid.UUID | None,
@@ -534,7 +667,7 @@ def save_findings(
             else service_line_ids[finding.line_index]
         )
         row = FindingModel(
-            tenant_id=tenant_id,
+            facility_id=facility_id,
             claim_id=claim_id,
             service_line_id=resolved_service_line_id,
             contract_version_id=contract_version_id,
@@ -558,24 +691,24 @@ def save_findings(
 
 
 def list_findings_by_payer_claim_control_number(
-    session: Session, tenant_id: uuid.UUID, payer_claim_control_number: str
+    session: Session, facility_id: uuid.UUID, payer_claim_control_number: str
 ) -> list[FindingModel]:
     """Findings belonging to any claim previously ingested under this payer
     claim control number -- used by ingestion to net a reversal (CLP02=22)
     against what it's reversing. Not scoped by remittance_id: a reversal
     typically arrives in a different file than the original payment.
 
-    Explicitly filtered by tenant_id (in addition to whatever RLS enforces
-    on the connection) -- this was previously accepted-but-unused, meaning
-    a payer_claim_control_number collision across tenants would leak
-    findings across tenants on any connection where RLS wasn't already
-    doing the job (e.g. a superuser/owner connection)."""
+    Explicitly filtered by facility_id (in addition to whatever RLS
+    enforces on the connection) -- this was previously accepted-but-unused,
+    meaning a payer_claim_control_number collision across facilities would
+    leak findings across facilities on any connection where RLS wasn't
+    already doing the job (e.g. a superuser/owner connection)."""
     return list(
         session.execute(
             select(FindingModel)
             .join(ClaimModel, FindingModel.claim_id == ClaimModel.id)
             .where(
-                ClaimModel.tenant_id == tenant_id,
+                ClaimModel.facility_id == facility_id,
                 ClaimModel.payer_claim_control_number == payer_claim_control_number,
             )
         )
@@ -589,7 +722,7 @@ def list_findings_by_payer_claim_control_number(
 
 def record_finding_outcome(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     finding_id: uuid.UUID,
     *,
     outcome: str,
@@ -603,7 +736,7 @@ def record_finding_outcome(
     database concern)."""
     finding = session.execute(
         select(FindingModel).where(
-            FindingModel.tenant_id == tenant_id, FindingModel.id == finding_id
+            FindingModel.facility_id == facility_id, FindingModel.id == finding_id
         )
     ).scalar_one()
     finding.outcome = outcome
@@ -615,11 +748,11 @@ def record_finding_outcome(
 
 
 def list_historical_outcomes(
-    session: Session, tenant_id: uuid.UUID, payer_id: str, root_cause: str
+    session: Session, facility_id: uuid.UUID, payer_id: str, root_cause: str
 ) -> list[FindingModel]:
-    """Every already-decided finding (outcome recorded) for this payer and
-    root cause -- domain.outcomes.calculate_confidence turns this into a
-    score for a new finding matching the same two dimensions. Payer
+    """Every already-decided finding (outcome recorded) for this facility
+    and root cause -- domain.outcomes.calculate_confidence turns this into
+    a score for a new finding matching the same two dimensions. Payer
     identity comes via contract_version -> contract, since Claim itself
     doesn't carry payer_id directly; findings with no contract_version
     (UNPRICED_CODE) can never match a payer this way and are correctly
@@ -633,7 +766,7 @@ def list_historical_outcomes(
             )
             .join(ContractModel, ContractVersionModel.contract_id == ContractModel.id)
             .where(
-                FindingModel.tenant_id == tenant_id,
+                FindingModel.facility_id == facility_id,
                 ContractModel.payer_id == payer_id,
                 FindingModel.root_cause == root_cause,
                 FindingModel.outcome.is_not(None),
@@ -645,7 +778,7 @@ def list_historical_outcomes(
 
 
 def list_findings_past_deadline_without_outcome(
-    session: Session, tenant_id: uuid.UUID, as_of: date
+    session: Session, facility_id: uuid.UUID, as_of: date
 ) -> list[FindingModel]:
     """Findings whose approved recovery packet's appeal deadline has
     passed with no outcome recorded yet. A human confirms these as
@@ -656,7 +789,7 @@ def list_findings_past_deadline_without_outcome(
             select(FindingModel)
             .join(RecoveryPacketModel, RecoveryPacketModel.finding_id == FindingModel.id)
             .where(
-                FindingModel.tenant_id == tenant_id,
+                FindingModel.facility_id == facility_id,
                 FindingModel.outcome.is_(None),
                 RecoveryPacketModel.status == "approved",
                 RecoveryPacketModel.deadline < as_of,
@@ -683,7 +816,7 @@ class FindingDetail:
 
 def list_findings(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     *,
     root_cause: str | None = None,
     date_from: date | None = None,
@@ -697,7 +830,7 @@ def list_findings(
     """Filters never include a patient identifier -- callers (the API
     layer) must not expose one as a query parameter, since query strings
     land in access logs (CLAUDE.md rule 6)."""
-    conditions = [FindingModel.tenant_id == tenant_id]
+    conditions = [FindingModel.facility_id == facility_id]
     if root_cause is not None:
         conditions.append(FindingModel.root_cause == root_cause)
     if min_shortfall is not None:
@@ -736,11 +869,11 @@ def list_findings(
 
 
 def get_finding_detail(
-    session: Session, tenant_id: uuid.UUID, finding_id: uuid.UUID
+    session: Session, facility_id: uuid.UUID, finding_id: uuid.UUID
 ) -> FindingDetail | None:
     finding = session.execute(
         select(FindingModel).where(
-            FindingModel.tenant_id == tenant_id, FindingModel.id == finding_id
+            FindingModel.facility_id == facility_id, FindingModel.id == finding_id
         )
     ).scalar_one_or_none()
     if finding is None:
@@ -769,7 +902,7 @@ def get_finding_detail(
 
 def write_audit_log(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     *,
     actor: str,
     action: str,
@@ -780,7 +913,7 @@ def write_audit_log(
     request_id: str | None = None,
 ) -> AuditLogModel:
     entry = AuditLogModel(
-        tenant_id=tenant_id,
+        facility_id=facility_id,
         actor=actor,
         action=action,
         resource_type=resource_type,
@@ -796,7 +929,7 @@ def write_audit_log(
 
 def list_audit_log(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     *,
     actor: str | None = None,
     action: str | None = None,
@@ -806,7 +939,7 @@ def list_audit_log(
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[AuditLogModel], int]:
-    conditions = [AuditLogModel.tenant_id == tenant_id]
+    conditions = [AuditLogModel.facility_id == facility_id]
     if actor is not None:
         conditions.append(AuditLogModel.actor == actor)
     if action is not None:
@@ -840,7 +973,7 @@ def list_audit_log(
 
 def create_recovery_packet(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     finding_id: uuid.UUID,
     *,
     draft_text: str,
@@ -848,7 +981,7 @@ def create_recovery_packet(
     generated_by: str,
 ) -> RecoveryPacketModel:
     packet = RecoveryPacketModel(
-        tenant_id=tenant_id,
+        facility_id=facility_id,
         finding_id=finding_id,
         status="draft",
         draft_text=draft_text,
@@ -862,7 +995,7 @@ def create_recovery_packet(
 
 def decide_recovery_packet(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     packet_id: uuid.UUID,
     *,
     approve: bool,
@@ -873,7 +1006,7 @@ def decide_recovery_packet(
     the record."""
     packet = session.execute(
         select(RecoveryPacketModel).where(
-            RecoveryPacketModel.tenant_id == tenant_id, RecoveryPacketModel.id == packet_id
+            RecoveryPacketModel.facility_id == facility_id, RecoveryPacketModel.id == packet_id
         )
     ).scalar_one()
     packet.status = "approved" if approve else "rejected"
@@ -884,13 +1017,13 @@ def decide_recovery_packet(
 
 
 def list_recovery_packets_for_finding(
-    session: Session, tenant_id: uuid.UUID, finding_id: uuid.UUID
+    session: Session, facility_id: uuid.UUID, finding_id: uuid.UUID
 ) -> list[RecoveryPacketModel]:
     return list(
         session.execute(
             select(RecoveryPacketModel)
             .where(
-                RecoveryPacketModel.tenant_id == tenant_id,
+                RecoveryPacketModel.facility_id == facility_id,
                 RecoveryPacketModel.finding_id == finding_id,
             )
             .order_by(RecoveryPacketModel.generated_at.desc())
@@ -904,23 +1037,25 @@ def list_recovery_packets_for_finding(
 
 
 def write_phi_access_log(
-    session: Session, tenant_id: uuid.UUID, *, actor: str, claim_id: uuid.UUID, purpose: str
+    session: Session, facility_id: uuid.UUID, *, actor: str, claim_id: uuid.UUID, purpose: str
 ) -> PHIAccessLogModel:
-    entry = PHIAccessLogModel(tenant_id=tenant_id, actor=actor, claim_id=claim_id, purpose=purpose)
+    entry = PHIAccessLogModel(
+        facility_id=facility_id, actor=actor, claim_id=claim_id, purpose=purpose
+    )
     session.add(entry)
     session.flush()
     return entry
 
 
 def list_audit_log_by_resource_ids(
-    session: Session, tenant_id: uuid.UUID, resource_type: str, resource_ids: Sequence[str]
+    session: Session, facility_id: uuid.UUID, resource_type: str, resource_ids: Sequence[str]
 ) -> list[AuditLogModel]:
     if not resource_ids:
         return []
     return list(
         session.execute(
             select(AuditLogModel).where(
-                AuditLogModel.tenant_id == tenant_id,
+                AuditLogModel.facility_id == facility_id,
                 AuditLogModel.resource_type == resource_type,
                 AuditLogModel.resource_id.in_(resource_ids),
             )
@@ -931,7 +1066,7 @@ def list_audit_log_by_resource_ids(
 
 
 def get_claim_access_history(
-    session: Session, tenant_id: uuid.UUID, claim_id: uuid.UUID
+    session: Session, facility_id: uuid.UUID, claim_id: uuid.UUID
 ) -> tuple[AccessEvent, ...]:
     """Auditor-facing report: "who accessed this claim's data, when, and
     why." A claim's findings and recovery packets reference it only
@@ -942,7 +1077,7 @@ def get_claim_access_history(
     finding_ids = list(
         session.execute(
             select(FindingModel.id).where(
-                FindingModel.tenant_id == tenant_id, FindingModel.claim_id == claim_id
+                FindingModel.facility_id == facility_id, FindingModel.claim_id == claim_id
             )
         )
         .scalars()
@@ -952,7 +1087,7 @@ def get_claim_access_history(
         list(
             session.execute(
                 select(RecoveryPacketModel.id).where(
-                    RecoveryPacketModel.tenant_id == tenant_id,
+                    RecoveryPacketModel.facility_id == facility_id,
                     RecoveryPacketModel.finding_id.in_(finding_ids),
                 )
             )
@@ -964,18 +1099,19 @@ def get_claim_access_history(
     )
 
     audit_rows = (
-        list_audit_log_by_resource_ids(session, tenant_id, "claim", [str(claim_id)])
+        list_audit_log_by_resource_ids(session, facility_id, "claim", [str(claim_id)])
         + list_audit_log_by_resource_ids(
-            session, tenant_id, "finding", [str(fid) for fid in finding_ids]
+            session, facility_id, "finding", [str(fid) for fid in finding_ids]
         )
         + list_audit_log_by_resource_ids(
-            session, tenant_id, "recovery_packet", [str(pid) for pid in packet_ids]
+            session, facility_id, "recovery_packet", [str(pid) for pid in packet_ids]
         )
     )
     phi_rows = list(
         session.execute(
             select(PHIAccessLogModel).where(
-                PHIAccessLogModel.tenant_id == tenant_id, PHIAccessLogModel.claim_id == claim_id
+                PHIAccessLogModel.facility_id == facility_id,
+                PHIAccessLogModel.claim_id == claim_id,
             )
         )
         .scalars()

@@ -37,7 +37,7 @@ def list_contracts(
     ctx: AuthContext = require_permission(Action.READ_CONTRACT),
     repository: Repository = Depends(get_repository),
 ) -> ContractListOut:
-    result = repository.list_contracts(ctx.tenant_id, page=page)
+    result = repository.list_contracts(ctx.user_id, ctx.org_id, page=page)
     return ContractListOut.from_domain(result)
 
 
@@ -47,7 +47,9 @@ def create_contract(
     ctx: AuthContext = require_permission(Action.MANAGE_CONTRACT),
     repository: Repository = Depends(get_repository),
 ) -> ContractSummaryOut:
-    row = repository.create_contract(ctx.tenant_id, payer_id=body.payer_id, name=body.name)
+    row = repository.create_contract(
+        ctx.user_id, ctx.org_id, payer_id=body.payer_id, name=body.name
+    )
     return ContractSummaryOut.from_domain(row)
 
 
@@ -81,5 +83,5 @@ def create_contract_version(
             implant_revenue_codes=frozenset(body.implant_carveout_rule.revenue_codes),
         ),
     )
-    version_id = repository.create_contract_version(ctx.tenant_id, contract_id, data)
+    version_id = repository.create_contract_version(ctx.user_id, ctx.org_id, contract_id, data)
     return ContractVersionOut(id=version_id)

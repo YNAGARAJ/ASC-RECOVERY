@@ -1,19 +1,22 @@
-"""Onboard a new ASC tenant: creates the tenant, its first admin user, and
-(optionally) an initial contract + fee-schedule version.
+"""Onboard a new ASC customer: creates its organization, one facility, an
+admin user, a membership binding them together, and (optionally) an
+initial contract + fee-schedule version.
 
-Deliberately a script, not an API endpoint. `security/rbac.py` is entirely
-tenant-scoped -- there is no "platform superadmin" role that could call a
-`POST /tenants` endpoint without breaking the no-cross-tenant-access
-boundary this build has maintained since Phase 3. This script uses the same
-direct-repository-call, operator-run pattern as `scripts/db/init_roles.sql`:
-it connects with the application's own `DATABASE_URL` (the `asc_app` role,
-same credentials `src/main.py` uses) and calls straight into
-`db.repository`, bypassing HTTP entirely.
+Deliberately a script, not an API endpoint. There is no "platform
+superadmin" HTTP route that could call a `POST /organizations` endpoint
+without breaking the resolved-access boundary this build has maintained
+since Phase 4 -- everything the API layer does starts from an already-
+authenticated `AuthContext`, which by definition doesn't exist yet for a
+brand-new customer. This script uses the same direct-repository-call,
+operator-run pattern as `scripts/db/init_roles.sql`: it connects with the
+application's own `DATABASE_URL` (the `asc_app` role, same credentials
+`src/main.py` uses) and calls straight into `db.repository`, bypassing
+HTTP entirely.
 
 Anything beyond the initial contract version (additional payers, later fee
-schedule updates) goes through the existing `POST /contracts` and
-`POST /contracts/{id}/versions` API once the tenant's first admin user can
-authenticate -- this script's job ends at making that first login possible.
+schedule updates, additional facilities/memberships) goes through the
+existing API once the customer's first admin user can authenticate --
+this script's job ends at making that first login possible.
 
 Usage:
     DATABASE_URL=postgresql+psycopg://asc_app:...@host/db \\
@@ -33,8 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from db import repository as db_repository
+from db.access import access_session
 from db.base import make_engine, make_session_factory
-from db.tenancy import tenant_session
 from domain.contract import (
     AssistantSurgeonRule,
     BilateralConvention,
@@ -100,27 +103,52 @@ def _build_contract_version(payer_id: str, contract_cfg: dict[str, Any]) -> Cont
     )
 
 
+_VALID_ORG_TYPES = frozenset({"PLATFORM", "BILLING_COMPANY", "ASC_GROUP", "ASC"})
+_VALID_SCOPES = frozenset({"ALL_FACILITIES", "SPECIFIC_FACILITIES"})
+
+
 def onboard(database_url: str, config: dict[str, Any]) -> None:
-    tenant_name = _require_key(config, "tenant_name")
+    org_name = _require_key(config, "org_name")
+    org_type = config.get("org_type", "ASC")
+    if org_type not in _VALID_ORG_TYPES:
+        raise ConfigError(f"org_type must be one of {sorted(_VALID_ORG_TYPES)}, got {org_type!r}")
+    facility_name = config.get("facility_name", org_name)
     admin_subject = _require_key(config, "admin_subject")
-    admin_role = config.get("admin_role", Role.ADMIN.value)
+    admin_role = config.get("admin_role", Role.ORG_ADMIN.value)
     valid_roles = {role.value for role in Role}
     if admin_role not in valid_roles:
         raise ConfigError(f"admin_role must be one of {sorted(valid_roles)}, got {admin_role!r}")
+    membership_scope = config.get("membership_scope", "ALL_FACILITIES")
+    if membership_scope not in _VALID_SCOPES:
+        raise ConfigError(
+            f"membership_scope must be one of {sorted(_VALID_SCOPES)}, got {membership_scope!r}"
+        )
 
     session_factory = make_session_factory(make_engine(database_url))
 
-    # Tenant/User creation is deliberately outside tenant_session -- these
-    # two tables are ungated (db.models.User's docstring), and there is no
-    # tenant_id yet to scope to until create_tenant returns one.
+    # Deliberately a single plain session, not access_session -- every
+    # table touched here (organizations, facilities, users, memberships)
+    # is RLS-protected against *resolved* access, and there is no
+    # membership yet for anyone to resolve until this transaction commits
+    # (the same bootstrap problem db.models.User's docstring describes,
+    # now spanning more tables). This script must run with asc_owner-
+    # level credentials (BYPASSRLS -- see
+    # alembic/versions/0001_initial_schema.py's own docstring for why
+    # asc_owner needs that attribute), never asc_app's constrained
+    # runtime role, exactly like running migrations does.
     with session_factory() as session, session.begin():
-        tenant = db_repository.create_tenant(session, tenant_name)
-        user = db_repository.create_user(
-            session, tenant.id, subject=admin_subject, role=admin_role
+        org = db_repository.create_organization(
+            session, parent_org_id=None, type=org_type, name=org_name
+        )
+        facility = db_repository.create_facility(session, org.id, name=facility_name)
+        user = db_repository.create_user(session, subject=admin_subject)
+        membership = db_repository.create_membership(
+            session, user.id, org.id, role=admin_role, scope=membership_scope
         )
     print(
-        f"Created tenant {tenant.id} ({tenant_name!r}) with admin user {user.id} "
-        f"(subject={admin_subject!r}, role={admin_role!r})"
+        f"Created organization {org.id} ({org_name!r}, type={org_type!r}) with facility "
+        f"{facility.id} ({facility_name!r}), admin user {user.id} (subject={admin_subject!r}), "
+        f"and membership {membership.id} (role={admin_role!r}, scope={membership_scope!r})"
     )
 
     contract_cfg = config.get("contract")
@@ -130,10 +158,10 @@ def onboard(database_url: str, config: dict[str, Any]) -> None:
     payer_id = _require_key(contract_cfg, "payer_id")
     contract_name = _require_key(contract_cfg, "name")
     version = _build_contract_version(payer_id, contract_cfg)
-    with tenant_session(session_factory, tenant.id) as session:
-        contract = db_repository.create_contract(session, tenant.id, payer_id, contract_name)
+    with access_session(session_factory, user.id) as session:
+        contract = db_repository.create_contract(session, org.id, payer_id, contract_name)
         contract_version = db_repository.create_contract_version(
-            session, tenant.id, contract.id, version
+            session, org.id, contract.id, version
         )
     print(
         f"Created contract {contract.id} ({contract_name!r}, payer {payer_id!r}) "

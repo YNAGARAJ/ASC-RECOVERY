@@ -1,4 +1,4 @@
-"""Poll one tenant's configured SFTP or S3 remittance source once,
+"""Poll one facility's configured SFTP or S3 remittance source once,
 ingesting whatever's new (F-18, docs/audit/REGISTER.md).
 `SFTPPollSource`/`S3PollSource` (`ingestion/sources.py`) were fully built
 and tested since Phase 5 but constructed by nothing anywhere in the
@@ -27,16 +27,23 @@ account -- no live SFTP/S3 credentials exist in this build environment,
 same ceiling every other real-cloud-integration adapter in this codebase
 has had since Phase 9 (real KMS adapters, the real LLM provider).
 
+USER_ID must be a user who holds a membership resolving access to
+FACILITY_ID (Phase 4, `docs/MASTER-BUILD-PROMPT-V2.md`) -- typically a
+service-account user provisioned specifically for this poller, once
+Phase 5's API-key/`api_service` role machinery exists; until then, any
+user with a qualifying membership works, same as any other caller of
+`db.access.access_session`.
+
 Usage (SFTP):
     pip install -e ".[poller]"
-    TENANT_ID=<uuid> SOURCE_KIND=sftp \\
+    USER_ID=<uuid> FACILITY_ID=<uuid> SOURCE_KIND=sftp \\
     SFTP_HOST=... SFTP_PORT=22 SFTP_USERNAME=... SFTP_PASSWORD=... \\
     SFTP_DIR=/incoming DATABASE_URL=... PHI_ENCRYPTION_KEY=... \\
         python scripts/ingestion/poll_remittances.py
 
 Usage (S3):
     pip install -e ".[poller]"
-    TENANT_ID=<uuid> SOURCE_KIND=s3 \\
+    USER_ID=<uuid> FACILITY_ID=<uuid> SOURCE_KIND=s3 \\
     S3_BUCKET=... S3_PREFIX=remittances/ AWS_REGION=us-east-1 \\
     DATABASE_URL=... PHI_ENCRYPTION_KEY=... \\
         python scripts/ingestion/poll_remittances.py
@@ -49,8 +56,8 @@ import sys
 import uuid
 from typing import Any
 
+from db.access import access_session
 from db.base import make_engine, make_session_factory
-from db.tenancy import tenant_session
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.poller import PolledOutcome, poll_and_ingest
@@ -153,7 +160,8 @@ def _report(results: tuple[PolledOutcome, ...]) -> None:
 
 def main() -> int:
     secrets = EnvSecretStore()
-    tenant_id = uuid.UUID(_require(secrets, "TENANT_ID"))
+    user_id = uuid.UUID(_require(secrets, "USER_ID"))
+    facility_id = uuid.UUID(_require(secrets, "FACILITY_ID"))
     source_kind = _require(secrets, "SOURCE_KIND")
     database_url = _require(secrets, "DATABASE_URL")
     _require(secrets, "PHI_ENCRYPTION_KEY")  # validated eagerly by EnvKMS below
@@ -172,10 +180,10 @@ def main() -> int:
     scanner = EicarAwareScanner()
 
     def ingest_one(file: IncomingFile) -> IngestionOutcome | DuplicateOutcome:
-        with tenant_session(session_factory, tenant_id) as session:
+        with access_session(session_factory, user_id) as session:
             return ingest_file(
                 session,
-                tenant_id,
+                facility_id,
                 content=file.content,
                 source=file.source,
                 uploaded_by=f"{source_kind}-poller",

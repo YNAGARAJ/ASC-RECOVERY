@@ -33,7 +33,7 @@ def enforce_rate_limit(
     request: Request, ctx: AuthContext = Depends(get_auth_context)
 ) -> AuthContext:
     limiter: RateLimiter = request.app.state.rate_limiter
-    key = f"{ctx.tenant_id}:{ctx.user_id}"
+    key = f"{ctx.org_id}:{ctx.user_id}"
     if not limiter.allow(key):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="rate limit exceeded"

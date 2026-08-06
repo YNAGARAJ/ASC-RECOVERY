@@ -41,7 +41,6 @@ from observability.notifications import NotificationPort
 from security.mfa import verify_code
 from security.passwords import hash_password, verify_password
 from security.rate_limit import AccountLockoutTracker
-from security.rbac import Role
 from security.session import issue_session
 
 router = APIRouter()
@@ -112,9 +111,24 @@ def login(
     # `credentials` is narrowed non-None from here on.
     if credentials.mfa_secret is None or not verify_code(credentials.mfa_secret, body.totp_code):
         raise _fail(request, lockout, body.subject)
+    if credentials.default_org_id is None:
+        # Correct password and MFA, but zero memberships -- provisioned
+        # as a user row (e.g. by an admin) but never onboarded onto any
+        # organization. Nothing to issue a session scoped to. Not a
+        # credentials problem, so this deliberately does not go through
+        # `_fail` (no lockout-count/anomaly-alert bookkeeping for a state
+        # that isn't a guessing attempt) but still never discloses more
+        # than "can't log in right now."
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="account has no organization membership",
+        )
 
     lockout.record_success(body.subject)
     tokens = issue_session(
-        _secret_key(request), credentials.subject, Role(credentials.role), mfa_verified=True
+        _secret_key(request),
+        credentials.subject,
+        str(credentials.default_org_id),
+        mfa_verified=True,
     )
     return LoginOut(access_token=tokens.access_token, refresh_token=tokens.refresh_token)
