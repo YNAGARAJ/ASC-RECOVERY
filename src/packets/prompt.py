@@ -1,14 +1,24 @@
 """Builds the prompt sent to the LLM, structurally excluding PHI.
 
-Patient name and member id never enter `BuiltPrompt.text` -- they live
-only in the `placeholders` map, used for post-generation substitution
-(`render_final_text`), the same mechanism the money figures use (see
-`packets.currency`/`packets.service`). Everything else on `PromptInput`
-(procedure code, dates, dollar amounts, root cause, evidence, payer claim
-control number) is not PHI and is included as real values, so the LLM
-has enough context to write coherent prose -- CLAUDE.md rule 1 and the
-Phase 7 prompt's "minimum necessary" requirement are specifically about
-names/member IDs, not about amounts or codes.
+Patient name, member id, payer claim control number, and date of service
+never enter `BuiltPrompt.text` as real values -- like the dollar figures
+(expected/actual allowed, shortfall), they live only in the
+`placeholders` map, used for post-generation substitution
+(`render_final_text`). Only procedure code, root cause, and evidence
+text are ever real values in the prompt text itself.
+
+F-13 (docs/audit/REGISTER.md): an earlier version of this module
+embedded the claim control number and date of service as literal text
+and called them "not PHI" in this docstring -- wrong. A claim/account
+number is a HIPAA Safe Harbor identifier (#16 account numbers / #18 any
+other unique identifying number); a date directly tied to an
+individual's care, including date of service, is explicitly identifier
+#3. Both are placeholder-only now, same as patient name/member id
+always were -- and the real `AnthropicPacketDrafter` (main.py) must not
+be enabled against a live tenant before a BAA exists with the LLM
+vendor, a compliance precondition this module's data minimization
+doesn't substitute for (see docs/compliance/README.md's own checklist;
+that gate is process, not something code can enforce).
 """
 
 from __future__ import annotations
@@ -23,6 +33,8 @@ from packets.templates import PacketTemplate
 # markers substituted by render_final_text(), not secrets or credentials.
 PATIENT_TOKEN = "{{PATIENT_REF}}"  # nosec B105
 MEMBER_ID_TOKEN = "{{MEMBER_ID}}"  # nosec B105
+CLAIM_REFERENCE_TOKEN = "{{CLAIM_REFERENCE}}"  # nosec B105
+DATE_OF_SERVICE_TOKEN = "{{DATE_OF_SERVICE}}"  # nosec B105
 EXPECTED_ALLOWED_TOKEN = "{{EXPECTED_ALLOWED}}"  # nosec B105
 ACTUAL_ALLOWED_TOKEN = "{{ACTUAL_ALLOWED}}"  # nosec B105
 SHORTFALL_TOKEN = "{{SHORTFALL}}"  # nosec B105
@@ -52,6 +64,8 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
     placeholders = {
         PATIENT_TOKEN: data.patient_name or "the patient",
         MEMBER_ID_TOKEN: data.patient_member_id or "",
+        CLAIM_REFERENCE_TOKEN: data.payer_claim_control_number,
+        DATE_OF_SERVICE_TOKEN: data.date_of_service.isoformat(),
         EXPECTED_ALLOWED_TOKEN: data.expected_allowed,
         ACTUAL_ALLOWED_TOKEN: data.actual_allowed,
         SHORTFALL_TOKEN: data.shortfall,
@@ -60,9 +74,9 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
         f"Draft the body of a professional insurance appeal letter, in the "
         f"style of a letter opening with {template.salutation!r} and closing "
         f"with {template.closing!r}.\n\n"
-        f"Claim reference: {data.payer_claim_control_number}\n"
+        f"Claim reference: {CLAIM_REFERENCE_TOKEN}\n"
         f"Procedure code: {data.procedure_code}\n"
-        f"Date of service: {data.date_of_service.isoformat()}\n"
+        f"Date of service: {DATE_OF_SERVICE_TOKEN}\n"
         f"Reason for underpayment: {data.root_cause}\n"
         f"Supporting evidence: {data.evidence}\n\n"
         "IMPORTANT -- do not write any dollar amount as digits, and do not "
@@ -70,10 +84,13 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
         f"placeholder tokens wherever a dollar figure belongs: "
         f"{EXPECTED_ALLOWED_TOKEN} for the contracted allowed amount, "
         f"{ACTUAL_ALLOWED_TOKEN} for the amount actually paid, and "
-        f"{SHORTFALL_TOKEN} for the shortfall. Refer to the patient only as "
-        f"{PATIENT_TOKEN} and, if a member id is needed, only as "
-        f"{MEMBER_ID_TOKEN} -- never write or invent a patient name or "
-        "member id yourself."
+        f"{SHORTFALL_TOKEN} for the shortfall. Also use "
+        f"{CLAIM_REFERENCE_TOKEN} and {DATE_OF_SERVICE_TOKEN} exactly as "
+        "shown above wherever the claim reference or date of service "
+        "belongs -- never invent or restate either yourself. Refer to the "
+        f"patient only as {PATIENT_TOKEN} and, if a member id is needed, "
+        f"only as {MEMBER_ID_TOKEN} -- never write or invent a patient "
+        "name or member id yourself."
     )
     return BuiltPrompt(text=text, placeholders=placeholders)
 

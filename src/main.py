@@ -103,6 +103,12 @@ def create_app_from_env() -> FastAPI:
     )
 
     session_factory = make_session_factory(make_engine(database_url))
+    # F-13 (docs/audit/REGISTER.md): packets.prompt now keeps every claim
+    # identifier (name, member id, claim control number, date of service)
+    # out of the literal prompt text sent here -- but that's data
+    # minimization, not a substitute for an actual BAA with the LLM
+    # vendor. Do not point ANTHROPIC_API_KEY at a real account for a real
+    # tenant until one exists (docs/compliance/README.md's checklist).
     drafter = AnthropicPacketDrafter(anthropic_api_key, instruments=instruments)
     # EnvKMS is a stopgap KEK store (see security/kms_env.py's docstring) --
     # a real cloud KMS adapter behind the same KeyManagementService port is

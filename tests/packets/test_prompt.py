@@ -12,6 +12,8 @@ import pytest
 
 from packets.prompt import (
     ACTUAL_ALLOWED_TOKEN,
+    CLAIM_REFERENCE_TOKEN,
+    DATE_OF_SERVICE_TOKEN,
     EXPECTED_ALLOWED_TOKEN,
     MEMBER_ID_TOKEN,
     PATIENT_TOKEN,
@@ -28,12 +30,15 @@ _CASES = [
     ("O'BRIEN-SALUTATION", "MBR-CLOSING-000"),  # deliberately echoes template words
 ]
 
+_CLAIM_REFERENCE = "PAYERCTRL0001"
+_DATE_OF_SERVICE = date(2023, 1, 10)
+
 
 def _make_input(patient_name: str | None, patient_member_id: str | None) -> PromptInput:
     return PromptInput(
-        payer_claim_control_number="PAYERCTRL0001",
+        payer_claim_control_number=_CLAIM_REFERENCE,
         procedure_code="99213",
-        date_of_service=date(2023, 1, 10),
+        date_of_service=_DATE_OF_SERVICE,
         expected_allowed="100.00",
         actual_allowed="50.00",
         shortfall="50.00",
@@ -58,11 +63,26 @@ def test_prompt_text_never_contains_the_patient_name_or_member_id(
     assert MEMBER_ID_TOKEN in built.text
 
 
+def test_prompt_text_never_contains_the_claim_reference_or_date_of_service() -> None:
+    """F-13 (docs/audit/REGISTER.md): both are HIPAA Safe Harbor
+    identifiers (claim/account number #16/#18, date of service #3) --
+    an earlier version of this module sent them to the LLM as literal
+    text and its own docstring wrongly called them "not PHI"."""
+    built = build_prompt(_make_input("JANE DOE", "MBR-1"), DEFAULT_TEMPLATE)
+
+    assert _CLAIM_REFERENCE not in built.text
+    assert _DATE_OF_SERVICE.isoformat() not in built.text
+    assert CLAIM_REFERENCE_TOKEN in built.text
+    assert DATE_OF_SERVICE_TOKEN in built.text
+
+
 def test_prompt_placeholders_map_carries_the_real_values_for_later_substitution() -> None:
     built = build_prompt(_make_input("JANE DOE", "MBR-1"), DEFAULT_TEMPLATE)
 
     assert built.placeholders[PATIENT_TOKEN] == "JANE DOE"
     assert built.placeholders[MEMBER_ID_TOKEN] == "MBR-1"
+    assert built.placeholders[CLAIM_REFERENCE_TOKEN] == _CLAIM_REFERENCE
+    assert built.placeholders[DATE_OF_SERVICE_TOKEN] == _DATE_OF_SERVICE.isoformat()
     assert built.placeholders[EXPECTED_ALLOWED_TOKEN] == "100.00"
     assert built.placeholders[ACTUAL_ALLOWED_TOKEN] == "50.00"
     assert built.placeholders[SHORTFALL_TOKEN] == "50.00"
