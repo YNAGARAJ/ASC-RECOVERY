@@ -14,9 +14,31 @@ def test_extracts_dollar_prefixed_and_bare_decimal_figures() -> None:
     assert figures == [Decimal("1234.56"), Decimal("100.00")]
 
 
-def test_does_not_mistake_a_procedure_code_or_year_for_currency() -> None:
+def test_bare_integers_are_detected_as_currency_by_default() -> None:
+    """F-14 (docs/audit/REGISTER.md): a bare integer with no `$` and no
+    decimal point previously matched neither regex alternative -- a
+    hallucinated whole-dollar figure written that way sailed through
+    both the raw-draft and post-substitution gates undetected. Detecting
+    it by default (rather than only in an ad hoc "monetary context")
+    means a caller must now explicitly `exclude` any bare digit string
+    it knows for certain is legitimately non-monetary -- see
+    test_exclude_suppresses_a_known_non_monetary_number below."""
     text = "Procedure 99213 was billed on 2023-01-10, claim ref PAYERCTRL0001."
-    assert extract_currency_figures(text) == []
+    figures = extract_currency_figures(text)
+    assert Decimal("99213") in figures
+    assert Decimal("2023") in figures
+
+
+def test_exclude_suppresses_a_known_non_monetary_number() -> None:
+    text = "Procedure 99213 was billed for the claim."
+    figures = extract_currency_figures(text, exclude=frozenset({"99213"}))
+    assert figures == []
+
+
+def test_a_hallucinated_bare_integer_is_still_caught_alongside_an_excluded_procedure_code() -> None:
+    text = "Procedure 99213 was underpaid by roughly 50."
+    figures = extract_currency_figures(text, exclude=frozenset({"99213"}))
+    assert figures == [Decimal("50")]
 
 
 def test_dollar_amount_without_cents_normalizes_by_value() -> None:

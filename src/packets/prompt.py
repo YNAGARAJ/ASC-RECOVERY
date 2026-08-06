@@ -19,6 +19,18 @@ be enabled against a live tenant before a BAA exists with the LLM
 vendor, a compliance precondition this module's data minimization
 doesn't substitute for (see docs/compliance/README.md's own checklist;
 that gate is process, not something code can enforce).
+
+F-15 (docs/audit/REGISTER.md): pure set-membership validation of the
+three dollar tokens after substitution can't tell "the model put the
+right figure in the right place" from "the model put a real figure in
+the wrong place" (e.g. `ACTUAL_ALLOWED_TOKEN` where
+`EXPECTED_ALLOWED_TOKEN` belongs) -- both substitute to a value that's a
+member of the allowed set. `required_figure_lines()` fixes the
+label-to-token mapping deterministically: the model must reproduce three
+exact `"Label: {{TOKEN}}"` strings verbatim, checked by
+`packets.service.generate_packet_draft` before substitution. A swapped
+token fails that exact-string check even though the swapped value would
+still pass plain set membership.
 """
 
 from __future__ import annotations
@@ -38,6 +50,26 @@ DATE_OF_SERVICE_TOKEN = "{{DATE_OF_SERVICE}}"  # nosec B105
 EXPECTED_ALLOWED_TOKEN = "{{EXPECTED_ALLOWED}}"  # nosec B105
 ACTUAL_ALLOWED_TOKEN = "{{ACTUAL_ALLOWED}}"  # nosec B105
 SHORTFALL_TOKEN = "{{SHORTFALL}}"  # nosec B105
+
+# F-15 (docs/audit/REGISTER.md): the exact label each dollar token must
+# appear immediately after -- see required_figure_lines().
+EXPECTED_ALLOWED_LABEL = "Expected allowed amount"
+ACTUAL_ALLOWED_LABEL = "Actual amount paid"
+SHORTFALL_LABEL = "Shortfall"
+
+
+def required_figure_lines() -> tuple[str, str, str]:
+    """The three exact `"Label: {{TOKEN}}"` substrings a draft must
+    contain verbatim -- one per dollar figure, in a label-to-token
+    pairing the model cannot swap without failing
+    `packets.service.generate_packet_draft`'s validation. Single source
+    of truth for both the prompt instructions (`build_prompt`) and the
+    post-generation check, so the two can never drift apart."""
+    return (
+        f"{EXPECTED_ALLOWED_LABEL}: {EXPECTED_ALLOWED_TOKEN}",
+        f"{ACTUAL_ALLOWED_LABEL}: {ACTUAL_ALLOWED_TOKEN}",
+        f"{SHORTFALL_LABEL}: {SHORTFALL_TOKEN}",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,17 +112,18 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
         f"Reason for underpayment: {data.root_cause}\n"
         f"Supporting evidence: {data.evidence}\n\n"
         "IMPORTANT -- do not write any dollar amount as digits, and do not "
-        "compute, adjust, or restate any figure yourself. Use exactly these "
-        f"placeholder tokens wherever a dollar figure belongs: "
-        f"{EXPECTED_ALLOWED_TOKEN} for the contracted allowed amount, "
-        f"{ACTUAL_ALLOWED_TOKEN} for the amount actually paid, and "
-        f"{SHORTFALL_TOKEN} for the shortfall. Also use "
-        f"{CLAIM_REFERENCE_TOKEN} and {DATE_OF_SERVICE_TOKEN} exactly as "
-        "shown above wherever the claim reference or date of service "
-        "belongs -- never invent or restate either yourself. Refer to the "
-        f"patient only as {PATIENT_TOKEN} and, if a member id is needed, "
-        f"only as {MEMBER_ID_TOKEN} -- never write or invent a patient "
-        "name or member id yourself."
+        "compute, adjust, or restate any figure yourself. Include these "
+        "three exact lines verbatim, each on its own line, in this exact "
+        "form and this exact label-to-value pairing -- never swap which "
+        "token follows which label:\n"
+        + "\n".join(required_figure_lines())
+        + "\n\n"
+        f"Also use {CLAIM_REFERENCE_TOKEN} and {DATE_OF_SERVICE_TOKEN} "
+        "exactly as shown above wherever the claim reference or date of "
+        "service belongs -- never invent or restate either yourself. "
+        f"Refer to the patient only as {PATIENT_TOKEN} and, if a member "
+        f"id is needed, only as {MEMBER_ID_TOKEN} -- never write or "
+        "invent a patient name or member id yourself."
     )
     return BuiltPrompt(text=text, placeholders=placeholders)
 

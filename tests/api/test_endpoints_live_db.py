@@ -28,12 +28,7 @@ from db.tenancy import tenant_session
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from packets.drafter import ScriptedPacketDrafter
-from packets.prompt import (
-    ACTUAL_ALLOWED_TOKEN,
-    EXPECTED_ALLOWED_TOKEN,
-    PATIENT_TOKEN,
-    SHORTFALL_TOKEN,
-)
+from packets.prompt import PATIENT_TOKEN, required_figure_lines
 from security.rbac import Role
 from security.session import issue_session
 from tests.domain.fixtures_x835 import minimal_valid_835
@@ -168,9 +163,9 @@ def test_finding_detail_cross_tenant_lookup_is_404_against_real_rls(
 
 
 _VALID_SCRIPTED_DRAFT = (
-    f"Dear Sir/Madam, {PATIENT_TOKEN} was underpaid on this claim. Expected "
-    f"{EXPECTED_ALLOWED_TOKEN}, paid {ACTUAL_ALLOWED_TOKEN}, shortfall "
-    f"{SHORTFALL_TOKEN}. Sincerely,"
+    f"Dear Sir/Madam, {PATIENT_TOKEN} was underpaid on this claim.\n"
+    + "\n".join(required_figure_lines())
+    + "\nSincerely,"
 )
 
 

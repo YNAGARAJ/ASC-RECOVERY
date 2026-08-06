@@ -21,6 +21,7 @@ from packets.prompt import (
     PromptInput,
     build_prompt,
     render_final_text,
+    required_figure_lines,
 )
 from packets.templates import DEFAULT_TEMPLATE
 
@@ -74,6 +75,23 @@ def test_prompt_text_never_contains_the_claim_reference_or_date_of_service() -> 
     assert _DATE_OF_SERVICE.isoformat() not in built.text
     assert CLAIM_REFERENCE_TOKEN in built.text
     assert DATE_OF_SERVICE_TOKEN in built.text
+
+
+def test_prompt_text_requires_the_three_labeled_figure_lines_verbatim() -> None:
+    """F-15 (docs/audit/REGISTER.md): the model must reproduce these
+    exact label-to-token pairings verbatim -- what
+    packets.service.generate_packet_draft checks for after generation."""
+    built = build_prompt(_make_input("JANE DOE", "MBR-1"), DEFAULT_TEMPLATE)
+
+    for line in required_figure_lines():
+        assert line in built.text
+
+
+def test_required_figure_lines_pair_each_token_with_its_own_label() -> None:
+    expected_line, actual_line, shortfall_line = required_figure_lines()
+    assert expected_line == f"Expected allowed amount: {EXPECTED_ALLOWED_TOKEN}"
+    assert actual_line == f"Actual amount paid: {ACTUAL_ALLOWED_TOKEN}"
+    assert shortfall_line == f"Shortfall: {SHORTFALL_TOKEN}"
 
 
 def test_prompt_placeholders_map_carries_the_real_values_for_later_substitution() -> None:

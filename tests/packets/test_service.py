@@ -12,18 +12,28 @@ from packets.prompt import (
     ACTUAL_ALLOWED_TOKEN,
     EXPECTED_ALLOWED_TOKEN,
     PATIENT_TOKEN,
-    SHORTFALL_TOKEN,
     PromptInput,
+    required_figure_lines,
 )
 from packets.service import generate_packet_draft
 from packets.templates import DEFAULT_TEMPLATE
 
+_EXPECTED_LINE, _ACTUAL_LINE, _SHORTFALL_LINE = required_figure_lines()
+
 _GOOD_DRAFT = (
-    f"Dear Sir/Madam, {PATIENT_TOKEN} was underpaid on this claim. The contracted "
-    f"allowed amount was {EXPECTED_ALLOWED_TOKEN}, but only {ACTUAL_ALLOWED_TOKEN} "
-    f"was paid, a shortfall of {SHORTFALL_TOKEN}. Sincerely,"
+    f"Dear Sir/Madam, {PATIENT_TOKEN} was underpaid on this claim.\n"
+    f"{_EXPECTED_LINE}\n{_ACTUAL_LINE}\n{_SHORTFALL_LINE}\nSincerely,"
 )
 _RAW_FIGURE_DRAFT = "Dear Sir/Madam, the patient was underpaid $999.99. Sincerely,"
+_SWAPPED_LABEL_DRAFT = (
+    f"Dear Sir/Madam, {PATIENT_TOKEN} was underpaid on this claim.\n"
+    # Expected/actual swapped -- the real bug F-15 catches: both tokens
+    # are individually valid and both substitute to allowed amounts, but
+    # each is now paired with the wrong label.
+    f"Expected allowed amount: {ACTUAL_ALLOWED_TOKEN}\n"
+    f"Actual amount paid: {EXPECTED_ALLOWED_TOKEN}\n"
+    f"{_SHORTFALL_LINE}\nSincerely,"
+)
 
 
 def _make_input() -> PromptInput:
@@ -87,3 +97,51 @@ def test_the_llm_never_sees_the_patient_name_even_though_the_final_letter_does()
 
     assert "JANE DOE" not in drafter.prompts_received[0]
     assert "MBR-1" not in drafter.prompts_received[0]
+
+
+def test_swapped_figure_labels_are_rejected() -> None:
+    """F-15 (docs/audit/REGISTER.md): a real, allowed figure placed
+    against the wrong label -- both individual tokens are valid and both
+    substitute to values in the allowed set, so plain set-membership
+    validation alone would have accepted this. Only checking the exact
+    label-to-token pairing catches it."""
+    drafter = ScriptedPacketDrafter([_SWAPPED_LABEL_DRAFT, _GOOD_DRAFT])
+
+    result = generate_packet_draft(_make_input(), DEFAULT_TEMPLATE, drafter)
+
+    assert result.success is True
+    assert result.attempts == 2
+    assert len(result.rejections) == 1
+    assert "missing or mislabeled" in result.rejections[0].reason
+
+
+def test_bare_integer_hallucination_is_rejected() -> None:
+    """F-14 (docs/audit/REGISTER.md): a hallucinated whole-dollar figure
+    with no $ and no decimal point previously matched neither regex
+    alternative and sailed through undetected."""
+    draft_with_bare_integer = "Dear Sir/Madam, the patient was underpaid by about 50. Sincerely,"
+    drafter = ScriptedPacketDrafter([draft_with_bare_integer, _GOOD_DRAFT])
+
+    result = generate_packet_draft(_make_input(), DEFAULT_TEMPLATE, drafter)
+
+    assert result.success is True
+    assert result.attempts == 2
+    assert len(result.rejections) == 1
+    assert "50" in result.rejections[0].reason
+
+
+def test_the_procedure_code_alone_is_never_flagged_as_a_hallucinated_figure() -> None:
+    """The bare-integer detection F-14 added must not flag the one bare
+    digit string this system knows for certain will legitimately appear
+    -- the procedure code itself."""
+    draft_mentioning_only_the_procedure_code = (
+        f"Dear Sir/Madam, regarding procedure 99213.\n"
+        f"{_EXPECTED_LINE}\n{_ACTUAL_LINE}\n{_SHORTFALL_LINE}\nSincerely,"
+    )
+    drafter = ScriptedPacketDrafter([draft_mentioning_only_the_procedure_code])
+
+    result = generate_packet_draft(_make_input(), DEFAULT_TEMPLATE, drafter)
+
+    assert result.success is True
+    assert result.attempts == 1
+    assert result.rejections == ()
