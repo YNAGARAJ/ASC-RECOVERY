@@ -14,11 +14,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from api.auth import AuthContext, get_repository, require_permission
+from api.rate_limit import enforce_rate_limit
 from api.repository import PacketGenerationFailed, Repository
 from api.schemas import PacketGenerationFailedOut, PacketListOut, RecoveryPacketOut
 from security.rbac import Action
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
 
 
 @router.post(

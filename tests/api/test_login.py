@@ -142,6 +142,87 @@ def test_login_never_calls_issue_session_when_password_is_wrong(
     assert response.status_code == 401
 
 
+# --- F-06: account lockout (security.rate_limit.AccountLockoutTracker) ------
+
+
+def test_login_locks_out_after_repeated_failures(
+    client: TestClient, repo: FakeRepository, mfa_secret: str
+) -> None:
+    _seed_full_credentials(repo, mfa_secret)
+    wrong = {"subject": _SUBJECT, "password": "wrong", "totp_code": _totp_code(mfa_secret)}
+    for _ in range(5):  # AccountLockoutTracker's default max_failures
+        assert client.post("/auth/login", json=wrong).status_code == 401
+
+    # The account is now locked out -- even the *correct* password+TOTP
+    # code is rejected, not just another wrong one.
+    correct = {"subject": _SUBJECT, "password": _PASSWORD, "totp_code": _totp_code(mfa_secret)}
+    response = client.post("/auth/login", json=correct)
+    assert response.status_code == 401
+
+
+def test_locked_out_account_never_reaches_issue_session(
+    client: TestClient, repo: FakeRepository, mfa_secret: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_full_credentials(repo, mfa_secret)
+    wrong = {"subject": _SUBJECT, "password": "wrong", "totp_code": _totp_code(mfa_secret)}
+    for _ in range(5):
+        client.post("/auth/login", json=wrong)
+
+    import api.routes.auth as auth_module
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("issue_session must not be called for a locked-out account")
+
+    monkeypatch.setattr(auth_module, "issue_session", _fail_if_called)
+
+    correct = {"subject": _SUBJECT, "password": _PASSWORD, "totp_code": _totp_code(mfa_secret)}
+    response = client.post("/auth/login", json=correct)
+    assert response.status_code == 401
+
+
+def test_login_success_resets_the_failure_count(
+    client: TestClient, repo: FakeRepository, mfa_secret: str
+) -> None:
+    _seed_full_credentials(repo, mfa_secret)
+    wrong = {"subject": _SUBJECT, "password": "wrong", "totp_code": _totp_code(mfa_secret)}
+    correct = {"subject": _SUBJECT, "password": _PASSWORD, "totp_code": _totp_code(mfa_secret)}
+
+    for _ in range(4):  # below the default 5-failure threshold
+        assert client.post("/auth/login", json=wrong).status_code == 401
+    assert client.post("/auth/login", json=correct).status_code == 200
+
+    # A successful login resets the count -- four more failures alone
+    # must not trip the lockout a second time.
+    for _ in range(4):
+        assert client.post("/auth/login", json=wrong).status_code == 401
+    assert client.post("/auth/login", json=correct).status_code == 200
+
+
+def test_lockout_is_scoped_to_the_subject(
+    client: TestClient, repo: FakeRepository, mfa_secret: str
+) -> None:
+    other_subject = "other-biller@example.com"
+    other_mfa_secret = generate_enrollment_secret()
+    _seed_full_credentials(repo, mfa_secret)
+    repo.seed_login_credentials(
+        other_subject, role=Role.BILLER.value, password=_PASSWORD, mfa_secret=other_mfa_secret
+    )
+
+    wrong = {"subject": _SUBJECT, "password": "wrong", "totp_code": _totp_code(mfa_secret)}
+    for _ in range(5):
+        client.post("/auth/login", json=wrong)
+
+    response = client.post(
+        "/auth/login",
+        json={
+            "subject": other_subject,
+            "password": _PASSWORD,
+            "totp_code": _totp_code(other_mfa_secret),
+        },
+    )
+    assert response.status_code == 200
+
+
 def test_login_validation_error_never_echoes_the_submitted_password(client: TestClient) -> None:
     secret_password = "super-secret-marker-value-should-not-leak"
     response = client.post(

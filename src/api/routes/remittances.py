@@ -5,13 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, UploadFile
 
 from api.auth import AuthContext, get_repository, require_permission
+from api.rate_limit import enforce_rate_limit
 from api.repository import Repository
 from api.schemas import IngestionOutcomeOut
 from ingestion.pipeline import DuplicateOutcome
 from ingestion.virus_scan import EicarAwareScanner
 from security.rbac import Action
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
 
 _scanner = EicarAwareScanner()
 

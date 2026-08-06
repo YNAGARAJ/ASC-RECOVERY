@@ -10,11 +10,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 
 from api.auth import AuthContext, get_repository, require_permission
+from api.rate_limit import enforce_rate_limit
 from api.repository import AuditLogFilters, Page, Repository
 from api.schemas import AccessHistoryOut, AuditLogListOut
 from security.rbac import Action
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
 
 
 def _filters(

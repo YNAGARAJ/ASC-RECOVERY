@@ -18,12 +18,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from api.auth import AuthContext, get_repository, require_permission
+from api.rate_limit import enforce_rate_limit
 from api.repository import FindingFilters, Page, RecordOutcomeInput, Repository
 from api.schemas import FindingDetailOut, FindingListOut, FindingSummaryOut, RecordOutcomeIn
 from domain.outcomes import NothingToAppealError, OutcomeAlreadyRecordedError
 from security.rbac import Action
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
 
 _EXPORT_ROW_LIMIT = 10_000
 
