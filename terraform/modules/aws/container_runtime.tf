@@ -140,6 +140,13 @@ resource "aws_ecs_task_definition" "app" {
         {
           name      = "ANTHROPIC_API_KEY"
           valueFrom = "${aws_secretsmanager_secret.app.arn}:ANTHROPIC_API_KEY::"
+        },
+        {
+          # F-02 (docs/audit/REGISTER.md): required by src/main.py at
+          # startup (EnvKMS reads it) -- without this the container
+          # crash-loops before binding :8000.
+          name      = "PHI_ENCRYPTION_KEY"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:PHI_ENCRYPTION_KEY::"
         }
       ]
       logConfiguration = {

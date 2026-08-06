@@ -71,6 +71,13 @@ resource "azurerm_container_app" "app" {
     identity            = azurerm_user_assigned_identity.app.id
   }
 
+  # F-02 (docs/audit/REGISTER.md): required by src/main.py at startup.
+  secret {
+    name                = "phi-encryption-key"
+    key_vault_secret_id = azurerm_key_vault_secret.phi_encryption_key.id
+    identity            = azurerm_user_assigned_identity.app.id
+  }
+
   template {
     min_replicas = var.min_replicas
     max_replicas = var.max_replicas
@@ -92,6 +99,10 @@ resource "azurerm_container_app" "app" {
       env {
         name        = "ANTHROPIC_API_KEY"
         secret_name = "anthropic-api-key"
+      }
+      env {
+        name        = "PHI_ENCRYPTION_KEY"
+        secret_name = "phi-encryption-key"
       }
 
       liveness_probe {

@@ -100,3 +100,19 @@ resource "azurerm_key_vault_secret" "anthropic_api_key" {
 
   depends_on = [azurerm_key_vault_access_policy.deployer]
 }
+
+# F-02 (docs/audit/REGISTER.md): required by src/main.py at startup
+# (EnvKMS reads it) -- without this the container fails at
+# create_app_from_env() before serving a request, same as the AWS module's
+# equivalent PHI_ENCRYPTION_KEY secrets-manager entry.
+resource "azurerm_key_vault_secret" "phi_encryption_key" {
+  name         = "phi-encryption-key"
+  key_vault_id = azurerm_key_vault.main.id
+  value        = "REPLACE_ME_OUT_OF_BAND" # populated out of band, never by Terraform
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  depends_on = [azurerm_key_vault_access_policy.deployer]
+}

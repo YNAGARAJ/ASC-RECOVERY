@@ -26,8 +26,14 @@ resource "aws_kms_alias" "main" {
 # reads already-materialized env vars via security.secrets.EnvSecretStore,
 # per this module's README.
 resource "aws_secretsmanager_secret" "app" {
-  name        = "${local.name_prefix}-app-secrets"
-  description = "JWT_SECRET_KEY, ANTHROPIC_API_KEY -- populated out of band, never by Terraform"
+  name = "${local.name_prefix}-app-secrets"
+  # F-02 (docs/audit/REGISTER.md): PHI_ENCRYPTION_KEY is a third key in
+  # this same secret, not a separate resource -- it needs the identical
+  # out-of-band-population + ECS `secrets` block treatment the other two
+  # already get, so it lives alongside them rather than duplicating the
+  # whole pattern. src/main.py._require()s all three at startup; a
+  # container with any one missing crash-loops before serving a request.
+  description = "JWT_SECRET_KEY, ANTHROPIC_API_KEY, PHI_ENCRYPTION_KEY -- populated out of band, never by Terraform"
   kms_key_id  = aws_kms_key.main.arn
 
   tags = merge(var.tags, {
