@@ -6,6 +6,7 @@ proxy for "same file ingested 3x -> identical totals")."""
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 
 from domain.money import Money
@@ -80,6 +81,7 @@ def test_reversal_nets_prior_finding_to_exactly_zero() -> None:
     assert len(original_claim.findings) == 1
     original_finding = original_claim.findings[0]
 
+    original_service_line_id = uuid.uuid4()
     prior = PriorFinding(
         line_index=original_finding.line_index,
         procedure_code=original_finding.procedure_code,
@@ -87,6 +89,7 @@ def test_reversal_nets_prior_finding_to_exactly_zero() -> None:
         actual_allowed=original_finding.actual_allowed,
         shortfall=original_finding.shortfall,
         root_cause=original_finding.root_cause.name,
+        service_line_id=original_service_line_id,
     )
 
     reversal_result = parse_835(reversal_835())
@@ -104,6 +107,49 @@ def test_reversal_nets_prior_finding_to_exactly_zero() -> None:
 
     assert reversal_finding.shortfall == -original_finding.shortfall
     assert original_finding.shortfall + reversal_finding.shortfall == Money.zero()
+    # F-01 (docs/audit/REGISTER.md): the reversing finding must carry the
+    # ORIGINAL's own service_line_id forward untouched -- persistence keys
+    # off this directly rather than re-deriving it from the reversal
+    # claim's own (possibly differently-shaped) service lines.
+    assert reversal_finding.service_line_id == original_service_line_id
+
+
+def test_reversal_service_line_id_is_independent_of_the_reversal_claims_own_lines() -> None:
+    """F-01's core plan-layer guarantee, isolated: the reversing Finding's
+    service_line_id comes only from the matched PriorFinding, never from
+    the reversal claim's own line count or layout -- even a line_index that
+    could never exist on the single-line `reversal_835()` fixture (index 7,
+    on a claim with exactly one SVC line) must still net correctly and
+    carry the original's service_line_id through untouched. This is what
+    makes a reversal reporting fewer lines than the original safe at the
+    plan layer; ingestion.apply/db.repository carrying it through correctly
+    at persistence time is proven separately in
+    tests/db/test_reversal_netting.py (DB-backed)."""
+    original_service_line_id = uuid.uuid4()
+    prior = PriorFinding(
+        line_index=7,
+        procedure_code="99213",
+        expected_allowed=Money("50.00"),
+        actual_allowed=Money("300.00"),
+        shortfall=Money("250.00"),
+        root_cause="UNDETERMINED_VARIANCE",
+        service_line_id=original_service_line_id,
+    )
+
+    reversal_result = parse_835(reversal_835())
+    reversal_plan = build_ingestion_plan(
+        reversal_result,
+        contract_versions_by_payer={},
+        prior_findings_by_control_number={"PAYERCTRL0001": (prior,)},
+    )
+    (reversal_transaction,) = reversal_plan.transactions
+    (reversal_claim,) = reversal_transaction.claims
+
+    assert len(reversal_claim.findings) == 1
+    reversal_finding = reversal_claim.findings[0]
+    assert reversal_finding.line_index == 7
+    assert reversal_finding.shortfall == Money("-250.00")
+    assert reversal_finding.service_line_id == original_service_line_id
 
 
 def test_same_content_produces_an_identical_plan() -> None:

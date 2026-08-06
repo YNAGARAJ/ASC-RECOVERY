@@ -508,10 +508,21 @@ def save_findings(
 ) -> list[FindingModel]:
     rows: list[FindingModel] = []
     for finding in findings:
+        # A reversal-netting finding carries its own service_line_id (the
+        # ORIGINAL finding's, already persisted) and must never be looked up
+        # by line_index against *this* claim's own lines -- see F-01 in
+        # docs/audit/REGISTER.md. Only a regular (non-reversal) finding,
+        # whose line_index always corresponds to this same claim's own
+        # service lines, uses the index-based lookup.
+        resolved_service_line_id = (
+            finding.service_line_id
+            if finding.service_line_id is not None
+            else service_line_ids[finding.line_index]
+        )
         row = FindingModel(
             tenant_id=tenant_id,
             claim_id=claim_id,
-            service_line_id=service_line_ids[finding.line_index],
+            service_line_id=resolved_service_line_id,
             contract_version_id=contract_version_id,
             line_index=finding.line_index,
             procedure_code=finding.procedure_code,

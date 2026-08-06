@@ -133,10 +133,14 @@ def _apply_claim(
             amount=adjustment.amount.as_decimal(),
         )
 
-    # Findings referencing a line this claim doesn't have (e.g. a reversal
-    # reporting fewer lines than what it's reversing) are dropped rather
-    # than raising -- one malformed correlation must not fail the batch.
-    persistable = tuple(f for f in claim_plan.findings if f.line_index in service_line_ids)
+    # Every finding here is persistable: a regular finding's line_index
+    # always corresponds to this same claim's own service lines (built from
+    # the same loop above), and a reversal-netting finding carries its own
+    # already-valid service_line_id instead of relying on line_index at all
+    # (db.repository.save_findings uses it directly -- see F-01 in
+    # docs/audit/REGISTER.md). Nothing here is silently dropped: a genuine
+    # mismatch is now a real bug and should raise, not vanish.
+    persistable = claim_plan.findings
     if persistable:
         finding_rows = repository.save_findings(
             session,

@@ -10,6 +10,7 @@ same way domain/ is testable without one.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -36,6 +37,11 @@ class PriorFinding:
     actual_allowed: Money
     shortfall: Money
     root_cause: str
+    # The original finding's own, already-persisted service_line_id -- a
+    # reversal must net against *this* line, not against whatever line sits
+    # at the same line_index on the reversal claim, which may not exist or
+    # may be a different procedure. See docs/audit/REGISTER.md F-01.
+    service_line_id: uuid.UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,9 @@ def _reverse_finding(claim: Claim835, prior: PriorFinding) -> Finding:
             f"shortfall {prior.shortfall} netted to zero by reversal of claim "
             f"{claim.payer_claim_control_number}"
         ),
+        # Never keyed off the reversal claim's own line layout -- see
+        # PriorFinding.service_line_id's docstring and F-01.
+        service_line_id=prior.service_line_id,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -50,6 +51,15 @@ class Finding:
     shortfall: Money
     root_cause: RootCause
     evidence: str
+    # Set only for a reversal-netting finding (ingestion.plan._reverse_finding)
+    # -- carries the ORIGINAL finding's already-persisted service_line_id
+    # forward, so persistence attaches the netting entry to the line it
+    # actually nets rather than to whatever line happens to sit at the same
+    # line_index on the reversal claim itself, which may have fewer lines or
+    # a different procedure at that index. `line_index` above stays as the
+    # original's index for evidence/reporting; this field is what persistence
+    # actually keys off when it's set. See docs/audit/REGISTER.md F-01.
+    service_line_id: uuid.UUID | None = None
 
 
 def _within_tolerance(diff: Money) -> bool:

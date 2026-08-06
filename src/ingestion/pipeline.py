@@ -204,4 +204,5 @@ def _to_prior_finding(row: FindingModel) -> PriorFinding:
         actual_allowed=Money(row.actual_allowed),
         shortfall=Money(row.shortfall),
         root_cause=row.root_cause,
+        service_line_id=row.service_line_id,
     )
