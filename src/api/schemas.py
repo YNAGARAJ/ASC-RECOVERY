@@ -31,6 +31,18 @@ class PageMeta(BaseModel):
     offset: int
 
 
+class LoginIn(BaseModel):
+    subject: str
+    password: str
+    totp_code: str
+
+
+class LoginOut(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: Literal["bearer"] = "bearer"
+
+
 class FindingSummaryOut(BaseModel):
     id: uuid.UUID
     claim_id: uuid.UUID

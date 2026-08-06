@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from api.errors import register_exception_handlers
 from api.repository import Repository
 from api.request_context import RequestIDMiddleware
-from api.routes import audit, contracts, findings, health, packets, remittances
+from api.routes import audit, auth, contracts, findings, health, packets, remittances
 
 
 def create_app(*, repository: Repository, jwt_secret_key: str) -> FastAPI:
@@ -25,6 +25,7 @@ def create_app(*, repository: Repository, jwt_secret_key: str) -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(remittances.router)
     app.include_router(findings.router)
     app.include_router(contracts.router)

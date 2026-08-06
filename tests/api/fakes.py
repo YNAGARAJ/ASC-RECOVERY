@@ -21,6 +21,7 @@ from api.repository import (
     FindingDetail,
     FindingFilters,
     FindingSummary,
+    LoginCredentials,
     Page,
     PagedResult,
     RecordOutcomeInput,
@@ -33,6 +34,7 @@ from domain.variance import RootCause
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome
 from ingestion.virus_scan import VirusScanner
+from security.passwords import hash_password
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
 
@@ -44,6 +46,7 @@ def now() -> datetime:
 @dataclass
 class FakeRepository:
     users: dict[str, UserRecord] = field(default_factory=dict)
+    login_credentials: dict[str, LoginCredentials] = field(default_factory=dict)
     findings: dict[uuid.UUID, tuple[uuid.UUID, FindingDetail]] = field(default_factory=dict)
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
@@ -57,6 +60,19 @@ class FakeRepository:
 
     def seed_user(self, subject: str, *, tenant_id: uuid.UUID, role: str) -> None:
         self.users[subject] = UserRecord(tenant_id=tenant_id, role=role, subject=subject)
+
+    def seed_login_credentials(
+        self, subject: str, *, role: str, password: str | None, mfa_secret: str | None
+    ) -> None:
+        """`password=None`/`mfa_secret=None` seeds an unprovisioned
+        credential (matching a NULL DB column) -- tests use that to prove
+        the login route rejects it the same as a wrong value."""
+        self.login_credentials[subject] = LoginCredentials(
+            subject=subject,
+            role=role,
+            password_hash=None if password is None else hash_password(password),
+            mfa_secret=mfa_secret,
+        )
 
     def seed_finding(self, tenant_id: uuid.UUID, detail: FindingDetail) -> uuid.UUID:
         self.findings[detail.summary.id] = (tenant_id, detail)
@@ -75,6 +91,9 @@ class FakeRepository:
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None:
         return self.users.get(subject)
+
+    def get_login_credentials(self, subject: str) -> LoginCredentials | None:
+        return self.login_credentials.get(subject)
 
     def ingest_remittance(
         self,

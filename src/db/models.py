@@ -72,6 +72,14 @@ class User(Base):
     )
     subject: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Both nullable: a user row can exist (e.g. provisioned by an admin)
+    # before credentials are set up. api/routes/auth.py's login route
+    # treats a NULL password_hash or mfa_secret_encrypted the same as a
+    # wrong password/code -- there is no partial-credential login. See
+    # security/passwords.py for the hash format and security/mfa.py's
+    # docstring for why the TOTP secret must be encrypted at rest.
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mfa_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

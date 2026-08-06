@@ -203,8 +203,22 @@ def get_user_by_subject(session: Session, subject: str) -> UserModel | None:
     ).scalar_one_or_none()
 
 
-def create_user(session: Session, tenant_id: uuid.UUID, *, subject: str, role: str) -> UserModel:
-    user = UserModel(tenant_id=tenant_id, subject=subject, role=role)
+def create_user(
+    session: Session,
+    tenant_id: uuid.UUID,
+    *,
+    subject: str,
+    role: str,
+    password_hash: str | None = None,
+    mfa_secret_encrypted: str | None = None,
+) -> UserModel:
+    user = UserModel(
+        tenant_id=tenant_id,
+        subject=subject,
+        role=role,
+        password_hash=password_hash,
+        mfa_secret_encrypted=mfa_secret_encrypted,
+    )
     session.add(user)
     session.flush()
     return user

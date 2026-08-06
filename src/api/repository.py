@@ -84,6 +84,21 @@ class UserRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class LoginCredentials:
+    """What `POST /auth/login` (api/routes/auth.py) needs to verify a
+    subject's password and TOTP code -- never returned to a client.
+    `mfa_secret` is already decrypted (PostgresRepository does that
+    itself, same convention as patient name/member id on FindingDetail);
+    either field is None if that credential was never provisioned, which
+    the login route treats identically to "wrong"."""
+
+    subject: str
+    role: str
+    password_hash: str | None
+    mfa_secret: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class FindingSummary:
     id: uuid.UUID
     claim_id: uuid.UUID
@@ -286,6 +301,8 @@ class Repository(Protocol):
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None: ...
 
+    def get_login_credentials(self, subject: str) -> LoginCredentials | None: ...
+
     def ingest_remittance(
         self,
         tenant_id: uuid.UUID,
@@ -460,6 +477,18 @@ class PostgresRepository:
             if user is None:
                 return None
             return UserRecord(tenant_id=user.tenant_id, role=user.role, subject=user.subject)
+
+    def get_login_credentials(self, subject: str) -> LoginCredentials | None:
+        with self._session_factory() as session:
+            user = db_repository.get_user_by_subject(session, subject)
+            if user is None:
+                return None
+            return LoginCredentials(
+                subject=user.subject,
+                role=user.role,
+                password_hash=user.password_hash,
+                mfa_secret=decrypt_phi_field(self._encryptor, user.mfa_secret_encrypted),
+            )
 
     def ingest_remittance(
         self,

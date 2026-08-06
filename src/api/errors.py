@@ -12,6 +12,7 @@ import logging
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from security.redaction import PHIRedactionFilter
@@ -37,6 +38,28 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content=_error_body("request_error", str(exc.detail), request_id),
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # FastAPI's default handler embeds the raw submitted value in each
+        # error's "input" key -- fine for a malformed date or UUID, but
+        # `POST /auth/login` (F-04) is the first route in this API whose
+        # request body carries a credential, so a malformed login request
+        # (e.g. totp_code sent as a number) must not echo the submitted
+        # password back in the 422 body. "loc"/"type"/"msg" carry no
+        # submitted values, only which field and what kind of error.
+        request_id = _request_id(request)
+        errors = [
+            {"loc": list(err["loc"]), "type": err["type"], "msg": err["msg"]}
+            for err in exc.errors()
+        ]
+        content: dict[str, object] = {
+            **_error_body("validation_error", "invalid request", request_id),
+            "errors": errors,
+        }
+        return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content=content)
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
