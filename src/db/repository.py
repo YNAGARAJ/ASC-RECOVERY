@@ -200,6 +200,16 @@ def _contract_version_to_domain(
 # --- Organizations, facilities, memberships (Phase 4) ---------------------------
 
 
+def get_org_id_for_facility(session: Session, facility_id: uuid.UUID) -> uuid.UUID | None:
+    """Contracts are org-scoped (`db/models.py`'s module docstring), but
+    ingestion only ever knows which *facility* a remittance belongs to --
+    this is the one join point where a facility-scoped write needs to
+    reach its parent org's contracts (`ingestion/pipeline.py`)."""
+    return session.execute(
+        select(FacilityModel.org_id).where(FacilityModel.id == facility_id)
+    ).scalar_one_or_none()
+
+
 def create_organization(
     session: Session,
     *,

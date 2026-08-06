@@ -47,7 +47,7 @@ def _resolve_contract_version_id(
 
 def _apply_claim(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     remittance_id: uuid.UUID,
     claim_plan: ClaimIngestionPlan,
     contract_version_ids: ContractVersionIds,
@@ -69,7 +69,7 @@ def _apply_claim(
 
     claim_row = repository.create_claim(
         session,
-        tenant_id,
+        facility_id,
         remittance_id,
         patient_control_number=claim.patient_control_number,
         payer_claim_control_number=claim.payer_claim_control_number,
@@ -87,7 +87,7 @@ def _apply_claim(
     )
     repository.write_audit_log(
         session,
-        tenant_id,
+        facility_id,
         actor=actor,
         action="claim_ingested",
         resource_type="claim",
@@ -99,7 +99,7 @@ def _apply_claim(
     for line_index, service_line in enumerate(claim.service_lines):
         line_row = repository.create_service_line(
             session,
-            tenant_id,
+            facility_id,
             claim_row.id,
             line_index=line_index,
             procedure_code=service_line.procedure_code,
@@ -114,7 +114,7 @@ def _apply_claim(
         for adjustment in service_line.adjustments:
             repository.create_adjustment(
                 session,
-                tenant_id,
+                facility_id,
                 claim_row.id,
                 line_row.id,
                 group_code=adjustment.group_code.value,
@@ -125,7 +125,7 @@ def _apply_claim(
     for adjustment in claim.adjustments:
         repository.create_adjustment(
             session,
-            tenant_id,
+            facility_id,
             claim_row.id,
             None,
             group_code=adjustment.group_code.value,
@@ -144,7 +144,7 @@ def _apply_claim(
     if persistable:
         finding_rows = repository.save_findings(
             session,
-            tenant_id,
+            facility_id,
             claim_row.id,
             service_line_ids,
             _resolve_contract_version_id(claim_plan.contract_version, contract_version_ids),
@@ -153,7 +153,7 @@ def _apply_claim(
         for finding_row in finding_rows:
             repository.write_audit_log(
                 session,
-                tenant_id,
+                facility_id,
                 actor=actor,
                 action="finding_created",
                 resource_type="finding",
@@ -165,7 +165,7 @@ def _apply_claim(
 
 def apply_ingestion_plan(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     plan: FileIngestionPlan,
     *,
     remittance_id: uuid.UUID,
@@ -176,14 +176,14 @@ def apply_ingestion_plan(
     if plan.quarantine_reason is not None:
         repository.update_remittance_status(
             session,
-            tenant_id,
+            facility_id,
             remittance_id,
             status="quarantined",
             quarantine_reason=plan.quarantine_reason,
         )
         repository.write_audit_log(
             session,
-            tenant_id,
+            facility_id,
             actor=actor,
             action="remittance_quarantined",
             resource_type="remittance",
@@ -212,7 +212,7 @@ def apply_ingestion_plan(
                 continue
             persisted_findings = _apply_claim(
                 session,
-                tenant_id,
+                facility_id,
                 remittance_id,
                 claim_plan,
                 contract_version_ids,
@@ -225,10 +225,10 @@ def apply_ingestion_plan(
             )
             claims_created += 1
 
-    repository.update_remittance_status(session, tenant_id, remittance_id, status="ingested")
+    repository.update_remittance_status(session, facility_id, remittance_id, status="ingested")
     repository.write_audit_log(
         session,
-        tenant_id,
+        facility_id,
         actor=actor,
         action="remittance_ingested",
         resource_type="remittance",

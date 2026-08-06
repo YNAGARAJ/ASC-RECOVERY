@@ -1,7 +1,11 @@
 """Shared fixtures for tests/api/: an app wired to a FakeRepository seeded
-with two tenants' worth of data, and helpers to mint real JWTs per role
-via `issue_session` (Phase 4, unchanged) -- the auth path itself stays
-real; only the Postgres-backed data layer is faked.
+with two organizations' worth of data (each with one facility), and
+helpers to mint real JWTs per role via `issue_session` (Phase 4) -- the
+auth path itself stays real; only the Postgres-backed data layer is
+faked. `auth_headers` no longer picks a role directly (the JWT carries no
+role claim -- see `security.session`'s module docstring); it selects
+*which org's membership* to activate, and the seeded membership's role
+for that (subject, org) pair is what `resolve_membership_role` returns.
 """
 
 from __future__ import annotations
@@ -101,6 +105,15 @@ def seed_ids() -> SeedIds:
 def repo(seed_ids: SeedIds) -> FakeRepository:
     repository = FakeRepository()
 
+    # Two independent single-facility orgs ("tenant" in every other
+    # fixture name here, kept for continuity with existing test bodies --
+    # each org IS the facility's sole owner, matching the common
+    # single-facility ASC case org/facility resolution collapses to).
+    org_a = repository.seed_organization(org_id=TENANT_A)
+    org_b = repository.seed_organization(org_id=TENANT_B)
+    facility_a = repository.seed_facility(org_a, facility_id=TENANT_A)
+    facility_b = repository.seed_facility(org_b, facility_id=TENANT_B)
+
     # Force the seeded finding ids to match seed_ids exactly, rather than
     # whatever random id FindingSummary's own construction chose, so tests
     # can request a specific tenant's finding by id deliberately.
@@ -108,28 +121,30 @@ def repo(seed_ids: SeedIds) -> FakeRepository:
     detail_a = replace(detail_a, summary=replace(detail_a.summary, id=seed_ids.finding_a))
     detail_b = _finding_detail("tenant-b", seed_ids.claim_b)
     detail_b = replace(detail_b, summary=replace(detail_b.summary, id=seed_ids.finding_b))
-    repository.seed_finding(TENANT_A, detail_a)
-    repository.seed_finding(TENANT_B, detail_b)
+    repository.seed_finding(facility_a, detail_a)
+    repository.seed_finding(facility_b, detail_b)
 
     repository.seed_contract(
-        TENANT_A,
+        org_a,
         ContractSummary(
             id=seed_ids.contract_a, payer_id="PAYER-A", name="Tenant A Contract", created_at=now()
         ),
     )
     repository.seed_contract(
-        TENANT_B,
+        org_b,
         ContractSummary(
             id=seed_ids.contract_b, payer_id="PAYER-B", name="Tenant B Contract", created_at=now()
         ),
     )
 
     for role in Role:
-        repository.seed_user(subject_for(role, "a"), tenant_id=TENANT_A, role=role.value)
-        repository.seed_user(subject_for(role, "b"), tenant_id=TENANT_B, role=role.value)
+        user_a = repository.seed_user(subject_for(role, "a"))
+        repository.seed_membership(user_a, org_a, role=role)
+        user_b = repository.seed_user(subject_for(role, "b"))
+        repository.seed_membership(user_b, org_b, role=role)
 
     repository.seed_audit_entry(
-        TENANT_A,
+        facility_a,
         AuditLogEntry(
             id=uuid.uuid4(),
             actor="tenant-a-actor",
@@ -143,7 +158,7 @@ def repo(seed_ids: SeedIds) -> FakeRepository:
         ),
     )
     repository.seed_audit_entry(
-        TENANT_B,
+        facility_b,
         AuditLogEntry(
             id=uuid.uuid4(),
             actor="tenant-b-actor",
@@ -171,6 +186,11 @@ def client(app: FastAPI) -> TestClient:
 
 
 def auth_headers(role: Role, tenant_label: str) -> dict[str, str]:
+    """`tenant_label` ("a"/"b") selects which seeded org's membership to
+    activate -- the org id doubles as the facility id in this fixture set
+    (`TENANT_A`/`TENANT_B`), matching `repo`'s single-facility-per-org
+    seeding above."""
     subject = subject_for(role, tenant_label)
-    tokens = issue_session(JWT_SECRET, subject, role, mfa_verified=True)
+    active_org_id = TENANT_A if tenant_label == "a" else TENANT_B
+    tokens = issue_session(JWT_SECRET, subject, str(active_org_id), mfa_verified=True)
     return {"Authorization": f"Bearer {tokens.access_token}"}

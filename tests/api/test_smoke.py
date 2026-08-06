@@ -22,10 +22,10 @@ def test_missing_token_is_401(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_viewer_cannot_upload_remittance(client: TestClient) -> None:
+def test_analyst_cannot_upload_remittance(client: TestClient) -> None:
     response = client.post(
         "/remittances",
-        headers=auth_headers(Role.VIEWER, "a"),
+        headers=auth_headers(Role.ANALYST, "a"),
         files={"file": ("test.835", b"ISA*...", "application/octet-stream")},
     )
     assert response.status_code == 403

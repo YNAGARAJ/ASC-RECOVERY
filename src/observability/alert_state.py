@@ -49,7 +49,7 @@ class RollingWindowCounter:
 
 
 class IngestionOutcomeTracker:
-    """Per-tenant rolling window of ingestion outcomes, feeding
+    """Per-facility rolling window of ingestion outcomes, feeding
     `observability.alerts.evaluate_ingestion_failure_alert` a real
     quarantined/total ratio instead of nothing."""
 
@@ -59,12 +59,12 @@ class IngestionOutcomeTracker:
         self._total = RollingWindowCounter(window_seconds=window_seconds, clock=clock)
         self._quarantined = RollingWindowCounter(window_seconds=window_seconds, clock=clock)
 
-    def record(self, tenant_id: str, *, quarantined: bool) -> tuple[int, int]:
+    def record(self, facility_id: str, *, quarantined: bool) -> tuple[int, int]:
         """Returns (quarantined_count, total_count) within the window,
         after recording this outcome."""
-        total = self._total.record(tenant_id)
+        total = self._total.record(facility_id)
         if quarantined:
-            quarantined_count = self._quarantined.record(tenant_id)
+            quarantined_count = self._quarantined.record(facility_id)
         else:
-            quarantined_count = self._quarantined.count(tenant_id)
+            quarantined_count = self._quarantined.count(facility_id)
         return quarantined_count, total

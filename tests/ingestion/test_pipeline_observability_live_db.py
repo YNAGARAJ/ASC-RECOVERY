@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.tenancy import tenant_session
+from db.access import access_session
 from domain.money import Money
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import ingest_file
@@ -19,11 +20,11 @@ from ingestion.virus_scan import EicarAwareScanner
 from observability.metrics import setup_metrics
 from observability.tracing import setup_tracing
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_org_with_contract
 
 
 def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
     # minimal_valid_835() reports allowed=450 for 99213 -- a contract
     # price below that (the shared default, make_contract_version()'s
@@ -33,8 +34,8 @@ def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
     # This test needs a genuine positive shortfall to prove the
     # instrument actually fires, so it prices 99213 above what's
     # reported allowed instead of using the shared default.
-    tenant_id = seed_tenant_with_contract(
-        app_session_factory,
+    user_id, facility_id = seed_org_with_contract(
+        owner_engine,
         "Observability tenant",
         fee_schedule={"99213": Money("500.00")},
     )
@@ -43,10 +44,10 @@ def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
     metric_reader = InMemoryMetricReader()
     instruments = setup_metrics(metric_reader)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         outcome = ingest_file(
             session,
-            tenant_id,
+            facility_id,
             content=minimal_valid_835().encode("utf-8"),
             source="upload",
             uploaded_by="observability-tester",
@@ -62,7 +63,7 @@ def test_ingest_file_emits_a_scrubbed_span_and_real_metrics(
     (span,) = span_exporter.get_finished_spans()
     assert span.name == "ingestion.ingest_file"
     assert span.attributes is not None
-    assert span.attributes["tenant_id"] == str(tenant_id)
+    assert span.attributes["facility_id"] == str(facility_id)
     assert span.attributes["outcome_status"] == "ingested"
 
     metrics_data = metric_reader.get_metrics_data()

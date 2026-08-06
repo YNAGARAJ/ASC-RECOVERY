@@ -12,10 +12,11 @@ import uuid
 from datetime import date
 from decimal import Decimal
 
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository
-from db.tenancy import tenant_session
+from db.access import access_session
 from domain.contract import (
     AssistantSurgeonRule,
     BilateralConvention,
@@ -28,6 +29,7 @@ from domain.contract import (
     price_claim,
 )
 from domain.money import Money, Rate
+from tests.db.conftest import seed_org_facility_user
 
 _CODE = "99213"
 
@@ -64,32 +66,32 @@ def _version(
 
 
 def _seed_two_versions(
-    session_factory: sessionmaker[Session],
-) -> tuple[uuid.UUID, str]:
+    owner_engine: Engine, session_factory: sessionmaker[Session]
+) -> tuple[uuid.UUID, uuid.UUID, str]:
     payer_id = f"PAYER-{uuid.uuid4().hex[:8]}"
     old_version = _version(payer_id, date(2022, 1, 1), date(2022, 12, 31), Money("100.00"))
     new_version = _version(payer_id, date(2023, 1, 1), None, Money("120.00"))
 
-    with session_factory() as session, session.begin():
-        tenant = repository.create_tenant(session, f"Effective-dating test tenant {uuid.uuid4()}")
-        tenant_id = tenant.id
+    user_id, org_id, _facility_id = seed_org_facility_user(
+        owner_engine, "Effective-dating test tenant"
+    )
 
-    with tenant_session(session_factory, tenant_id) as session:
-        contract = repository.create_contract(session, tenant_id, payer_id, "Test Payer Contract")
-        repository.create_contract_version(session, tenant_id, contract.id, old_version)
-        repository.create_contract_version(session, tenant_id, contract.id, new_version)
+    with access_session(session_factory, user_id) as session:
+        contract = repository.create_contract(session, org_id, payer_id, "Test Payer Contract")
+        repository.create_contract_version(session, org_id, contract.id, old_version)
+        repository.create_contract_version(session, org_id, contract.id, new_version)
 
-    return tenant_id, payer_id
+    return user_id, org_id, payer_id
 
 
 def test_claim_dated_last_year_prices_against_last_years_contract(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, payer_id = _seed_two_versions(app_session_factory)
+    user_id, org_id, payer_id = _seed_two_versions(owner_engine, app_session_factory)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         effective = repository.get_effective_contract_version(
-            session, tenant_id, payer_id, date(2022, 6, 15)
+            session, org_id, payer_id, date(2022, 6, 15)
         )
 
     assert effective is not None
@@ -102,13 +104,13 @@ def test_claim_dated_last_year_prices_against_last_years_contract(
 
 
 def test_claim_dated_this_year_prices_against_current_contract(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, payer_id = _seed_two_versions(app_session_factory)
+    user_id, org_id, payer_id = _seed_two_versions(owner_engine, app_session_factory)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         effective = repository.get_effective_contract_version(
-            session, tenant_id, payer_id, date(2023, 6, 15)
+            session, org_id, payer_id, date(2023, 6, 15)
         )
 
     assert effective is not None
@@ -121,13 +123,13 @@ def test_claim_dated_this_year_prices_against_current_contract(
 
 
 def test_claim_dated_before_any_contract_version_finds_nothing(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, payer_id = _seed_two_versions(app_session_factory)
+    user_id, org_id, payer_id = _seed_two_versions(owner_engine, app_session_factory)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         effective = repository.get_effective_contract_version(
-            session, tenant_id, payer_id, date(2020, 1, 1)
+            session, org_id, payer_id, date(2020, 1, 1)
         )
 
     assert effective is None

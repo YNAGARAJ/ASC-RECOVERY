@@ -8,16 +8,17 @@ never executed in this environment (no Docker/WSL/Postgres available).
 
 from __future__ import annotations
 
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.tenancy import tenant_session
+from db.access import access_session
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.poller import poll_and_ingest
 from ingestion.sources import IncomingFile, IngestionSource
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_org_with_contract
 
 
 class _OneShotSource(IngestionSource):
@@ -29,9 +30,9 @@ class _OneShotSource(IngestionSource):
 
 
 def test_poll_and_ingest_against_real_postgres(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id = seed_tenant_with_contract(app_session_factory, "poller-live")
+    user_id, facility_id = seed_org_with_contract(owner_engine, "poller-live")
     encryptor = make_test_encryptor()
     scanner = EicarAwareScanner()
     source = _OneShotSource(
@@ -39,10 +40,10 @@ def test_poll_and_ingest_against_real_postgres(
     )
 
     def ingest_one(file: IncomingFile) -> IngestionOutcome | DuplicateOutcome:
-        with tenant_session(app_session_factory, tenant_id) as session:
+        with access_session(app_session_factory, user_id) as session:
             return ingest_file(
                 session,
-                tenant_id,
+                facility_id,
                 content=file.content,
                 source=file.source,
                 uploaded_by="s3-poller",
@@ -59,22 +60,22 @@ def test_poll_and_ingest_against_real_postgres(
 
 
 def test_polling_the_same_file_twice_is_a_duplicate_the_second_time(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
     """Proves the module docstring's own claim: a fresh, empty `seen` set
     every script invocation (no persisted filename tracking) is
     harmless, not incorrect -- db.repository.record_remittance_if_new's
     content-hash check is what actually prevents double-ingestion."""
-    tenant_id = seed_tenant_with_contract(app_session_factory, "poller-live-dup")
+    user_id, facility_id = seed_org_with_contract(owner_engine, "poller-live-dup")
     encryptor = make_test_encryptor()
     scanner = EicarAwareScanner()
     content = minimal_valid_835().encode("utf-8")
 
     def ingest_one(file: IncomingFile) -> IngestionOutcome | DuplicateOutcome:
-        with tenant_session(app_session_factory, tenant_id) as session:
+        with access_session(app_session_factory, user_id) as session:
             return ingest_file(
                 session,
-                tenant_id,
+                facility_id,
                 content=file.content,
                 source=file.source,
                 uploaded_by="s3-poller",

@@ -34,14 +34,14 @@ class DuplicateOutcome:
 
 
 def _quarantine_new_remittance(
-    session: Session, tenant_id: uuid.UUID, remittance_id: uuid.UUID, *, actor: str, reason: str
+    session: Session, facility_id: uuid.UUID, remittance_id: uuid.UUID, *, actor: str, reason: str
 ) -> IngestionOutcome:
     repository.update_remittance_status(
-        session, tenant_id, remittance_id, status="quarantined", quarantine_reason=reason
+        session, facility_id, remittance_id, status="quarantined", quarantine_reason=reason
     )
     repository.write_audit_log(
         session,
-        tenant_id,
+        facility_id,
         actor=actor,
         action="remittance_quarantined",
         resource_type="remittance",
@@ -60,7 +60,7 @@ def _quarantine_new_remittance(
 
 def ingest_file(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     *,
     content: bytes,
     source: str,
@@ -84,11 +84,11 @@ def ingest_file(
 
     with resolved_tracer.start_as_current_span(
         "ingestion.ingest_file",
-        attributes={"tenant_id": str(tenant_id), "source": source},
+        attributes={"facility_id": str(facility_id), "source": source},
     ) as span:
         outcome = _ingest_file_impl(
             session,
-            tenant_id,
+            facility_id,
             content=content,
             source=source,
             uploaded_by=uploaded_by,
@@ -101,7 +101,7 @@ def ingest_file(
             span.set_attribute("findings_created", outcome.findings_created)
             record_ingestion_outcome(
                 resolved_instruments,
-                tenant_id=str(tenant_id),
+                facility_id=str(facility_id),
                 status=outcome.status,
                 latency_ms=latency_ms,
                 dollars_detected=outcome.dollars_detected,
@@ -114,7 +114,7 @@ def ingest_file(
 
 def _ingest_file_impl(
     session: Session,
-    tenant_id: uuid.UUID,
+    facility_id: uuid.UUID,
     *,
     content: bytes,
     source: str,
@@ -125,7 +125,7 @@ def _ingest_file_impl(
     file_hash = hashlib.sha256(content).hexdigest()
 
     remittance, is_new = repository.record_remittance_if_new(
-        session, tenant_id, file_hash, source=source, uploaded_by=uploaded_by
+        session, facility_id, file_hash, source=source, uploaded_by=uploaded_by
     )
     if not is_new:
         return DuplicateOutcome(remittance_id=remittance.id)
@@ -134,7 +134,7 @@ def _ingest_file_impl(
     if not scan_result.clean:
         return _quarantine_new_remittance(
             session,
-            tenant_id,
+            facility_id,
             remittance.id,
             actor=uploaded_by,
             reason=f"virus scan flagged this file: {scan_result.detail}",
@@ -145,7 +145,7 @@ def _ingest_file_impl(
     except UnicodeDecodeError as exc:
         return _quarantine_new_remittance(
             session,
-            tenant_id,
+            facility_id,
             remittance.id,
             actor=uploaded_by,
             reason=f"could not decode file as UTF-8: {exc}",
@@ -153,14 +153,21 @@ def _ingest_file_impl(
 
     parse_result = parse_835(text)
 
+    # Contracts are org-scoped, not facility-scoped (db/models.py's module
+    # docstring) -- one ASC_GROUP's facilities share a payer rate card.
+    # Ingestion only ever knows the target facility, so resolve its
+    # parent org once here for the contract-version lookups below.
+    org_id = repository.get_org_id_for_facility(session, facility_id)
+
     payer_ids = {payer_key(txn.payer) for txn in parse_result.transactions}
     contract_versions_by_payer: dict[str, tuple[ContractVersion, ...]] = {}
     contract_version_ids: dict[tuple[str, date], uuid.UUID] = {}
-    for pid in payer_ids:
-        rows = repository.list_contract_versions(session, tenant_id, pid)
-        contract_versions_by_payer[pid] = tuple(version for _, version in rows)
-        for version_id, version in rows:
-            contract_version_ids[(version.payer_id, version.effective_from)] = version_id
+    if org_id is not None:
+        for pid in payer_ids:
+            rows = repository.list_contract_versions(session, org_id, pid)
+            contract_versions_by_payer[pid] = tuple(version for _, version in rows)
+            for version_id, version in rows:
+                contract_version_ids[(version.payer_id, version.effective_from)] = version_id
 
     reversal_control_numbers = {
         claim.payer_claim_control_number
@@ -172,7 +179,7 @@ def _ingest_file_impl(
         control_number: tuple(
             _to_prior_finding(row)
             for row in repository.list_findings_by_payer_claim_control_number(
-                session, tenant_id, control_number
+                session, facility_id, control_number
             )
         )
         for control_number in reversal_control_numbers
@@ -187,7 +194,7 @@ def _ingest_file_impl(
     contract_version_ids_typed: ContractVersionIds = contract_version_ids
     return apply_ingestion_plan(
         session,
-        tenant_id,
+        facility_id,
         plan,
         remittance_id=remittance.id,
         actor=uploaded_by,

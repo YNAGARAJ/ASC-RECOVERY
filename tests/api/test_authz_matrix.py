@@ -240,7 +240,7 @@ def test_claim_access_history_matrix(client: TestClient, seed_ids: SeedIds, role
     action = Action.READ_PHI_ACCESS_LOG
     # Generate some access history first, independent of the role under
     # test, so there's something to see when an allowed role asks for it.
-    client.get(f"/findings/{seed_ids.finding_a}", headers=auth_headers(Role.ADMIN, "a"))
+    client.get(f"/findings/{seed_ids.finding_a}", headers=auth_headers(Role.PLATFORM_ADMIN, "a"))
 
     own = client.get(
         f"/claims/{seed_ids.claim_a}/access-history", headers=auth_headers(role, "a")

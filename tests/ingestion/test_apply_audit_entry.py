@@ -5,29 +5,29 @@ tests/ingestion/conftest.py."""
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from db.access import access_session
 from db.models import AuditLog as AuditLogModel
-from db.tenancy import tenant_session
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_org_with_contract
 
 
 def test_ingesting_a_file_writes_exactly_one_audit_entry(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id = seed_tenant_with_contract(app_session_factory, "Audit entry tenant")
+    user_id, facility_id = seed_org_with_contract(owner_engine, "Audit entry tenant")
     content = minimal_valid_835().encode("utf-8")
     scanner = EicarAwareScanner()
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         outcome = ingest_file(
             session,
-            tenant_id,
+            facility_id,
             content=content,
             source="upload",
             uploaded_by="audit-tester",
@@ -37,11 +37,11 @@ def test_ingesting_a_file_writes_exactly_one_audit_entry(
 
     assert isinstance(outcome, IngestionOutcome)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         entries = (
             session.execute(
                 select(AuditLogModel).where(
-                    AuditLogModel.tenant_id == tenant_id,
+                    AuditLogModel.facility_id == facility_id,
                     AuditLogModel.resource_id == str(outcome.remittance_id),
                 )
             )
@@ -58,21 +58,21 @@ def test_ingesting_a_file_writes_exactly_one_audit_entry(
 
 
 def test_ingesting_a_file_also_writes_claim_and_finding_audit_entries(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
     """`GET /claims/{id}/access-history` (Phase 8) reconstructs a claim's
     history from `audit_log` rows with resource_type "claim"/"finding" --
     without these, ingestion itself is invisible to that report, even
     though it's the first (and most PHI-bearing) thing that happens to a
     claim."""
-    tenant_id = seed_tenant_with_contract(app_session_factory, "Claim audit tenant")
+    user_id, facility_id = seed_org_with_contract(owner_engine, "Claim audit tenant")
     content = minimal_valid_835().encode("utf-8")
     scanner = EicarAwareScanner()
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         outcome = ingest_file(
             session,
-            tenant_id,
+            facility_id,
             content=content,
             source="upload",
             uploaded_by="audit-tester",
@@ -83,11 +83,11 @@ def test_ingesting_a_file_also_writes_claim_and_finding_audit_entries(
     assert outcome.claims_created == 1
     assert outcome.findings_created == 1
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         claim_entries = (
             session.execute(
                 select(AuditLogModel).where(
-                    AuditLogModel.tenant_id == tenant_id,
+                    AuditLogModel.facility_id == facility_id,
                     AuditLogModel.resource_type == "claim",
                 )
             )
@@ -97,7 +97,7 @@ def test_ingesting_a_file_also_writes_claim_and_finding_audit_entries(
         finding_entries = (
             session.execute(
                 select(AuditLogModel).where(
-                    AuditLogModel.tenant_id == tenant_id,
+                    AuditLogModel.facility_id == facility_id,
                     AuditLogModel.resource_type == "finding",
                 )
             )

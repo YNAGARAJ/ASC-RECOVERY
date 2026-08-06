@@ -21,12 +21,12 @@ runs against a real Postgres 16.
 
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from db.access import access_session
 from db.models import Finding as FindingModel
 from db.models import ServiceLine as ServiceLineModel
-from db.tenancy import tenant_session
 from domain.money import Money
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import ingest_file
@@ -40,7 +40,7 @@ from tests.domain.fixtures_x835 import (
     plb_segment,
     seg,
 )
-from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_org_with_contract
 
 _PAYER_CTRL = "PAYERCTRL-REVTEST-01"
 
@@ -153,19 +153,19 @@ def _reversal_claim_one_line() -> str:
 
 
 def test_reversal_with_fewer_lines_than_original_nets_every_finding_to_zero(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id = seed_tenant_with_contract(
-        app_session_factory,
+    user_id, facility_id = seed_org_with_contract(
+        owner_engine,
         "Reversal netting tenant",
         fee_schedule={"99213": Money("50.00"), "99214": Money("60.00")},
     )
     scanner = EicarAwareScanner()
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         original_outcome = ingest_file(
             session,
-            tenant_id,
+            facility_id,
             content=_original_claim_two_lines().encode("utf-8"),
             source="upload",
             uploaded_by="tester",
@@ -176,20 +176,20 @@ def test_reversal_with_fewer_lines_than_original_nets_every_finding_to_zero(
     assert original_outcome.status == "ingested"
     assert original_outcome.findings_created == 2
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         original_service_line_ids = set(
             session.execute(
-                select(ServiceLineModel.id).where(ServiceLineModel.tenant_id == tenant_id)
+                select(ServiceLineModel.id).where(ServiceLineModel.facility_id == facility_id)
             )
             .scalars()
             .all()
         )
         assert len(original_service_line_ids) == 2
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         reversal_outcome = ingest_file(
             session,
-            tenant_id,
+            facility_id,
             content=_reversal_claim_one_line().encode("utf-8"),
             source="upload",
             uploaded_by="tester",
@@ -203,16 +203,16 @@ def test_reversal_with_fewer_lines_than_original_nets_every_finding_to_zero(
     # count that silently dropped to 1 before the F-01 fix.
     assert reversal_outcome.findings_created == 2
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         all_findings = (
-            session.execute(select(FindingModel).where(FindingModel.tenant_id == tenant_id))
+            session.execute(select(FindingModel).where(FindingModel.facility_id == facility_id))
             .scalars()
             .all()
         )
         total_finding_count = session.execute(
             select(func.count())
             .select_from(FindingModel)
-            .where(FindingModel.tenant_id == tenant_id)
+            .where(FindingModel.facility_id == facility_id)
         ).scalar_one()
 
     assert total_finding_count == 4  # 2 original + 2 reversing

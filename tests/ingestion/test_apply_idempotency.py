@@ -4,33 +4,33 @@ Postgres -- see tests/ingestion/conftest.py."""
 
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from db.access import access_session
 from db.models import Claim as ClaimModel
 from db.models import Finding as FindingModel
-from db.tenancy import tenant_session
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import minimal_valid_835
-from tests.ingestion.conftest import make_test_encryptor, seed_tenant_with_contract
+from tests.ingestion.conftest import make_test_encryptor, seed_org_with_contract
 
 
 def test_ingesting_the_same_file_three_times_creates_no_duplicates(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id = seed_tenant_with_contract(app_session_factory, "Idempotent ingest tenant")
+    user_id, facility_id = seed_org_with_contract(owner_engine, "Idempotent ingest tenant")
     content = minimal_valid_835().encode("utf-8")
     scanner = EicarAwareScanner()
 
     outcomes = []
     for _ in range(3):
-        with tenant_session(app_session_factory, tenant_id) as session:
+        with access_session(app_session_factory, user_id) as session:
             outcomes.append(
                 ingest_file(
                     session,
-                    tenant_id,
+                    facility_id,
                     content=content,
                     source="upload",
                     uploaded_by="tester",
@@ -49,14 +49,16 @@ def test_ingesting_the_same_file_three_times_creates_no_duplicates(
     assert second.remittance_id == first.remittance_id
     assert third.remittance_id == first.remittance_id
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         claim_count = session.execute(
-            select(func.count()).select_from(ClaimModel).where(ClaimModel.tenant_id == tenant_id)
+            select(func.count())
+            .select_from(ClaimModel)
+            .where(ClaimModel.facility_id == facility_id)
         ).scalar_one()
         finding_count = session.execute(
             select(func.count())
             .select_from(FindingModel)
-            .where(FindingModel.tenant_id == tenant_id)
+            .where(FindingModel.facility_id == facility_id)
         ).scalar_one()
 
     assert claim_count == 1

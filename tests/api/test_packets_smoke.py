@@ -35,9 +35,9 @@ def test_biller_can_generate_list_and_approve_a_packet(
     assert approve.json()["decided_by"] is not None
 
 
-def test_viewer_cannot_generate_a_packet(client: TestClient, seed_ids: SeedIds) -> None:
+def test_analyst_cannot_generate_a_packet(client: TestClient, seed_ids: SeedIds) -> None:
     response = client.post(
-        f"/findings/{seed_ids.finding_a}/packets", headers=auth_headers(Role.VIEWER, "a")
+        f"/findings/{seed_ids.finding_a}/packets", headers=auth_headers(Role.ANALYST, "a")
     )
     assert response.status_code == 403
 

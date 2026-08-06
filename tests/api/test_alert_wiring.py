@@ -52,9 +52,9 @@ def test_repeated_login_failures_fire_an_auth_anomaly_alert(
 ) -> None:
     subject = "biller-anomaly@example.com"
     mfa_secret = generate_enrollment_secret()
+    repo.seed_user(subject)
     repo.seed_login_credentials(
         subject,
-        role=Role.BILLER.value,
         password="correct horse battery staple",
         mfa_secret=mfa_secret,
     )
@@ -77,9 +77,9 @@ def test_a_single_login_failure_does_not_fire_the_alert(
 ) -> None:
     subject = "biller-single-fail@example.com"
     mfa_secret = generate_enrollment_secret()
+    repo.seed_user(subject)
     repo.seed_login_credentials(
         subject,
-        role=Role.BILLER.value,
         password="correct horse battery staple",
         mfa_secret=mfa_secret,
     )

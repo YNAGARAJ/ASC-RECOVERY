@@ -20,49 +20,54 @@ import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from db import repository
-from db.tenancy import tenant_session
+from db.access import access_session
 from domain.money import Money
 from domain.variance import Finding, RootCause
+from tests.db.conftest import seed_org_facility_user
 from tests.ingestion.fixtures import make_contract_version
 
 _PROCEDURE_CODE = "99213"
 _RECORDED_BY = "biller@example.com"
 
 
-def _seed_tenant_with_contract(
-    session_factory: sessionmaker[Session], payer_id: str
-) -> tuple[uuid.UUID, uuid.UUID]:
-    with session_factory() as session, session.begin():
-        tenant = repository.create_tenant(session, f"Outcomes test tenant {uuid.uuid4()}")
-        tenant_id = tenant.id
+def _seed_facility_with_contract(
+    owner_engine: Engine, session_factory: sessionmaker[Session], payer_id: str
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Returns `(user_id, facility_id, contract_version_id)` -- contracts
+    are org-scoped (only needed internally here to build the version),
+    but everything else in this file (remittances/claims/findings/
+    packets) is facility-scoped."""
+    user_id, org_id, facility_id = seed_org_facility_user(owner_engine, "Outcomes test tenant")
 
-    with tenant_session(session_factory, tenant_id) as session:
-        contract = repository.create_contract(session, tenant_id, payer_id, "Outcomes contract")
+    with access_session(session_factory, user_id) as session:
+        contract = repository.create_contract(session, org_id, payer_id, "Outcomes contract")
         version = repository.create_contract_version(
-            session, tenant_id, contract.id, make_contract_version(payer_id=payer_id)
+            session, org_id, contract.id, make_contract_version(payer_id=payer_id)
         )
         version_id = version.id
-    return tenant_id, version_id
+    return user_id, facility_id, version_id
 
 
 def _seed_finding(
     session_factory: sessionmaker[Session],
-    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    facility_id: uuid.UUID,
     contract_version_id: uuid.UUID,
     *,
     root_cause: RootCause = RootCause.MPPR_NOT_APPLIED,
     shortfall: str = "50.00",
 ) -> uuid.UUID:
-    with tenant_session(session_factory, tenant_id) as session:
+    with access_session(session_factory, user_id) as session:
         remittance, _ = repository.record_remittance_if_new(
-            session, tenant_id, uuid.uuid4().hex, source="test", uploaded_by="test-actor"
+            session, facility_id, uuid.uuid4().hex, source="test", uploaded_by="test-actor"
         )
         claim = repository.create_claim(
             session,
-            tenant_id,
+            facility_id,
             remittance.id,
             patient_control_number=f"PCN-{uuid.uuid4().hex[:8]}",
             payer_claim_control_number=f"PAYERCTRL-{uuid.uuid4().hex[:8]}",
@@ -74,7 +79,7 @@ def _seed_finding(
         )
         line = repository.create_service_line(
             session,
-            tenant_id,
+            facility_id,
             claim.id,
             line_index=0,
             procedure_code=_PROCEDURE_CODE,
@@ -96,21 +101,23 @@ def _seed_finding(
             evidence="synthetic test evidence",
         )
         rows = repository.save_findings(
-            session, tenant_id, claim.id, {0: line.id}, contract_version_id, [finding]
+            session, facility_id, claim.id, {0: line.id}, contract_version_id, [finding]
         )
     return rows[0].id
 
 
 def test_record_finding_outcome_persists_all_fields(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, version_id = _seed_tenant_with_contract(app_session_factory, "PAYER-RECORD")
-    finding_id = _seed_finding(app_session_factory, tenant_id, version_id)
+    user_id, facility_id, version_id = _seed_facility_with_contract(
+        owner_engine, app_session_factory, "PAYER-RECORD"
+    )
+    finding_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         updated = repository.record_finding_outcome(
             session,
-            tenant_id,
+            facility_id,
             finding_id,
             outcome="recovered",
             amount_recovered=Decimal("45.00"),
@@ -122,31 +129,39 @@ def test_record_finding_outcome_persists_all_fields(
     assert updated.outcome_recorded_by == _RECORDED_BY
     assert updated.outcome_recorded_at is not None
 
-    with tenant_session(app_session_factory, tenant_id) as session:
-        detail = repository.get_finding_detail(session, tenant_id, finding_id)
+    with access_session(app_session_factory, user_id) as session:
+        detail = repository.get_finding_detail(session, facility_id, finding_id)
     assert detail is not None
     assert detail.finding.outcome == "recovered"
 
 
 def test_list_historical_outcomes_filters_by_payer_root_cause_and_outcome_set(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, version_id = _seed_tenant_with_contract(app_session_factory, "PAYER-HISTORY")
-    other_tenant_id, other_version_id = _seed_tenant_with_contract(
-        app_session_factory, "PAYER-HISTORY-OTHER"
+    user_id, facility_id, version_id = _seed_facility_with_contract(
+        owner_engine, app_session_factory, "PAYER-HISTORY"
+    )
+    other_user_id, other_facility_id, other_version_id = _seed_facility_with_contract(
+        owner_engine, app_session_factory, "PAYER-HISTORY-OTHER"
     )
 
-    decided_id = _seed_finding(app_session_factory, tenant_id, version_id)
-    undecided_id = _seed_finding(app_session_factory, tenant_id, version_id)
+    decided_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
+    undecided_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
     different_root_cause_id = _seed_finding(
-        app_session_factory, tenant_id, version_id, root_cause=RootCause.DUPLICATE_LINE
+        app_session_factory,
+        user_id,
+        facility_id,
+        version_id,
+        root_cause=RootCause.DUPLICATE_LINE,
     )
-    different_payer_id = _seed_finding(app_session_factory, other_tenant_id, other_version_id)
+    different_payer_id = _seed_finding(
+        app_session_factory, other_user_id, other_facility_id, other_version_id
+    )
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         repository.record_finding_outcome(
             session,
-            tenant_id,
+            facility_id,
             decided_id,
             outcome="recovered",
             amount_recovered=Decimal("50.00"),
@@ -154,25 +169,25 @@ def test_list_historical_outcomes_filters_by_payer_root_cause_and_outcome_set(
         )
         repository.record_finding_outcome(
             session,
-            tenant_id,
+            facility_id,
             different_root_cause_id,
             outcome="denied",
             amount_recovered=None,
             recorded_by=_RECORDED_BY,
         )
-    with tenant_session(app_session_factory, other_tenant_id) as session:
+    with access_session(app_session_factory, other_user_id) as session:
         repository.record_finding_outcome(
             session,
-            other_tenant_id,
+            other_facility_id,
             different_payer_id,
             outcome="recovered",
             amount_recovered=Decimal("50.00"),
             recorded_by=_RECORDED_BY,
         )
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         historical = repository.list_historical_outcomes(
-            session, tenant_id, "PAYER-HISTORY", RootCause.MPPR_NOT_APPLIED.name
+            session, facility_id, "PAYER-HISTORY", RootCause.MPPR_NOT_APPLIED.name
         )
 
     historical_ids = {row.id for row in historical}
@@ -183,20 +198,22 @@ def test_list_historical_outcomes_filters_by_payer_root_cause_and_outcome_set(
 
 
 def test_list_findings_past_deadline_without_outcome(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, version_id = _seed_tenant_with_contract(app_session_factory, "PAYER-DEADLINE")
+    user_id, facility_id, version_id = _seed_facility_with_contract(
+        owner_engine, app_session_factory, "PAYER-DEADLINE"
+    )
     today = date(2026, 6, 1)
     past_deadline = today - timedelta(days=10)
     future_deadline = today + timedelta(days=10)
 
-    past_no_outcome_id = _seed_finding(app_session_factory, tenant_id, version_id)
-    past_with_outcome_id = _seed_finding(app_session_factory, tenant_id, version_id)
-    future_deadline_id = _seed_finding(app_session_factory, tenant_id, version_id)
-    no_packet_id = _seed_finding(app_session_factory, tenant_id, version_id)
-    draft_packet_id = _seed_finding(app_session_factory, tenant_id, version_id)
+    past_no_outcome_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
+    past_with_outcome_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
+    future_deadline_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
+    no_packet_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
+    draft_packet_id = _seed_finding(app_session_factory, user_id, facility_id, version_id)
 
-    with tenant_session(app_session_factory, tenant_id) as session:
+    with access_session(app_session_factory, user_id) as session:
         for finding_id, deadline in (
             (past_no_outcome_id, past_deadline),
             (past_with_outcome_id, past_deadline),
@@ -204,18 +221,18 @@ def test_list_findings_past_deadline_without_outcome(
         ):
             packet = repository.create_recovery_packet(
                 session,
-                tenant_id,
+                facility_id,
                 finding_id,
                 draft_text="synthetic draft",
                 deadline=deadline,
                 generated_by=_RECORDED_BY,
             )
             repository.decide_recovery_packet(
-                session, tenant_id, packet.id, approve=True, decided_by=_RECORDED_BY
+                session, facility_id, packet.id, approve=True, decided_by=_RECORDED_BY
             )
         draft_packet = repository.create_recovery_packet(
             session,
-            tenant_id,
+            facility_id,
             draft_packet_id,
             draft_text="synthetic draft",
             deadline=past_deadline,
@@ -226,15 +243,17 @@ def test_list_findings_past_deadline_without_outcome(
 
         repository.record_finding_outcome(
             session,
-            tenant_id,
+            facility_id,
             past_with_outcome_id,
             outcome="recovered",
             amount_recovered=Decimal("50.00"),
             recorded_by=_RECORDED_BY,
         )
 
-    with tenant_session(app_session_factory, tenant_id) as session:
-        overdue = repository.list_findings_past_deadline_without_outcome(session, tenant_id, today)
+    with access_session(app_session_factory, user_id) as session:
+        overdue = repository.list_findings_past_deadline_without_outcome(
+            session, facility_id, today
+        )
 
     overdue_ids = {row.id for row in overdue}
     assert overdue_ids == {past_no_outcome_id}

@@ -102,7 +102,7 @@ def noop_instruments() -> Instruments:
 def record_ingestion_outcome(
     instruments: Instruments,
     *,
-    tenant_id: str,
+    facility_id: str,
     status: str,
     latency_ms: float,
     dollars_detected: Decimal,
@@ -110,10 +110,10 @@ def record_ingestion_outcome(
 ) -> None:
     instruments.ingestion_latency_ms.record(latency_ms, {"status": status})
     if status == "quarantined":
-        instruments.ingestion_failures.add(1, {"tenant_id": tenant_id})
+        instruments.ingestion_failures.add(1, {"facility_id": facility_id})
     if dollars_detected > 0:
-        instruments.dollars_detected.add(float(dollars_detected), {"tenant_id": tenant_id})
-    instruments.findings_per_remittance.record(findings_created, {"tenant_id": tenant_id})
+        instruments.dollars_detected.add(float(dollars_detected), {"facility_id": facility_id})
+    instruments.findings_per_remittance.record(findings_created, {"facility_id": facility_id})
 
 
 def record_llm_usage(

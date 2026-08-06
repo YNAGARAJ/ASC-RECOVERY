@@ -1,8 +1,17 @@
-"""In-memory `Repository` fake -- tenant-partitioned storage implementing
-the same `api.repository.Repository` Protocol `PostgresRepository` does.
-This is what lets the full role x endpoint x tenant authorization matrix
-run as real, passing tests without a live Postgres (the same trick
-`ingestion.plan`/`apply` used in Phase 5).
+"""In-memory `Repository` fake -- facility/org-partitioned storage
+implementing the same `api.repository.Repository` Protocol
+`PostgresRepository` does. This is what lets the full role x endpoint x
+facility authorization matrix run as real, passing tests without a live
+Postgres (the same trick `ingestion.plan`/`apply` used in Phase 5).
+
+Access resolution here (`_accessible_facility_ids`/`_accessible_org_ids`)
+mirrors `resolve_accessible_facility_ids`/`resolve_accessible_org_ids`
+(`alembic/versions/0001_initial_schema.py`) closely enough to exercise
+API-layer wiring (routes, auth, masking) -- it is not a substitute for
+`tests/db/test_rls_tenant_isolation.py`'s proof that RLS itself, at the
+database, is what actually blocks a cross-facility read (register finding
+B-50 already documents this as an accepted gap in what the runnable
+suite alone can prove).
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome
 from ingestion.virus_scan import VirusScanner
 from security.passwords import hash_password
+from security.phi_masking import mask_patient_fields
+from security.rbac import Role
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
 
@@ -43,10 +54,25 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class _Membership:
+    id: uuid.UUID
+    user_id: uuid.UUID
+    org_id: uuid.UUID
+    role: str
+    scope: str
+    facility_ids: frozenset[uuid.UUID]
+
+
 @dataclass
 class FakeRepository:
     users: dict[str, UserRecord] = field(default_factory=dict)
     login_credentials: dict[str, LoginCredentials] = field(default_factory=dict)
+    # org_id -> parent_org_id (None for a root org)
+    organizations: dict[uuid.UUID, uuid.UUID | None] = field(default_factory=dict)
+    # facility_id -> org_id
+    facilities: dict[uuid.UUID, uuid.UUID] = field(default_factory=dict)
+    memberships: list[_Membership] = field(default_factory=list)
     findings: dict[uuid.UUID, tuple[uuid.UUID, FindingDetail]] = field(default_factory=dict)
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
@@ -58,31 +84,136 @@ class FakeRepository:
 
     # --- seeding helpers, test-only -------------------------------------
 
-    def seed_user(self, subject: str, *, tenant_id: uuid.UUID, role: str) -> None:
-        self.users[subject] = UserRecord(tenant_id=tenant_id, role=role, subject=subject)
+    def seed_user(self, subject: str) -> uuid.UUID:
+        user_id = uuid.uuid4()
+        self.users[subject] = UserRecord(id=user_id, subject=subject)
+        return user_id
+
+    def seed_organization(
+        self, *, parent_org_id: uuid.UUID | None = None, org_id: uuid.UUID | None = None
+    ) -> uuid.UUID:
+        org_id = org_id or uuid.uuid4()
+        self.organizations[org_id] = parent_org_id
+        return org_id
+
+    def seed_facility(
+        self, org_id: uuid.UUID, *, facility_id: uuid.UUID | None = None
+    ) -> uuid.UUID:
+        facility_id = facility_id or uuid.uuid4()
+        self.facilities[facility_id] = org_id
+        return facility_id
+
+    def seed_membership(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        role: Role | str,
+        scope: str = "ALL_FACILITIES",
+        facility_ids: frozenset[uuid.UUID] = frozenset(),
+    ) -> uuid.UUID:
+        membership_id = uuid.uuid4()
+        role_value = role.value if isinstance(role, Role) else role
+        self.memberships.append(
+            _Membership(
+                id=membership_id,
+                user_id=user_id,
+                org_id=org_id,
+                role=role_value,
+                scope=scope,
+                facility_ids=facility_ids,
+            )
+        )
+        return membership_id
 
     def seed_login_credentials(
-        self, subject: str, *, role: str, password: str | None, mfa_secret: str | None
+        self, subject: str, *, password: str | None, mfa_secret: str | None
     ) -> None:
         """`password=None`/`mfa_secret=None` seeds an unprovisioned
         credential (matching a NULL DB column) -- tests use that to prove
         the login route rejects it the same as a wrong value."""
+        user = self.users.get(subject)
+        default_org_id = self._default_membership_org_id(user.id) if user is not None else None
         self.login_credentials[subject] = LoginCredentials(
+            user_id=user.id if user is not None else uuid.uuid4(),
             subject=subject,
-            role=role,
             password_hash=None if password is None else hash_password(password),
             mfa_secret=mfa_secret,
+            default_org_id=default_org_id,
         )
 
-    def seed_finding(self, tenant_id: uuid.UUID, detail: FindingDetail) -> uuid.UUID:
-        self.findings[detail.summary.id] = (tenant_id, detail)
+    def seed_finding(self, facility_id: uuid.UUID, detail: FindingDetail) -> uuid.UUID:
+        self.findings[detail.summary.id] = (facility_id, detail)
         return detail.summary.id
 
-    def seed_contract(self, tenant_id: uuid.UUID, summary: ContractSummary) -> None:
-        self.contracts[summary.id] = (tenant_id, summary)
+    def seed_contract(self, org_id: uuid.UUID, summary: ContractSummary) -> None:
+        self.contracts[summary.id] = (org_id, summary)
 
-    def seed_audit_entry(self, tenant_id: uuid.UUID, entry: AuditLogEntry) -> None:
-        self.audit_entries[entry.id] = (tenant_id, entry)
+    def seed_audit_entry(self, facility_id: uuid.UUID, entry: AuditLogEntry) -> None:
+        self.audit_entries[entry.id] = (facility_id, entry)
+
+    # --- access resolution, mirrors alembic/versions/0001_initial_schema.py --
+
+    def _descendant_org_ids(self, root_org_id: uuid.UUID) -> set[uuid.UUID]:
+        result = {root_org_id}
+        changed = True
+        while changed:
+            changed = False
+            for org_id, parent_id in self.organizations.items():
+                if parent_id in result and org_id not in result:
+                    result.add(org_id)
+                    changed = True
+        return result
+
+    def _accessible_org_ids(self, user_id: uuid.UUID) -> set[uuid.UUID]:
+        result: set[uuid.UUID] = set()
+        for m in self.memberships:
+            if m.user_id == user_id:
+                result |= self._descendant_org_ids(m.org_id)
+        return result
+
+    def _accessible_facility_ids(self, user_id: uuid.UUID) -> set[uuid.UUID]:
+        result: set[uuid.UUID] = set()
+        for m in self.memberships:
+            if m.user_id != user_id:
+                continue
+            if m.scope == "SPECIFIC_FACILITIES":
+                result |= m.facility_ids
+                continue
+            accessible_orgs = self._descendant_org_ids(m.org_id)
+            result |= {
+                facility_id
+                for facility_id, org_id in self.facilities.items()
+                if org_id in accessible_orgs
+            }
+        return result
+
+    def _default_membership_org_id(self, user_id: uuid.UUID) -> uuid.UUID | None:
+        for m in self.memberships:
+            if m.user_id == user_id:
+                return m.org_id
+        return None
+
+    def resolve_membership_role(self, user_id: uuid.UUID, org_id: uuid.UUID) -> Role | None:
+        """Walks from `org_id` up through `organizations` looking for the
+        nearest membership -- mirrors db.repository.resolve_membership_role."""
+        current: uuid.UUID | None = org_id
+        visited: set[uuid.UUID] = set()
+        for _ in range(20):
+            if current is None or current in visited:
+                return None
+            visited.add(current)
+            for m in self.memberships:
+                if m.user_id == user_id and m.org_id == current:
+                    return Role(m.role)
+            current = self.organizations.get(current)
+        return None
+
+    def resolve_default_facility_id(
+        self, user_id: uuid.UUID, org_id: uuid.UUID
+    ) -> uuid.UUID | None:
+        matches = [fid for fid, oid in self.facilities.items() if oid == org_id]
+        return matches[0] if len(matches) == 1 else None
 
     # --- Repository protocol ---------------------------------------------
 
@@ -97,14 +228,15 @@ class FakeRepository:
 
     def ingest_remittance(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         *,
         content: bytes,
         source: str,
         uploaded_by: str,
         scanner: VirusScanner,
     ) -> IngestionOutcome | DuplicateOutcome:
-        self.ingest_calls.append((tenant_id, content, source, uploaded_by))
+        self.ingest_calls.append((facility_id, content, source, uploaded_by))
         scan_result = scanner.scan(content)
         if not scan_result.clean:
             return IngestionOutcome(
@@ -127,12 +259,13 @@ class FakeRepository:
         )
 
     def list_findings(
-        self, tenant_id: uuid.UUID, *, filters: FindingFilters, page: Page
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: FindingFilters, page: Page
     ) -> PagedResult[FindingSummary]:
+        accessible = self._accessible_facility_ids(user_id)
         items = [
             detail.summary
-            for tid, detail in self.findings.values()
-            if tid == tenant_id
+            for fid, detail in self.findings.values()
+            if fid == facility_id and fid in accessible
         ]
         if filters.root_cause is not None:
             items = [i for i in items if i.root_cause == filters.root_cause]
@@ -145,28 +278,37 @@ class FakeRepository:
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
 
     def get_finding_detail(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        actor: str,
+        role: Role,
     ) -> FindingDetail | None:
         entry = self.findings.get(finding_id)
         if entry is None:
             return None
-        tid, detail = entry
-        if tid != tenant_id:
-            # Cross-tenant lookup by known id must miss, not 403 -- same
+        fid, detail = entry
+        if fid != facility_id or fid not in self._accessible_facility_ids(user_id):
+            # Cross-facility lookup by known id must miss, not 403 -- same
             # IDOR-shaped guarantee tests/db/test_rls_tenant_isolation.py
             # proves at the DB layer.
             return None
         self._record_access(
-            tenant_id,
+            facility_id,
             actor=actor,
             action="finding_detail_view",
             claim_id=detail.summary.claim_id,
             purpose="finding_detail_view",
         )
-        return detail
+        patient_name, patient_member_id = mask_patient_fields(
+            role, patient_name=detail.patient_name, patient_member_id=detail.patient_member_id
+        )
+        return replace(detail, patient_name=patient_name, patient_member_id=patient_member_id)
 
     def _record_access(
-        self, tenant_id: uuid.UUID, *, actor: str, action: str, claim_id: uuid.UUID, purpose: str
+        self, facility_id: uuid.UUID, *, actor: str, action: str, claim_id: uuid.UUID, purpose: str
     ) -> None:
         event = AccessEventSummary(
             occurred_at=now(),
@@ -176,37 +318,54 @@ class FakeRepository:
             resource_id=str(claim_id),
             purpose=purpose,
         )
-        self.access_events.append((tenant_id, event))
+        self.access_events.append((facility_id, event))
 
-    def list_contracts(self, tenant_id: uuid.UUID, *, page: Page) -> PagedResult[ContractSummary]:
-        items = [summary for tid, summary in self.contracts.values() if tid == tenant_id]
+    def list_contracts(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[ContractSummary]:
+        accessible = self._accessible_org_ids(user_id)
+        items = [
+            summary
+            for oid, summary in self.contracts.values()
+            if oid == org_id and oid in accessible
+        ]
         total = len(items)
         page_items = items[page.offset : page.offset + page.limit]
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
 
     def create_contract(
-        self, tenant_id: uuid.UUID, *, payer_id: str, name: str
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
     ) -> ContractSummary:
         summary = ContractSummary(id=uuid.uuid4(), payer_id=payer_id, name=name, created_at=now())
-        self.contracts[summary.id] = (tenant_id, summary)
+        self.contracts[summary.id] = (org_id, summary)
         return summary
 
     def create_contract_version(
-        self, tenant_id: uuid.UUID, contract_id: uuid.UUID, data: ContractVersionInput
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        contract_id: uuid.UUID,
+        data: ContractVersionInput,
     ) -> uuid.UUID:
         return uuid.uuid4()
 
     def list_audit_log(
-        self, tenant_id: uuid.UUID, *, filters: AuditLogFilters, page: Page
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: AuditLogFilters, page: Page
     ) -> PagedResult[AuditLogEntry]:
-        items = [entry for tid, entry in self.audit_entries.values() if tid == tenant_id]
+        accessible = self._accessible_facility_ids(user_id)
+        items = [
+            entry
+            for fid, entry in self.audit_entries.values()
+            if fid == facility_id and fid in accessible
+        ]
         total = len(items)
         page_items = items[page.offset : page.offset + page.limit]
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
 
     def write_audit_log(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         *,
         actor: str,
         action: str,
@@ -226,21 +385,28 @@ class FakeRepository:
             phi_accessed=phi_accessed,
             request_id=request_id,
         )
-        self.audit_entries[entry.id] = (tenant_id, entry)
+        self.audit_entries[entry.id] = (facility_id, entry)
 
     def generate_packet(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, generated_by: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        *,
+        generated_by: str,
     ) -> RecoveryPacketSummary | None:
-        """Only proves tenant-scoping/state-machine plumbing through the
+        """Only proves facility-scoping/state-machine plumbing through the
         API layer -- the actual currency/PHI-safety logic this stands in
         for is proven directly against `packets.service` in
         tests/packets/, not re-tested redundantly here."""
         entry = self.findings.get(finding_id)
-        if entry is None or entry[0] != tenant_id:
+        if entry is None or entry[0] != facility_id or facility_id not in (
+            self._accessible_facility_ids(user_id)
+        ):
             return None
         _, detail = entry
         self._record_access(
-            tenant_id,
+            facility_id,
             actor=generated_by,
             action="packet_generation",
             claim_id=detail.summary.claim_id,
@@ -257,16 +423,17 @@ class FakeRepository:
             decided_by=None,
             decided_at=None,
         )
-        self.packets[packet.id] = (tenant_id, packet)
+        self.packets[packet.id] = (facility_id, packet)
         return packet
 
     def list_packets(
-        self, tenant_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, finding_id: uuid.UUID, *, actor: str
     ) -> list[RecoveryPacketSummary]:
+        accessible = self._accessible_facility_ids(user_id)
         entry = self.findings.get(finding_id)
-        if entry is not None and entry[0] == tenant_id:
+        if entry is not None and entry[0] == facility_id and facility_id in accessible:
             self._record_access(
-                tenant_id,
+                facility_id,
                 actor=actor,
                 action="packet_list_view",
                 claim_id=entry[1].summary.claim_id,
@@ -274,25 +441,34 @@ class FakeRepository:
             )
         return [
             packet
-            for tid, packet in self.packets.values()
-            if tid == tenant_id and packet.finding_id == finding_id
+            for fid, packet in self.packets.values()
+            if fid == facility_id and fid in accessible and packet.finding_id == finding_id
         ]
 
     def get_claim_access_history(
-        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, claim_id: uuid.UUID
     ) -> tuple[AccessEventSummary, ...]:
+        accessible = self._accessible_facility_ids(user_id)
         events = [
             event
-            for tid, event in self.access_events
-            if tid == tenant_id and event.resource_id == str(claim_id)
+            for fid, event in self.access_events
+            if fid == facility_id and fid in accessible and event.resource_id == str(claim_id)
         ]
         return tuple(sorted(events, key=lambda event: event.occurred_at))
 
     def decide_packet(
-        self, tenant_id: uuid.UUID, packet_id: uuid.UUID, *, approve: bool, decided_by: str
+        self,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
+        packet_id: uuid.UUID,
+        *,
+        approve: bool,
+        decided_by: str,
     ) -> RecoveryPacketSummary | None:
         entry = self.packets.get(packet_id)
-        if entry is None or entry[0] != tenant_id:
+        if entry is None or entry[0] != facility_id or facility_id not in (
+            self._accessible_facility_ids(user_id)
+        ):
             return None
         _, packet = entry
         updated = replace(
@@ -301,19 +477,22 @@ class FakeRepository:
             decided_by=decided_by,
             decided_at=now(),
         )
-        self.packets[packet_id] = (tenant_id, updated)
+        self.packets[packet_id] = (facility_id, updated)
         return updated
 
     def record_finding_outcome(
         self,
-        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        facility_id: uuid.UUID,
         finding_id: uuid.UUID,
         *,
         data: RecordOutcomeInput,
         recorded_by: str,
     ) -> FindingSummary | None:
         entry = self.findings.get(finding_id)
-        if entry is None or entry[0] != tenant_id:
+        if entry is None or entry[0] != facility_id or facility_id not in (
+            self._accessible_facility_ids(user_id)
+        ):
             return None
         _, detail = entry
         existing_outcome = Outcome(detail.summary.outcome) if detail.summary.outcome else None
@@ -325,5 +504,5 @@ class FakeRepository:
             outcome_recorded_by=recorded_by,
             outcome_recorded_at=now(),
         )
-        self.findings[finding_id] = (tenant_id, replace(detail, summary=updated_summary))
+        self.findings[finding_id] = (facility_id, replace(detail, summary=updated_summary))
         return updated_summary

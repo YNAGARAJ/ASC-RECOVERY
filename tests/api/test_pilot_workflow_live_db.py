@@ -22,18 +22,21 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from api.app import create_app
 from api.repository import PostgresRepository
 from db import repository as db_repository
+from db.access import access_session
 from db.base import make_engine, make_session_factory
-from db.tenancy import tenant_session
+from db.models import User as UserModel
 from ingestion.pipeline import ingest_file
 from ingestion.virus_scan import EicarAwareScanner
 from packets.drafter import ScriptedPacketDrafter
 from security.rbac import Role
 from security.session import issue_session
+from tests.db.conftest import seed_org_facility_user
 from tests.domain.fixtures_x835 import (
     ELEMENT_SEP,
     SUB_ELEMENT_SEP,
@@ -47,6 +50,7 @@ from tests.ingestion.conftest import make_test_encryptor
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+OWNER_DATABASE_URL = os.environ.get("DATABASE_URL")
 JWT_SECRET = "test-only-secret-never-use-in-production"
 _TEST_ENCRYPTOR = make_test_encryptor()
 
@@ -65,6 +69,14 @@ def app_session_factory() -> sessionmaker[Session]:
     _require_database_url()
     assert TEST_DATABASE_URL is not None
     return make_session_factory(make_engine(TEST_DATABASE_URL))
+
+
+@pytest.fixture(scope="session")
+def owner_engine() -> Engine:
+    _require_database_url()
+    url = OWNER_DATABASE_URL or TEST_DATABASE_URL
+    assert url is not None
+    return make_engine(url)
 
 
 def _synthetic_claim_835(claim_control_number: str, payer_claim_control_number: str) -> str:
@@ -128,36 +140,47 @@ def _synthetic_claim_835(claim_control_number: str, payer_claim_control_number: 
     return assemble(segments)
 
 
-def _onboard_tenant(session_factory: sessionmaker[Session]) -> tuple[uuid.UUID, str]:
-    """Mirrors scripts/onboard_customer.py's shape (create the tenant, its
-    first admin user, an initial contract + fee-schedule version) as a
-    function rather than by shelling out to the script, so this test can
-    inspect the resulting ids directly."""
-    subject = f"pilot-admin-{uuid.uuid4().hex[:12]}"
-    with session_factory() as session, session.begin():
-        tenant = db_repository.create_tenant(session, f"Pilot ASC {uuid.uuid4()}")
-        db_repository.create_user(session, tenant.id, subject=subject, role=Role.BILLER.value)
-        tenant_id = tenant.id
+def _onboard_tenant(
+    owner_engine: Engine, session_factory: sessionmaker[Session]
+) -> tuple[uuid.UUID, uuid.UUID, str]:
+    """Mirrors scripts/onboard_customer.py's shape (create the org,
+    facility, first admin user + membership, an initial contract +
+    fee-schedule version) as a function rather than by shelling out to
+    the script, so this test can inspect the resulting ids directly.
+    Returns `(org_id, facility_id, subject)`."""
+    user_id, org_id, facility_id = seed_org_facility_user(
+        owner_engine, "Pilot ASC", role=Role.BILLER
+    )
 
-    with tenant_session(session_factory, tenant_id) as session:
+    with access_session(session_factory, user_id) as session:
         contract = db_repository.create_contract(
-            session, tenant_id, TEST_PAYER, "Pilot payer contract"
+            session, org_id, TEST_PAYER, "Pilot payer contract"
         )
         db_repository.create_contract_version(
-            session, tenant_id, contract.id, make_contract_version()
+            session, org_id, contract.id, make_contract_version()
         )
-    return tenant_id, subject
+
+    with session_factory() as session:
+        row = session.get(UserModel, user_id)
+        assert row is not None
+        subject = row.subject
+
+    return org_id, facility_id, subject
 
 
 def _ingest_quarter(
-    session_factory: sessionmaker[Session], tenant_id: uuid.UUID, subject: str, count: int
+    session_factory: sessionmaker[Session],
+    user_id: uuid.UUID,
+    facility_id: uuid.UUID,
+    subject: str,
+    count: int,
 ) -> None:
-    with tenant_session(session_factory, tenant_id) as session:
+    with access_session(session_factory, user_id) as session:
         for i in range(count):
             content = _synthetic_claim_835(f"QCLAIM{i:04d}", f"QPAYERCTRL{i:04d}").encode("utf-8")
             outcome = ingest_file(
                 session,
-                tenant_id,
+                facility_id,
                 content=content,
                 source="upload",
                 uploaded_by=subject,
@@ -167,24 +190,27 @@ def _ingest_quarter(
             assert outcome.status == "ingested"  # type: ignore[union-attr]
 
 
-def _auth_headers(subject: str) -> dict[str, str]:
-    tokens = issue_session(JWT_SECRET, subject, Role.BILLER, mfa_verified=True)
+def _auth_headers(subject: str, org_id: uuid.UUID) -> dict[str, str]:
+    tokens = issue_session(JWT_SECRET, subject, str(org_id), mfa_verified=True)
     return {"Authorization": f"Bearer {tokens.access_token}"}
 
 
 def test_pilot_workflow_confidence_score_reflects_recorded_outcomes(
-    app_session_factory: sessionmaker[Session],
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
 ) -> None:
-    tenant_id, subject = _onboard_tenant(app_session_factory)
-    _ingest_quarter(app_session_factory, tenant_id, subject, count=3)
+    org_id, facility_id, subject = _onboard_tenant(owner_engine, app_session_factory)
 
     repository = PostgresRepository(
         app_session_factory, drafter=ScriptedPacketDrafter([]), encryptor=_TEST_ENCRYPTOR
     )
+    user = repository.get_user_by_subject(subject)
+    assert user is not None
+    _ingest_quarter(app_session_factory, user.id, facility_id, subject, count=3)
+
     app = create_app(repository=repository, jwt_secret_key=JWT_SECRET)
     client = TestClient(app)
 
-    report = client.get("/findings", headers=_auth_headers(subject))
+    report = client.get("/findings", headers=_auth_headers(subject, org_id))
     assert report.status_code == 200
     assert report.json()["page"]["total"] == 3
     finding_ids = [item["id"] for item in report.json()["items"]]
@@ -192,13 +218,15 @@ def test_pilot_workflow_confidence_score_reflects_recorded_outcomes(
     # Before any outcome is recorded, there's no decided history yet for
     # this payer/root_cause -- confidence is honestly None, never a
     # fabricated default.
-    fresh_detail = client.get(f"/findings/{finding_ids[0]}", headers=_auth_headers(subject))
+    fresh_detail = client.get(
+        f"/findings/{finding_ids[0]}", headers=_auth_headers(subject, org_id)
+    )
     assert fresh_detail.status_code == 200
     assert fresh_detail.json()["confidence_score"] is None
 
     recovered = client.post(
         f"/findings/{finding_ids[0]}/outcome",
-        headers=_auth_headers(subject),
+        headers=_auth_headers(subject, org_id),
         json={"outcome": "recovered", "amount_recovered": "50.00"},
     )
     assert recovered.status_code == 200
@@ -206,7 +234,7 @@ def test_pilot_workflow_confidence_score_reflects_recorded_outcomes(
 
     denied = client.post(
         f"/findings/{finding_ids[1]}/outcome",
-        headers=_auth_headers(subject),
+        headers=_auth_headers(subject, org_id),
         json={"outcome": "denied"},
     )
     assert denied.status_code == 200
@@ -215,19 +243,23 @@ def test_pilot_workflow_confidence_score_reflects_recorded_outcomes(
     # The third, still-undecided finding now has two historical outcomes
     # for the same payer/root_cause to learn from: one recovered, one
     # denied -- 1/2.
-    third_detail = client.get(f"/findings/{finding_ids[2]}", headers=_auth_headers(subject))
+    third_detail = client.get(
+        f"/findings/{finding_ids[2]}", headers=_auth_headers(subject, org_id)
+    )
     assert third_detail.json()["confidence_score"] == "0.5"
 
     # The first finding's own confidence score excludes itself from its
     # own history -- only the second (denied) finding counts, so 0.
-    first_detail = client.get(f"/findings/{finding_ids[0]}", headers=_auth_headers(subject))
+    first_detail = client.get(
+        f"/findings/{finding_ids[0]}", headers=_auth_headers(subject, org_id)
+    )
     assert first_detail.json()["confidence_score"] == "0"
 
     # Recording an outcome twice on the same finding is rejected, not
     # silently overwritten -- domain.outcomes.OutcomeAlreadyRecordedError.
     repeat = client.post(
         f"/findings/{finding_ids[0]}/outcome",
-        headers=_auth_headers(subject),
+        headers=_auth_headers(subject, org_id),
         json={"outcome": "abandoned"},
     )
     assert repeat.status_code == 409

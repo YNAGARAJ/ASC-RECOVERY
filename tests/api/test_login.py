@@ -30,10 +30,26 @@ def _totp_code(secret: str) -> str:
     return pyotp.TOTP(secret).now()
 
 
+def _seed_credentials(
+    repo: FakeRepository,
+    subject: str,
+    *,
+    password: str | None,
+    mfa_secret: str | None,
+) -> None:
+    """A membership (org + facility + role) must exist before login
+    credentials do -- `LoginCredentials.default_org_id` (what
+    `POST /auth/login` scopes the issued session to) comes from resolving
+    the subject's oldest membership, same as the real repository."""
+    user_id = repo.seed_user(subject)
+    org_id = repo.seed_organization()
+    repo.seed_facility(org_id)
+    repo.seed_membership(user_id, org_id, role=Role.BILLER)
+    repo.seed_login_credentials(subject, password=password, mfa_secret=mfa_secret)
+
+
 def _seed_full_credentials(repo: FakeRepository, mfa_secret: str) -> None:
-    repo.seed_login_credentials(
-        _SUBJECT, role=Role.BILLER.value, password=_PASSWORD, mfa_secret=mfa_secret
-    )
+    _seed_credentials(repo, _SUBJECT, password=_PASSWORD, mfa_secret=mfa_secret)
 
 
 def test_login_succeeds_with_correct_password_and_totp_code(
@@ -51,7 +67,7 @@ def test_login_succeeds_with_correct_password_and_totp_code(
     assert body["token_type"] == "bearer"
     claims = validate_access_token(JWT_SECRET, body["access_token"])
     assert claims.user_id == _SUBJECT
-    assert claims.role == Role.BILLER
+    assert claims.active_org_id  # a session was actually scoped to something
 
 
 def test_login_rejects_wrong_password(
@@ -94,9 +110,7 @@ def test_login_rejects_unknown_subject(client: TestClient) -> None:
 def test_login_rejects_a_user_with_no_password_provisioned(
     client: TestClient, repo: FakeRepository, mfa_secret: str
 ) -> None:
-    repo.seed_login_credentials(
-        _SUBJECT, role=Role.BILLER.value, password=None, mfa_secret=mfa_secret
-    )
+    _seed_credentials(repo, _SUBJECT, password=None, mfa_secret=mfa_secret)
 
     response = client.post(
         "/auth/login",
@@ -109,9 +123,7 @@ def test_login_rejects_a_user_with_no_password_provisioned(
 def test_login_rejects_a_user_not_enrolled_in_mfa(
     client: TestClient, repo: FakeRepository
 ) -> None:
-    repo.seed_login_credentials(
-        _SUBJECT, role=Role.BILLER.value, password=_PASSWORD, mfa_secret=None
-    )
+    _seed_credentials(repo, _SUBJECT, password=_PASSWORD, mfa_secret=None)
 
     response = client.post(
         "/auth/login",
@@ -204,9 +216,7 @@ def test_lockout_is_scoped_to_the_subject(
     other_subject = "other-biller@example.com"
     other_mfa_secret = generate_enrollment_secret()
     _seed_full_credentials(repo, mfa_secret)
-    repo.seed_login_credentials(
-        other_subject, role=Role.BILLER.value, password=_PASSWORD, mfa_secret=other_mfa_secret
-    )
+    _seed_credentials(repo, other_subject, password=_PASSWORD, mfa_secret=other_mfa_secret)
 
     wrong = {"subject": _SUBJECT, "password": "wrong", "totp_code": _totp_code(mfa_secret)}
     for _ in range(5):

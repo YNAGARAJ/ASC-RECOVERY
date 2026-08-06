@@ -25,7 +25,7 @@ def test_ingestion_outcome_records_latency_dollars_and_finding_count() -> None:
 
     record_ingestion_outcome(
         instruments,
-        tenant_id="tenant-a",
+        facility_id="tenant-a",
         status="ingested",
         latency_ms=123.4,
         dollars_detected=Decimal("250.50"),
@@ -52,7 +52,7 @@ def test_quarantined_ingestion_increments_failure_counter() -> None:
 
     record_ingestion_outcome(
         instruments,
-        tenant_id="tenant-a",
+        facility_id="tenant-a",
         status="quarantined",
         latency_ms=10.0,
         dollars_detected=Decimal("0.00"),
