@@ -15,6 +15,7 @@ from api.rate_limit import default_rate_limiter
 from api.repository import Repository
 from api.request_context import RequestIDMiddleware
 from api.routes import audit, auth, contracts, findings, health, packets, remittances
+from api.security_headers import SecurityHeadersMiddleware
 from security.rate_limit import AccountLockoutTracker, RateLimiter
 
 
@@ -40,6 +41,7 @@ def create_app(
     )
 
     app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
     register_exception_handlers(app)
 
     app.include_router(health.router)
