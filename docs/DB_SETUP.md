@@ -31,9 +31,14 @@ exposed beyond localhost. Real secret management is Phase 4/9 scope.
 ## Run migrations
 
 ```bash
-export DATABASE_URL="postgresql+psycopg://asc_owner:asc_owner_dev_password@localhost:5432/asc_recovery"
+export DATABASE_URL="postgresql+psycopg://asc_owner:asc_owner_dev_password@localhost:5432/asc_recovery?sslmode=disable"
 alembic upgrade head
 ```
+
+`sslmode=disable` is explicit, not an oversight -- `db.base.make_engine`
+(F-07, `docs/audit/REGISTER.md`) now defaults to `sslmode=require`
+whenever a `DATABASE_URL` omits `sslmode` entirely, and this local
+`docker compose` Postgres has no TLS configured at all.
 
 Migrations run as `asc_owner` (the table owner) so `GRANT`/`REVOKE` and
 `ENABLE ROW LEVEL SECURITY` statements succeed.
@@ -41,7 +46,7 @@ Migrations run as `asc_owner` (the table owner) so `GRANT`/`REVOKE` and
 ## Run the DB test suite
 
 ```bash
-export TEST_DATABASE_URL="postgresql+psycopg://asc_app:asc_app_dev_password@localhost:5432/asc_recovery"
+export TEST_DATABASE_URL="postgresql+psycopg://asc_app:asc_app_dev_password@localhost:5432/asc_recovery?sslmode=disable"
 pytest tests/db/ -v
 ```
 

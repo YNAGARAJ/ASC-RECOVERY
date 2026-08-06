@@ -35,6 +35,7 @@ jobs:
   deploy-staging-aws:
     if: >-
       secrets.AWS_DEPLOY_ROLE_ARN != '' &&
+      secrets.AWS_ACM_CERTIFICATE_ARN != '' &&
       (github.event_name == 'workflow_dispatch' && inputs.cloud == 'aws' ||
        github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
@@ -67,7 +68,8 @@ jobs:
           terraform workspace select -or-create staging
           terraform apply -auto-approve \
             -var="environment=staging" \
-            -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}"
+            -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}" \
+            -var="certificate_arn=${{ secrets.AWS_ACM_CERTIFICATE_ARN }}"
           echo "app_url=$(terraform output -raw container_service_endpoint)" >> "$GITHUB_OUTPUT"
       # F-03 (docs/audit/REGISTER.md): without this, a fresh staging
       # database has no asc_app role and no schema -- the smoke test below
@@ -147,7 +149,8 @@ jobs:
           terraform workspace select -or-create production
           terraform apply -auto-approve \
             -var="environment=production" \
-            -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}"
+            -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}" \
+            -var="certificate_arn=${{ secrets.AWS_ACM_CERTIFICATE_ARN }}"
       # F-03 (docs/audit/REGISTER.md) -- same reasoning as the staging job above.
       - name: Bootstrap asc_app role and run migrations
         working-directory: terraform/environments/aws

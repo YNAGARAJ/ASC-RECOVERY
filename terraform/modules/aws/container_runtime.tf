@@ -181,6 +181,20 @@ resource "aws_security_group" "alb" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # F-07 (docs/audit/REGISTER.md): the environment root's port-80
+  # listener (terraform/environments/aws/main.tf) exists only to issue an
+  # HTTP->HTTPS redirect -- it never forwards plaintext traffic to a
+  # target -- but still needs an inbound path to answer on before it can
+  # redirect anything.
+  #tfsec:ignore:aws-ec2-no-public-ingress-sgr
+  ingress {
+    description = "HTTP (redirected to HTTPS by the port-80 listener)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # Scoped to the app security group on the app's own port, not
   # 0.0.0.0/0 -- the ALB only ever needs to reach the Fargate tasks
   # behind it, never the open internet.
@@ -235,7 +249,10 @@ resource "aws_lb_target_group" "app" {
 # HTTPS listener requires an ACM certificate ARN, which requires a
 # domain -- out of scope for this module (supplied by the environment
 # root config once a real domain exists). This module exposes the target
-# group and ALB; the environment wires the listener + certificate.
+# group and ALB (see alb_arn/target_group_arn in outputs.tf); the
+# environment root wires the actual aws_lb_listener resources +
+# certificate -- see terraform/environments/aws/main.tf (F-07,
+# docs/audit/REGISTER.md).
 
 resource "aws_security_group_rule" "alb_to_app" {
   type                     = "ingress"

@@ -23,6 +23,21 @@ output "container_service_endpoint" {
   value       = aws_lb.main.dns_name
 }
 
+# F-07 (docs/audit/REGISTER.md): the environment root attaches the real
+# aws_lb_listener resources to these -- this module provisions the ALB
+# and target group but can't provision the listener itself (needs an
+# ACM certificate ARN, which needs a real domain this module doesn't
+# have). See terraform/environments/aws/main.tf.
+output "alb_arn" {
+  description = "ARN of the ALB -- the environment root's HTTPS/HTTP listeners attach here."
+  value       = aws_lb.main.arn
+}
+
+output "target_group_arn" {
+  description = "ARN of the app's target group -- the environment root's HTTPS listener forwards here."
+  value       = aws_lb_target_group.app.arn
+}
+
 # F-03 (docs/audit/REGISTER.md): the deploy pipeline needs these two to
 # bootstrap the asc_app role and run migrations against a fresh database
 # before anything smoke-tests the service -- see scripts/deploy/migrate.sh

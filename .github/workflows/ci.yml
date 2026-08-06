@@ -81,8 +81,12 @@ jobs:
       PGUSER: asc_owner
       PGPASSWORD: asc_owner_dev_password
       PGDATABASE: asc_recovery
-      DATABASE_URL: postgresql+psycopg://asc_owner:asc_owner_dev_password@localhost:5432/asc_recovery
-      TEST_DATABASE_URL: postgresql+psycopg://asc_app:asc_app_dev_password@localhost:5432/asc_recovery
+      # sslmode=disable is explicit, not an oversight -- db.base.make_engine
+      # (F-07, docs/audit/REGISTER.md) now defaults to sslmode=require
+      # whenever a DATABASE_URL omits sslmode entirely, and this CI
+      # postgres:16 service container has no TLS configured at all.
+      DATABASE_URL: postgresql+psycopg://asc_owner:asc_owner_dev_password@localhost:5432/asc_recovery?sslmode=disable
+      TEST_DATABASE_URL: postgresql+psycopg://asc_app:asc_app_dev_password@localhost:5432/asc_recovery?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

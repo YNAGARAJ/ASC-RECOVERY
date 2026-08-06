@@ -33,7 +33,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: "postgresql+psycopg://asc_app:asc_app_dev_password@postgres:5432/asc_recovery"
+      # sslmode=disable is explicit, not an oversight -- db.base.make_engine
+      # (F-07, docs/audit/REGISTER.md) now defaults to sslmode=require
+      # whenever a DATABASE_URL omits sslmode entirely, and this local
+      # postgres:16 image has no TLS configured at all.
+      DATABASE_URL: "postgresql+psycopg://asc_app:asc_app_dev_password@postgres:5432/asc_recovery?sslmode=disable"
       JWT_SECRET_KEY: "local-dev-jwt-secret-never-use-in-production"
       ANTHROPIC_API_KEY: "replace-with-a-real-key-to-exercise-packet-generation"
       # base64 of 32 zero bytes -- fine for local-only, same "never reused

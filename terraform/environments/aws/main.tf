@@ -42,6 +42,21 @@ variable "environment" {
   default     = "production"
 }
 
+# F-07 (docs/audit/REGISTER.md): without this, module.asc_recovery
+# provisions an ALB with no listener at all -- the AWS deployment target
+# is unreachable end to end, not just missing TLS. No default: an ALB
+# with a listener pointed at a certificate that doesn't exist is worse
+# than failing `terraform plan` with a clear "you must supply this"
+# error. Issuing + validating the certificate itself needs a real
+# Route53-hosted domain, which this build environment doesn't have --
+# out of scope for Terraform authored here to provision; whoever runs
+# this for real supplies an already-issued, already-validated ACM
+# certificate ARN for their own domain.
+variable "certificate_arn" {
+  description = "ACM certificate ARN for the HTTPS listener, already issued and validated in this account/region."
+  type        = string
+}
+
 module "asc_recovery" {
   source = "../../modules/aws"
 
@@ -49,6 +64,40 @@ module "asc_recovery" {
   environment     = var.environment
   region          = var.region
   container_image = var.container_image
+}
+
+# The module exposes the ALB and target group but can't provision the
+# listener itself (see container_runtime.tf's comment) -- these two
+# resources are what actually make the AWS deployment target reachable.
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = module.asc_recovery.alb_arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = module.asc_recovery.target_group_arn
+  }
+}
+
+# Plaintext HTTP is never served -- this listener's only job is the
+# redirect, so port 80 never forwards a request to a target.
+resource "aws_lb_listener" "http_redirect" {
+  load_balancer_arn = module.asc_recovery.alb_arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
 }
 
 output "database_endpoint" {

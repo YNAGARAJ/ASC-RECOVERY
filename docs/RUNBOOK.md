@@ -206,7 +206,12 @@ GitHub):
 3. Add repo secrets: `AWS_DEPLOY_ROLE_ARN` (the role from step 2),
    `AWS_ECR_REPOSITORY` (an ECR repository URI — Terraform doesn't
    provision this; create it once, separately), `AWS_REGION` (optional,
-   defaults to `us-east-1`).
+   defaults to `us-east-1`), `AWS_ACM_CERTIFICATE_ARN` (an ACM
+   certificate for the app's real domain, already issued and validated —
+   Terraform doesn't provision Route53/ACM either, same reasoning as the
+   ECR repository above; without this the AWS deploy jobs stay skipped,
+   same as without `AWS_DEPLOY_ROLE_ARN`, per F-07 in
+   `docs/audit/REGISTER.md`).
 
 **Azure** (federated credentials — same no-static-secrets principle):
 1. Create an Azure AD App Registration with a federated credential
