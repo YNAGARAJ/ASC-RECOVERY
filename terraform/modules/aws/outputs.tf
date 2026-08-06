@@ -22,3 +22,18 @@ output "container_service_endpoint" {
   description = "ALB DNS name the app is reachable at."
   value       = aws_lb.main.dns_name
 }
+
+# F-03 (docs/audit/REGISTER.md): the deploy pipeline needs these two to
+# bootstrap the asc_app role and run migrations against a fresh database
+# before anything smoke-tests the service -- see scripts/deploy/migrate.sh
+# and .github/workflows/deploy.yml.
+output "database_admin_secret_id" {
+  description = "Secrets Manager secret holding the AWS-managed asc_owner (admin) credentials, as {username, password} JSON."
+  value       = aws_db_instance.main.master_user_secret[0].secret_arn
+}
+
+output "app_db_password" {
+  description = "The asc_app role's real, Terraform-generated password."
+  value       = random_password.app_db.result
+  sensitive   = true
+}

@@ -69,6 +69,27 @@ jobs:
             -var="environment=staging" \
             -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}"
           echo "app_url=$(terraform output -raw container_service_endpoint)" >> "$GITHUB_OUTPUT"
+      # F-03 (docs/audit/REGISTER.md): without this, a fresh staging
+      # database has no asc_app role and no schema -- the smoke test below
+      # used to only check /healthz+/readyz, which passed against an empty
+      # database too. /readyz now itself checks alembic_version
+      # (api/repository.py::ping), so this step is what actually makes an
+      # unmigrated deploy fail the gate instead of silently reporting ready.
+      - name: Bootstrap asc_app role and run migrations
+        working-directory: terraform/environments/aws
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client jq
+          admin_secret_arn="$(terraform output -raw database_admin_secret_id)"
+          admin_json="$(aws secretsmanager get-secret-value --secret-id "$admin_secret_arn" --query SecretString --output text)"
+          admin_user="$(echo "$admin_json" | jq -r .username)"
+          admin_pass="$(echo "$admin_json" | jq -r .password)"
+          db_host="$(terraform output -raw database_endpoint)"
+          echo "::add-mask::$admin_pass"
+          export OWNER_DATABASE_URL="postgresql+psycopg://${admin_user}:${admin_pass}@${db_host}/asc_recovery?sslmode=require"
+          app_pass="$(terraform output -raw app_db_password)"
+          echo "::add-mask::$app_pass"
+          export ASC_APP_PASSWORD="$app_pass"
+          bash "$GITHUB_WORKSPACE/scripts/deploy/migrate.sh"
 
   smoke-test-staging-aws:
     needs: deploy-staging-aws
@@ -127,6 +148,22 @@ jobs:
           terraform apply -auto-approve \
             -var="environment=production" \
             -var="container_image=${ECR_REPOSITORY}:${{ github.sha }}"
+      # F-03 (docs/audit/REGISTER.md) -- same reasoning as the staging job above.
+      - name: Bootstrap asc_app role and run migrations
+        working-directory: terraform/environments/aws
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client jq
+          admin_secret_arn="$(terraform output -raw database_admin_secret_id)"
+          admin_json="$(aws secretsmanager get-secret-value --secret-id "$admin_secret_arn" --query SecretString --output text)"
+          admin_user="$(echo "$admin_json" | jq -r .username)"
+          admin_pass="$(echo "$admin_json" | jq -r .password)"
+          db_host="$(terraform output -raw database_endpoint)"
+          echo "::add-mask::$admin_pass"
+          export OWNER_DATABASE_URL="postgresql+psycopg://${admin_user}:${admin_pass}@${db_host}/asc_recovery?sslmode=require"
+          app_pass="$(terraform output -raw app_db_password)"
+          echo "::add-mask::$app_pass"
+          export ASC_APP_PASSWORD="$app_pass"
+          bash "$GITHUB_WORKSPACE/scripts/deploy/migrate.sh"
 
   # -------------------------------------------------------------- Azure ---
   deploy-staging-azure:
@@ -166,6 +203,20 @@ jobs:
             -var="environment=staging" \
             -var="container_image=${ACR_REGISTRY}/asc-recovery:${{ github.sha }}"
           echo "app_url=$(terraform output -raw container_service_endpoint)" >> "$GITHUB_OUTPUT"
+      # F-03 (docs/audit/REGISTER.md) -- same reasoning as the AWS job.
+      - name: Bootstrap asc_app role and run migrations
+        working-directory: terraform/environments/azure
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          admin_user="$(terraform output -raw database_admin_username)"
+          admin_pass="$(terraform output -raw database_admin_password)"
+          db_host="$(terraform output -raw database_endpoint)"
+          echo "::add-mask::$admin_pass"
+          export OWNER_DATABASE_URL="postgresql+psycopg://${admin_user}:${admin_pass}@${db_host}/asc_recovery?sslmode=require"
+          app_pass="$(terraform output -raw app_db_password)"
+          echo "::add-mask::$app_pass"
+          export ASC_APP_PASSWORD="$app_pass"
+          bash "$GITHUB_WORKSPACE/scripts/deploy/migrate.sh"
 
   smoke-test-staging-azure:
     needs: deploy-staging-azure
@@ -219,3 +270,17 @@ jobs:
           terraform apply -auto-approve \
             -var="environment=production" \
             -var="container_image=${ACR_REGISTRY}/asc-recovery:${{ github.sha }}"
+      # F-03 (docs/audit/REGISTER.md) -- same reasoning as the AWS job.
+      - name: Bootstrap asc_app role and run migrations
+        working-directory: terraform/environments/azure
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          admin_user="$(terraform output -raw database_admin_username)"
+          admin_pass="$(terraform output -raw database_admin_password)"
+          db_host="$(terraform output -raw database_endpoint)"
+          echo "::add-mask::$admin_pass"
+          export OWNER_DATABASE_URL="postgresql+psycopg://${admin_user}:${admin_pass}@${db_host}/asc_recovery?sslmode=require"
+          app_pass="$(terraform output -raw app_db_password)"
+          echo "::add-mask::$app_pass"
+          export ASC_APP_PASSWORD="$app_pass"
+          bash "$GITHUB_WORKSPACE/scripts/deploy/migrate.sh"

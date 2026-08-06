@@ -440,11 +440,18 @@ class PostgresRepository:
         self._instruments = instruments
 
     def ping(self) -> bool:
-        """For GET /readyz -- no tenant context needed, just proves the
-        DB is reachable. Any exception here means "not ready", not a
-        crash: callers catch and translate to a 503."""
+        """For GET /readyz -- no tenant context needed. Queries
+        `alembic_version` rather than a bare `SELECT 1`, so this proves
+        both that the DB is reachable AND that migrations have actually
+        run -- a freshly provisioned, unmigrated database (no
+        `alembic_version` table, or an empty one) now correctly reports
+        not-ready instead of a false "ready" that a `SELECT 1` alone would
+        give. This is what makes the existing staging smoke test (which
+        already polls /readyz) catch a deploy that skipped migrations --
+        see F-03, docs/audit/REGISTER.md. Any exception here means "not
+        ready", not a crash: callers catch and translate to a 503."""
         with self._session_factory() as session:
-            session.execute(text("SELECT 1"))
+            session.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).one()
         return True
 
     def get_user_by_subject(self, subject: str) -> UserRecord | None:

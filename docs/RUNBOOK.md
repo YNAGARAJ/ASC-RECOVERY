@@ -197,7 +197,12 @@ GitHub):
    (one per AWS account, if one doesn't already exist for other repos).
 2. Create an IAM role trusting that provider, scoped (via the trust
    policy's `sub` condition) to this repo, with permissions to run
-   `terraform apply` for `terraform/modules/aws` plus ECR push access.
+   `terraform apply` for `terraform/modules/aws` plus ECR push access, plus
+   `secretsmanager:GetSecretValue` on the RDS-managed master-user secret
+   (`aws_db_instance.main.master_user_secret[0].secret_arn`) and on
+   `aws_secretsmanager_secret.app` — needed by `deploy.yml`'s migration
+   step (`scripts/deploy/migrate.sh`, F-03 in `docs/audit/REGISTER.md`) to
+   bootstrap the `asc_app` role and run Alembic against a fresh database.
 3. Add repo secrets: `AWS_DEPLOY_ROLE_ARN` (the role from step 2),
    `AWS_ECR_REPOSITORY` (an ECR repository URI — Terraform doesn't
    provision this; create it once, separately), `AWS_REGION` (optional,
