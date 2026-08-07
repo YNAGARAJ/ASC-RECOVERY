@@ -24,8 +24,12 @@ Python 3.12 · FastAPI · PostgreSQL 16 · SQLAlchemy 2.x · Alembic · Pydantic
    will be read by someone unauthorized.
 7. Cloud-agnostic. No proprietary managed service without an equivalent on
    another cloud.
-8. Multi-tenant. Every query is scoped by `tenant_id`. There is no global
-   read.
+8. Multi-tenant. Every query is scoped by resolved facility/org access
+   (`organizations` → `facilities` → `memberships`, walked recursively —
+   see `alembic/versions/0001_initial_schema.py`'s
+   `resolve_accessible_facility_ids`/`resolve_accessible_org_ids` and
+   `docs/PERMISSIONS.md`). There is no global read, and no bare tenant id
+   to scope by — access is never a flat equality check.
 
 ## Commands
 - `make test` — full test suite, must be green before any commit

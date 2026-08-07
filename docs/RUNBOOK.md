@@ -68,23 +68,27 @@ below says explicitly what is and isn't verified.
 
 ## Onboarding a new customer
 
-`scripts/onboard_customer.py` (Phase 12) creates a tenant, its first admin
-user, and optionally an initial contract + fee-schedule version. It is a
-script, not an API endpoint, on purpose: `security/rbac.py` is entirely
-tenant-scoped, and there is no "platform superadmin" role that could gate a
-`POST /tenants` endpoint without breaking the no-cross-tenant-access
-boundary this build has maintained since Phase 3. It connects directly with
-the application's own `DATABASE_URL` (the `asc_app` role) and calls
-straight into `db.repository`, the same adapter `PostgresRepository` wraps
--- bypassing HTTP entirely, the same way `scripts/db/init_roles.sql` is a
+`scripts/onboard_customer.py` (Phase 12, config shape updated in Phase 4)
+creates an organization, one facility, its first admin user, a membership
+binding them together, and optionally an initial contract + fee-schedule
+version. It is a script, not an API endpoint, on purpose: everything the
+API layer does starts from an already-authenticated `AuthContext`, which
+by definition doesn't exist yet for a brand-new customer, and there is no
+"platform superadmin" HTTP route that could gate a `POST /organizations`
+endpoint without breaking the resolved-access boundary this build has
+maintained since Phase 4. It connects directly with **the owner role's**
+`DATABASE_URL` (see below for why) and calls straight into
+`db.repository`, the same adapter `PostgresRepository` wraps -- bypassing
+HTTP entirely, the same way `scripts/db/init_roles.sql` is a
 direct-DB-access, operator-run step rather than an endpoint.
 
 1. Write a JSON config, e.g. `onboard_riverside.json`:
    ```json
    {
-     "tenant_name": "Riverside ASC",
+     "org_name": "Riverside ASC",
+     "org_type": "ASC",
      "admin_subject": "auth0|riverside-admin",
-     "admin_role": "admin",
+     "admin_role": "org_admin",
      "contract": {
        "payer_id": "ACME-PPO",
        "name": "Acme Health PPO",
@@ -95,32 +99,47 @@ direct-DB-access, operator-run step rather than an endpoint.
    ```
    `admin_subject` is the bearer token `sub` claim the real IdP will issue
    for this user (see `src/api/auth.py`) -- this script only creates the
-   `users` row that maps it to a tenant and role, it does not create the
-   IdP account itself, which is out of this codebase's scope. `contract`
-   is optional; omit it to onboard a tenant with no fee schedule yet and
-   load one later via `POST /contracts` + `POST /contracts/{id}/versions`.
-   Payment rules (MPPR, bilateral, assistant surgeon, implant carve-out)
-   always start disabled here for the same reason -- configure them via
-   that same endpoint once the tenant can authenticate.
+   `users` row plus a `memberships` row binding it to the new org and
+   role, it does not create the IdP account itself, which is out of this
+   codebase's scope. `org_type` defaults to `"ASC"` (a single-facility
+   customer, the common case); use `"ASC_GROUP"` or `"BILLING_COMPANY"`
+   for a multi-facility customer and onboard its facilities separately
+   via the existing API once the admin can authenticate. `facility_name`
+   defaults to `org_name` if omitted. `contract` is optional; omit it to
+   onboard a customer with no fee schedule yet and load one later via
+   `POST /contracts` + `POST /contracts/{id}/versions`. Payment rules
+   (MPPR, bilateral, assistant surgeon, implant carve-out) always start
+   disabled here for the same reason -- configure them via that same
+   endpoint once the customer can authenticate.
 
-2. Run it:
+2. Run it, with **owner-role** credentials (not `asc_app`):
    ```
-   DATABASE_URL="<asc_app connection string>" \
+   DATABASE_URL="<asc_owner connection string>" \
      PYTHONPATH=src python scripts/onboard_customer.py onboard_riverside.json
    ```
-   Prints the new tenant/user/contract ids on success. Not run against a
-   real Postgres in the environment this was authored in -- verified so far
-   only via `ruff`/`mypy --strict` and a fake `DATABASE_URL` that exercises
-   config validation without a live connection; get a real run against a
-   provisioned database before trusting it for an actual pilot customer.
+   `organizations`/`facilities`/`memberships` are RLS-protected against
+   *resolved* access, and there is no membership yet for a brand-new
+   customer to resolve against -- the same bootstrap problem
+   `alembic/versions/0001_initial_schema.py`'s own docstring describes
+   for the `resolve_accessible_*` functions, and why `asc_owner` needs
+   `BYPASSRLS` (see `docs/DB_SETUP.md`). Running this with `asc_app`
+   credentials will fail with a row-level-security policy violation on
+   the very first insert.
+
+   Prints the new organization/facility/user/membership/contract ids on
+   success. Not run against a real Postgres in the environment this was
+   authored in -- verified so far only via `ruff`/`mypy --strict` and a
+   fake `DATABASE_URL` that exercises config validation without a live
+   connection; get a real run against a provisioned database before
+   trusting it for an actual pilot customer.
 
 ## Scheduling remittance polling (SFTP/S3)
 
 `scripts/ingestion/poll_remittances.py` (F-18, `docs/audit/REGISTER.md`)
-polls one tenant's configured SFTP directory or S3 prefix once, ingesting
-whatever's new, then exits. It is a script, not a service this codebase
-runs continuously -- there is no job queue or scheduler anywhere in this
-build (that's tracked as a larger, separate gap; see
+polls one facility's configured SFTP directory or S3 prefix once,
+ingesting whatever's new, then exits. It is a script, not a service this
+codebase runs continuously -- there is no job queue or scheduler anywhere
+in this build (that's tracked as a larger, separate gap; see
 `docs/MASTER-BUILD-PROMPT-V2.md`'s Phase 7). A real deployment schedules
 it with whatever it already has: a Kubernetes `CronJob`, a cloud
 provider's scheduled task (ECS Scheduled Task, Azure Container Apps Jobs,
@@ -138,7 +157,7 @@ person uploading through the UI.
 
 2. Run it once, by hand, to prove the configuration is right, e.g. for S3:
    ```
-   TENANT_ID="<tenant uuid>" SOURCE_KIND=s3 \
+   USER_ID="<service-account user uuid>" FACILITY_ID="<facility uuid>" SOURCE_KIND=s3 \
      S3_BUCKET="acme-remittances" S3_PREFIX="incoming/" AWS_REGION=us-east-1 \
      DATABASE_URL="<asc_app connection string>" \
      PHI_ENCRYPTION_KEY="<same value main.py uses>" \
@@ -146,23 +165,27 @@ person uploading through the UI.
    ```
    or for SFTP:
    ```
-   TENANT_ID="<tenant uuid>" SOURCE_KIND=sftp \
+   USER_ID="<service-account user uuid>" FACILITY_ID="<facility uuid>" SOURCE_KIND=sftp \
      SFTP_HOST="sftp.payer.example" SFTP_USERNAME="..." SFTP_PASSWORD="..." \
      SFTP_DIR="/outgoing" \
      DATABASE_URL="<asc_app connection string>" \
      PHI_ENCRYPTION_KEY="<same value main.py uses>" \
      PYTHONPATH=src python scripts/ingestion/poll_remittances.py
    ```
-   Prints one line per file it found (ingested, quarantined, or
-   duplicate). A file already ingested on a prior run is re-fetched and
-   re-hashed every time (there's no persisted "already seen" state across
-   invocations -- the `remittances` table stores a content hash, not the
-   original filename) and correctly comes back a duplicate; this is
-   wasteful on a very large mailbox, never incorrect.
+   `USER_ID` must be a user holding a membership that resolves access to
+   `FACILITY_ID` (Phase 4) -- ideally a service-account user provisioned
+   for this poller once Phase 5's API-key/`api_service` role machinery
+   exists; until then, any qualifying user works. Prints one line per
+   file it found (ingested, quarantined, or duplicate). A file already
+   ingested on a prior run is re-fetched and re-hashed every time
+   (there's no persisted "already seen" state across invocations -- the
+   `remittances` table stores a content hash, not the original filename)
+   and correctly comes back a duplicate; this is wasteful on a very
+   large mailbox, never incorrect.
 
 3. Point your scheduler at the same command, on whatever interval matches
    the payer's actual delivery cadence (hourly is a reasonable default
-   for most payers). One scheduled job per tenant per source.
+   for most payers). One scheduled job per facility per source.
 
 Not run against a real SFTP server or a real AWS account in the
 environment this was authored in -- the two real client adapters in that
