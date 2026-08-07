@@ -22,6 +22,7 @@ from domain.contract import (
     MPPRRule,
     PricingMethod,
     PricingMethodUsed,
+    StopLossRule,
     find_effective_contract,
     price_claim,
 )
@@ -352,6 +353,158 @@ def test_case_rate_wins_but_implant_still_carved_out(
     assert by_code[IMPLANT_CODE].pricing_method_used == PricingMethodUsed.INVOICE_COST_IMPLANT
     assert by_code["27447"].allowed == Money("2000.00")
     assert by_code["27447"].pricing_method_used == PricingMethodUsed.CASE_RATE_ALLOCATED
+
+
+# --- Lesser of billed charges vs. fee schedule (Phase 8) -----------------------
+
+
+def test_lesser_of_caps_fee_schedule_at_billed_charge(
+    make_contract_version: ContractFactory,
+) -> None:
+    """The literal false-positive bug Phase 8 exists to fix: a claim
+    billed below the fee schedule must price at the billed amount, not
+    the flat fee-schedule rate -- otherwise a correctly-paid claim shows
+    up as underpaid."""
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("100.00")}, lesser_of_charge_enabled=True
+    )
+    line = ClaimLineInput("99213", (), None, Money("80.00"), None, Decimal("1"))
+    priced = price_claim([line], contract)
+    assert priced.lines[0].allowed == Money("80.00")
+    assert priced.lines[0].pricing_method_used == PricingMethodUsed.FEE_SCHEDULE
+
+
+def test_lesser_of_no_effect_when_billed_above_fee_schedule(
+    make_contract_version: ContractFactory,
+) -> None:
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("100.00")}, lesser_of_charge_enabled=True
+    )
+    line = ClaimLineInput("99213", (), None, Money("500.00"), None, Decimal("1"))
+    priced = price_claim([line], contract)
+    assert priced.lines[0].allowed == Money("100.00")
+
+
+def test_lesser_of_disabled_falls_back_to_flat_fee_schedule(
+    make_contract_version: ContractFactory,
+) -> None:
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("100.00")}, lesser_of_charge_enabled=False
+    )
+    line = ClaimLineInput("99213", (), None, Money("80.00"), None, Decimal("1"))
+    priced = price_claim([line], contract)
+    assert priced.lines[0].allowed == Money("100.00")
+
+
+# --- Stop-loss / outlier pricing (Phase 8) --------------------------------------
+
+
+def test_stop_loss_below_threshold_uses_normal_pricing(
+    make_contract_version: ContractFactory,
+) -> None:
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("100.00")},
+        stop_loss_rule=StopLossRule(
+            enabled=True,
+            threshold=Money("1000.00"),
+            outlier_rate=Rate.percent(Decimal("30")),
+            first_dollar=True,
+        ),
+    )
+    line = ClaimLineInput("99213", (), None, Money("100.00"), None, Decimal("1"))
+    priced = price_claim([line], contract)
+    assert priced.lines[0].allowed == Money("100.00")
+    assert priced.lines[0].pricing_method_used == PricingMethodUsed.FEE_SCHEDULE
+
+
+def test_stop_loss_above_threshold_prices_each_line_as_percent_of_own_charge(
+    make_contract_version: ContractFactory,
+) -> None:
+    """First-dollar: the outlier percentage applies to the whole claim's
+    charge basis, not just the amount above threshold -- each line prices
+    at its own charge times outlier_rate, summing to outlier_rate of the
+    entire claim's total charge."""
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("100.00"), "99214": Money("150.00")},
+        stop_loss_rule=StopLossRule(
+            enabled=True,
+            threshold=Money("1000.00"),
+            outlier_rate=Rate.percent(Decimal("30")),
+            first_dollar=True,
+        ),
+    )
+    lines = [
+        ClaimLineInput("99213", (), None, Money("700.00"), None, Decimal("1")),
+        ClaimLineInput("99214", (), None, Money("700.00"), None, Decimal("1")),
+    ]
+    priced = price_claim(lines, contract)
+    assert priced.lines[0].allowed == Money("210.00")
+    assert priced.lines[1].allowed == Money("210.00")
+    assert all(
+        p.pricing_method_used == PricingMethodUsed.STOP_LOSS_OUTLIER for p in priced.lines
+    )
+    assert priced.total_allowed == Money("420.00")
+
+
+def test_stop_loss_implant_carve_out_still_applies_over_stop_loss(
+    make_contract_version: ContractFactory,
+) -> None:
+    """Implants still carve out separately at invoice cost even once
+    stop-loss triggers -- same "implants are special-cased out of every
+    other rule" precedent bilateral/assistant/MPPR already establish."""
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("500.00")},
+        stop_loss_rule=StopLossRule(
+            enabled=True,
+            threshold=Money("1000.00"),
+            outlier_rate=Rate.percent(Decimal("30")),
+            first_dollar=True,
+        ),
+    )
+    lines = [
+        ClaimLineInput(IMPLANT_CODE, (), None, Money("2000.00"), Money("1750.00"), Decimal("1")),
+        ClaimLineInput("99213", (), None, Money("500.00"), None, Decimal("1")),
+    ]
+    priced = price_claim(lines, contract)
+    by_code = {p.procedure_code: p for p in priced.lines}
+    assert by_code[IMPLANT_CODE].allowed == Money("1750.00")
+    assert by_code[IMPLANT_CODE].pricing_method_used == PricingMethodUsed.INVOICE_COST_IMPLANT
+    assert by_code["99213"].allowed == Money("150.00")
+    assert by_code["99213"].pricing_method_used == PricingMethodUsed.STOP_LOSS_OUTLIER
+
+
+def test_stop_loss_triggered_lines_skip_bilateral_and_mppr(
+    make_contract_version: ContractFactory,
+) -> None:
+    """A bilateral pair that would otherwise trigger TWO_LINE_SPLIT
+    pricing (and a spurious second MPPR reduction) instead prices purely
+    as a percentage of each line's own charge once stop-loss triggers --
+    stop-loss overrides every other pricing step for the lines it
+    touches."""
+    contract = make_contract_version(
+        fee_schedule={"27447": Money("1000.00")},
+        bilateral_rule=BilateralRule(
+            enabled=True,
+            total_rate=Rate.percent(Decimal("150")),
+            convention=BilateralConvention.TWO_LINE_SPLIT,
+        ),
+        stop_loss_rule=StopLossRule(
+            enabled=True,
+            threshold=Money("1000.00"),
+            outlier_rate=Rate.percent(Decimal("30")),
+            first_dollar=True,
+        ),
+    )
+    lines = [
+        ClaimLineInput("27447", ("50",), None, Money("1000.00"), None, Decimal("1")),
+        ClaimLineInput("27447", ("50",), None, Money("1000.00"), None, Decimal("1")),
+    ]
+    priced = price_claim(lines, contract)
+    assert all(p.allowed == Money("300.00") for p in priced.lines)
+    assert all(
+        p.pricing_method_used == PricingMethodUsed.STOP_LOSS_OUTLIER for p in priced.lines
+    )
+    assert all(p.mppr_rank is None for p in priced.lines)
 
 
 # --- find_effective_contract ---------------------------------------------------

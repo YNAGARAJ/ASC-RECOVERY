@@ -23,6 +23,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
 )
 from domain.money import Money, Rate
 
@@ -74,6 +75,8 @@ def make_contract_version() -> ContractFactory:
         bilateral_rule: BilateralRule | None = None,
         assistant_surgeon_rule: AssistantSurgeonRule | None = None,
         implant_carveout_rule: ImplantCarveoutRule | None = None,
+        lesser_of_charge_enabled: bool = False,
+        stop_loss_rule: StopLossRule | None = None,
     ) -> ContractVersion:
         return ContractVersion(
             payer_id=payer_id,
@@ -111,6 +114,15 @@ def make_contract_version() -> ContractFactory:
                 enabled=True,
                 procedure_codes=frozenset({IMPLANT_CODE}),
                 revenue_codes=frozenset({"0278"}),
+            ),
+            lesser_of_charge_enabled=lesser_of_charge_enabled,
+            stop_loss_rule=stop_loss_rule
+            if stop_loss_rule is not None
+            else StopLossRule(
+                enabled=False,
+                threshold=Money.zero(),
+                outlier_rate=Rate.percent(Decimal("0")),
+                first_dollar=True,
             ),
         )
 

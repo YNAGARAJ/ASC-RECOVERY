@@ -29,6 +29,7 @@ class PricingMethodUsed(enum.Enum):
     ASSISTANT_SURGEON = enum.auto()
     CASE_RATE_ALLOCATED = enum.auto()
     MPPR_REDUCED = enum.auto()
+    STOP_LOSS_OUTLIER = enum.auto()
     UNPRICED = enum.auto()
 
 
@@ -69,6 +70,23 @@ class CaseRateGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class StopLossRule:
+    """Phase 8 (`docs/MASTER-BUILD-PROMPT-V2.md`): above `threshold` total
+    claim charges, the whole claim flips to a flat percentage of billed
+    charges instead of its normal fee-schedule/percent-of-charge pricing.
+    `first_dollar=True` is the only semantics `price_claim` implements --
+    the percentage applies to each line's full charge (summing to
+    `outlier_rate` of the *entire* claim), not just the amount above
+    `threshold`. A marginal/excess-only mode is out of scope, named here
+    rather than silently unsupported."""
+
+    enabled: bool
+    threshold: Money
+    outlier_rate: Rate
+    first_dollar: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ContractVersion:
     payer_id: str
     effective_from: date
@@ -81,6 +99,13 @@ class ContractVersion:
     bilateral_rule: BilateralRule
     assistant_surgeon_rule: AssistantSurgeonRule
     implant_carveout_rule: ImplantCarveoutRule
+    # Phase 8: "most contracts pay the lesser of billed charges or the fee
+    # schedule" -- without this, a claim billed below the fee schedule is
+    # reported as underpaid when it was paid correctly (the literal
+    # false-positive bug this phase exists to fix). Mandatory, no default,
+    # same as every other field on this dataclass -- see _apply_lesser_of.
+    lesser_of_charge_enabled: bool
+    stop_loss_rule: StopLossRule
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,13 +148,28 @@ def find_effective_contract(
     return None
 
 
+def _apply_lesser_of(amount: Money, line: ClaimLineInput, contract: ContractVersion) -> Money:
+    """Phase 8: caps a fee-schedule amount at the billed charge when the
+    contract pays lesser-of. Deliberately not applied to
+    percent-of-charge amounts -- a percentage of the charge is already
+    <= charge whenever the rate is <= 100%, so this is specifically a
+    fee-schedule-vs-charge concept, matching the contract term's usual
+    real-world wording."""
+    if contract.lesser_of_charge_enabled and line.charge < amount:
+        return line.charge
+    return amount
+
+
 def _base_price(
     line: ClaimLineInput, contract: ContractVersion
 ) -> tuple[Money | None, PricingMethodUsed]:
     fee_schedule_amount = contract.fee_schedule.get(line.procedure_code)
     if contract.default_pricing_method == PricingMethod.FEE_SCHEDULE:
         if fee_schedule_amount is not None:
-            return fee_schedule_amount, PricingMethodUsed.FEE_SCHEDULE
+            return (
+                _apply_lesser_of(fee_schedule_amount, line, contract),
+                PricingMethodUsed.FEE_SCHEDULE,
+            )
         if contract.percent_of_charge_rate is not None:
             return line.charge.times(
                 contract.percent_of_charge_rate
@@ -140,7 +180,10 @@ def _base_price(
             contract.percent_of_charge_rate
         ), PricingMethodUsed.PERCENT_OF_CHARGE
     if fee_schedule_amount is not None:
-        return fee_schedule_amount, PricingMethodUsed.FEE_SCHEDULE
+        return (
+            _apply_lesser_of(fee_schedule_amount, line, contract),
+            PricingMethodUsed.FEE_SCHEDULE,
+        )
     return None, PricingMethodUsed.UNPRICED
 
 
@@ -160,10 +203,35 @@ def price_claim(lines: Sequence[ClaimLineInput], contract: ContractVersion) -> P
     method: list[PricingMethodUsed] = [PricingMethodUsed.UNPRICED] * n
     excluded_from_mppr: list[bool] = [False] * n
     is_implant_line: list[bool] = [False] * n
+    stop_loss_triggered_line: list[bool] = [False] * n
     mppr_rank: list[int | None] = [None] * n
 
-    # 1. Base price: fee schedule or percent-of-charge.
+    # 0. Stop-loss/outlier (Phase 8): claim-level charge threshold. Above
+    #    it, every non-implant line prices at a flat percentage of its own
+    #    billed charge (first-dollar -- the percentage applies to the
+    #    whole claim's charge basis, not just the excess above
+    #    threshold), overriding every other pricing step below for that
+    #    line. Checked via the pure _is_implant helper directly, since
+    #    is_implant_line isn't populated until step 2 -- implants still
+    #    carve out separately at invoice cost there, same "implants are
+    #    special-cased out of every other rule" precedent
+    #    bilateral/assistant/MPPR already establish below.
+    stop_loss_rule = contract.stop_loss_rule
+    total_charge = sum((line.charge for line in line_list), Money.zero())
+    if stop_loss_rule.enabled and total_charge > stop_loss_rule.threshold:
+        for i, line in enumerate(line_list):
+            if _is_implant(line, contract.implant_carveout_rule):
+                continue
+            allowed[i] = line.charge.times(stop_loss_rule.outlier_rate)
+            method[i] = PricingMethodUsed.STOP_LOSS_OUTLIER
+            excluded_from_mppr[i] = True
+            stop_loss_triggered_line[i] = True
+
+    # 1. Base price: fee schedule or percent-of-charge. Skipped for lines
+    #    already priced by stop-loss above.
     for i, line in enumerate(line_list):
+        if stop_loss_triggered_line[i]:
+            continue
         allowed[i], method[i] = _base_price(line, contract)
 
     # 2. Implant carve-out: 100% of caller-supplied invoice cost, never fee schedule.
@@ -203,7 +271,10 @@ def price_claim(lines: Sequence[ClaimLineInput], contract: ContractVersion) -> P
         bilateral_indices = [
             i
             for i, line in enumerate(line_list)
-            if not is_implant_line[i] and allowed[i] is not None and "50" in line.modifiers
+            if not is_implant_line[i]
+            and not stop_loss_triggered_line[i]
+            and allowed[i] is not None
+            and "50" in line.modifiers
         ]
         for i in bilateral_indices:
             excluded_from_mppr[i] = True
@@ -223,7 +294,7 @@ def price_claim(lines: Sequence[ClaimLineInput], contract: ContractVersion) -> P
     assistant_rule = contract.assistant_surgeon_rule
     if assistant_rule.enabled:
         for i, line in enumerate(line_list):
-            if is_implant_line[i]:
+            if is_implant_line[i] or stop_loss_triggered_line[i]:
                 continue
             if not (set(line.modifiers) & assistant_rule.applicable_modifiers):
                 continue
@@ -249,7 +320,10 @@ def price_claim(lines: Sequence[ClaimLineInput], contract: ContractVersion) -> P
         if not triggered:
             continue
         eligible_indices = [
-            i for i in range(n) if not (is_implant_line[i] and not group.includes_implants)
+            i
+            for i in range(n)
+            if not stop_loss_triggered_line[i]
+            and not (is_implant_line[i] and not group.includes_implants)
         ]
         if eligible_indices:
             shares = group.flat_rate.allocate(len(eligible_indices))

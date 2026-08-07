@@ -46,6 +46,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
 )
 from domain.money import Money, Rate
 from security.rbac import Role
@@ -99,6 +100,20 @@ def _build_contract_version(payer_id: str, contract_cfg: dict[str, Any]) -> Cont
         ),
         implant_carveout_rule=ImplantCarveoutRule(
             enabled=False, procedure_codes=frozenset(), revenue_codes=frozenset()
+        ),
+        # Phase 8 (docs/MASTER-BUILD-PROMPT-V2.md): unlike every other rule
+        # above, this defaults *on* -- same reasoning as the API's own
+        # default (api/schemas.py::CreateContractVersionIn) and the
+        # migration's column default: most real ASC contracts pay the
+        # lesser of billed charges or the fee schedule, so a brand-new
+        # contract should get the false-positive-safe behavior unless the
+        # operator's config says otherwise.
+        lesser_of_charge_enabled=contract_cfg.get("lesser_of_charge_enabled", True),
+        stop_loss_rule=StopLossRule(
+            enabled=False,
+            threshold=Money.zero(),
+            outlier_rate=Rate.percent("0"),
+            first_dollar=True,
         ),
     )
 

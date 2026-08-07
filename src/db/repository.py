@@ -64,6 +64,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
     find_effective_contract,
 )
 from domain.money import Money, Rate
@@ -150,6 +151,24 @@ def _implant_carveout_rule_from_json(data: dict[str, Any]) -> ImplantCarveoutRul
     )
 
 
+def _stop_loss_rule_to_json(rule: StopLossRule) -> dict[str, Any]:
+    return {
+        "enabled": rule.enabled,
+        "threshold": str(rule.threshold.as_decimal()),
+        "outlier_rate": _rate_to_str(rule.outlier_rate),
+        "first_dollar": rule.first_dollar,
+    }
+
+
+def _stop_loss_rule_from_json(data: dict[str, Any]) -> StopLossRule:
+    return StopLossRule(
+        enabled=bool(data["enabled"]),
+        threshold=Money(str(data["threshold"])),
+        outlier_rate=Rate(str(data["outlier_rate"])),
+        first_dollar=bool(data["first_dollar"]),
+    )
+
+
 def _case_rate_groups_to_json(groups: tuple[CaseRateGroup, ...]) -> list[dict[str, Any]]:
     return [
         {
@@ -199,6 +218,8 @@ def _contract_version_to_domain(
         bilateral_rule=_bilateral_rule_from_json(row.bilateral_rule),
         assistant_surgeon_rule=_assistant_surgeon_rule_from_json(row.assistant_surgeon_rule),
         implant_carveout_rule=_implant_carveout_rule_from_json(row.implant_carveout_rule),
+        lesser_of_charge_enabled=row.lesser_of_charge_enabled,
+        stop_loss_rule=_stop_loss_rule_from_json(row.stop_loss_rule),
     )
 
 
@@ -782,6 +803,8 @@ def create_contract_version(
         assistant_surgeon_rule=_assistant_surgeon_rule_to_json(version.assistant_surgeon_rule),
         implant_carveout_rule=_implant_carveout_rule_to_json(version.implant_carveout_rule),
         case_rate_groups=_case_rate_groups_to_json(version.case_rate_groups),
+        lesser_of_charge_enabled=version.lesser_of_charge_enabled,
+        stop_loss_rule=_stop_loss_rule_to_json(version.stop_loss_rule),
     )
     session.add(row)
     session.flush()

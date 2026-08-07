@@ -447,6 +447,12 @@ class MPPRRuleIn(BaseModel):
 class BilateralRuleIn(BaseModel):
     enabled: bool = False
     total_rate_percent: str = "150"
+    # F-16 audit-amendment re-verification (Phase 8, docs/audit/REGISTER.md):
+    # this field was missing entirely -- domain.contract.BilateralConvention
+    # .TWO_LINE_SPLIT had a real pricing branch but no way to ever be
+    # selected via the only production entry point. "single_line_150_pct"
+    # or "two_line_split" (domain.contract.BilateralConvention's values).
+    convention: str = "single_line_150_pct"
 
 
 class AssistantSurgeonRuleIn(BaseModel):
@@ -461,12 +467,26 @@ class ImplantCarveoutRuleIn(BaseModel):
     revenue_codes: list[str] = Field(default_factory=list)
 
 
+class StopLossRuleIn(BaseModel):
+    enabled: bool = False
+    threshold: str = "0"
+    outlier_rate_percent: str = "0"
+    first_dollar: bool = True
+
+
 class CreateContractVersionIn(BaseModel):
     effective_from: date
     effective_to: date | None = None
     default_pricing_method: str = "fee_schedule"
     fee_schedule: dict[str, str] = Field(default_factory=dict)
     percent_of_charge_rate_percent: str | None = None
+    # Phase 8 (docs/MASTER-BUILD-PROMPT-V2.md): defaults true -- most real
+    # ASC contracts pay the lesser of billed charges or the fee schedule;
+    # a fresh contract version gets the false-positive-safe behavior
+    # unless explicitly turned off. Matches the DB column's own default
+    # (alembic/versions/0013_contract_stop_loss_lesser_of.py).
+    lesser_of_charge_enabled: bool = True
+    stop_loss_rule: StopLossRuleIn = Field(default_factory=StopLossRuleIn)
     mppr_rule: MPPRRuleIn = Field(default_factory=MPPRRuleIn)
     bilateral_rule: BilateralRuleIn = Field(default_factory=BilateralRuleIn)
     assistant_surgeon_rule: AssistantSurgeonRuleIn = Field(default_factory=AssistantSurgeonRuleIn)

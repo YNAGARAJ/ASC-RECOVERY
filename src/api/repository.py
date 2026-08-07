@@ -41,6 +41,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
 )
 from domain.deadlines import calculate_appeal_deadline
 from domain.money import Money, Rate
@@ -408,12 +409,19 @@ class RuleInput:
     mppr_exempt_codes: frozenset[str] = field(default_factory=frozenset)
     bilateral_enabled: bool = False
     bilateral_total_rate_percent: str = "150"
+    # F-16 audit-amendment re-verification (Phase 8) -- see
+    # api.schemas.BilateralRuleIn's own comment for why this exists now.
+    bilateral_convention: str = "single_line_150_pct"
     assistant_enabled: bool = False
     assistant_rate_percent: str = "16"
     assistant_modifiers: frozenset[str] = field(default_factory=frozenset)
     implant_enabled: bool = False
     implant_procedure_codes: frozenset[str] = field(default_factory=frozenset)
     implant_revenue_codes: frozenset[str] = field(default_factory=frozenset)
+    stop_loss_enabled: bool = False
+    stop_loss_threshold: str = "0"
+    stop_loss_outlier_rate_percent: str = "0"
+    stop_loss_first_dollar: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +431,7 @@ class ContractVersionInput:
     default_pricing_method: str
     fee_schedule: dict[str, str]
     percent_of_charge_rate_percent: str | None
+    lesser_of_charge_enabled: bool
     rules: RuleInput
 
 
@@ -452,7 +461,7 @@ def _rule_input_to_contract_version(data: ContractVersionInput) -> ContractVersi
         bilateral_rule=BilateralRule(
             enabled=data.rules.bilateral_enabled,
             total_rate=Rate.percent(data.rules.bilateral_total_rate_percent),
-            convention=BilateralConvention.SINGLE_LINE_150_PCT,
+            convention=BilateralConvention(data.rules.bilateral_convention),
         ),
         assistant_surgeon_rule=AssistantSurgeonRule(
             enabled=data.rules.assistant_enabled,
@@ -463,6 +472,13 @@ def _rule_input_to_contract_version(data: ContractVersionInput) -> ContractVersi
             enabled=data.rules.implant_enabled,
             procedure_codes=data.rules.implant_procedure_codes,
             revenue_codes=data.rules.implant_revenue_codes,
+        ),
+        lesser_of_charge_enabled=data.lesser_of_charge_enabled,
+        stop_loss_rule=StopLossRule(
+            enabled=data.rules.stop_loss_enabled,
+            threshold=Money(data.rules.stop_loss_threshold),
+            outlier_rate=Rate.percent(data.rules.stop_loss_outlier_rate_percent),
+            first_dollar=data.rules.stop_loss_first_dollar,
         ),
     )
 

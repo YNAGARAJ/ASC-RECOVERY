@@ -26,6 +26,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
     price_claim,
 )
 from domain.money import Money, Rate
@@ -35,7 +36,13 @@ _CODE = "99213"
 
 
 def _version(
-    payer_id: str, effective_from: date, effective_to: date | None, rate: Money
+    payer_id: str,
+    effective_from: date,
+    effective_to: date | None,
+    rate: Money,
+    *,
+    lesser_of_charge_enabled: bool = False,
+    stop_loss_rule: StopLossRule | None = None,
 ) -> ContractVersion:
     return ContractVersion(
         payer_id=payer_id,
@@ -61,6 +68,15 @@ def _version(
         ),
         implant_carveout_rule=ImplantCarveoutRule(
             enabled=False, procedure_codes=frozenset(), revenue_codes=frozenset()
+        ),
+        lesser_of_charge_enabled=lesser_of_charge_enabled,
+        stop_loss_rule=stop_loss_rule
+        if stop_loss_rule is not None
+        else StopLossRule(
+            enabled=False,
+            threshold=Money.zero(),
+            outlier_rate=Rate.percent(Decimal("0")),
+            first_dollar=True,
         ),
     )
 
@@ -133,3 +149,47 @@ def test_claim_dated_before_any_contract_version_finds_nothing(
         )
 
     assert effective is None
+
+
+def test_lesser_of_and_stop_loss_round_trip_through_postgres(
+    owner_engine: Engine, app_session_factory: sessionmaker[Session]
+) -> None:
+    """Phase 8: contract_versions.lesser_of_charge_enabled/stop_loss_rule
+    -- the first real ALTER on this table since its creation -- survive a
+    real write/read, same proof test_organization_kms_key.py-style tests
+    already give every other JSONB rule sub-structure on this table."""
+    payer_id = f"PAYER-{uuid.uuid4().hex[:8]}"
+    version = _version(
+        payer_id,
+        date(2023, 1, 1),
+        None,
+        Money("100.00"),
+        lesser_of_charge_enabled=True,
+        stop_loss_rule=StopLossRule(
+            enabled=True,
+            threshold=Money("10000.00"),
+            outlier_rate=Rate.percent(Decimal("35")),
+            first_dollar=True,
+        ),
+    )
+    user_id, org_id, _facility_id = seed_org_facility_user(
+        owner_engine, "Lesser-of/stop-loss round-trip tenant"
+    )
+
+    with access_session(app_session_factory, user_id) as session:
+        contract = repository.create_contract(session, org_id, payer_id, "Test Payer Contract")
+        repository.create_contract_version(session, org_id, contract.id, version)
+
+    with access_session(app_session_factory, user_id) as session:
+        effective = repository.get_effective_contract_version(
+            session, org_id, payer_id, date(2023, 6, 15)
+        )
+
+    assert effective is not None
+    assert effective.lesser_of_charge_enabled is True
+    assert effective.stop_loss_rule == StopLossRule(
+        enabled=True,
+        threshold=Money("10000.00"),
+        outlier_rate=Rate.percent(Decimal("35")),
+        first_dollar=True,
+    )

@@ -250,6 +250,23 @@ class ContractVersion(Base):
     case_rate_groups: Mapped[list[object]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    # Phase 8 (`docs/MASTER-BUILD-PROMPT-V2.md`): the false-positive fix
+    # ("lesser of billed charges or the fee schedule") plus stop-loss/
+    # outlier pricing -- see domain.contract.ContractVersion's own
+    # docstring/comment for the rationale. `lesser_of_charge_enabled`
+    # defaults true (most real ASC contracts pay lesser-of);
+    # `stop_loss_rule` defaults to an inert, disabled rule.
+    lesser_of_charge_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    stop_loss_rule: Mapped[dict[str, object]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            '\'{"enabled": false, "threshold": "0", "outlier_rate": "0", '
+            '"first_dollar": true}\'::jsonb'
+        ),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

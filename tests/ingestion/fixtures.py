@@ -19,6 +19,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
 )
 from domain.money import Money, Rate
 from tests.domain.fixtures_x835 import (
@@ -42,6 +43,9 @@ def make_contract_version(
     effective_to: date | None = None,
     fee_schedule: dict[str, Money] | None = None,
     implant_carveout_rule: ImplantCarveoutRule | None = None,
+    bilateral_rule: BilateralRule | None = None,
+    lesser_of_charge_enabled: bool = False,
+    stop_loss_rule: StopLossRule | None = None,
 ) -> ContractVersion:
     """A minimal fee-schedule contract with every optional rule disabled --
     ingestion tests only need pricing to run end to end deterministically,
@@ -65,7 +69,9 @@ def make_contract_version(
             third_and_subsequent_rate=Rate.percent(25),
             exempt_codes=frozenset(),
         ),
-        bilateral_rule=BilateralRule(
+        bilateral_rule=bilateral_rule
+        if bilateral_rule is not None
+        else BilateralRule(
             enabled=False,
             total_rate=Rate.percent(150),
             convention=BilateralConvention.SINGLE_LINE_150_PCT,
@@ -81,6 +87,15 @@ def make_contract_version(
             enabled=False,
             procedure_codes=frozenset(),
             revenue_codes=frozenset(),
+        ),
+        lesser_of_charge_enabled=lesser_of_charge_enabled,
+        stop_loss_rule=stop_loss_rule
+        if stop_loss_rule is not None
+        else StopLossRule(
+            enabled=False,
+            threshold=Money.zero(),
+            outlier_rate=Rate.percent(0),
+            first_dollar=True,
         ),
     )
 

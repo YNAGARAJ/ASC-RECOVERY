@@ -68,6 +68,7 @@ def create_contract_version(
         default_pricing_method=body.default_pricing_method,
         fee_schedule=body.fee_schedule,
         percent_of_charge_rate_percent=body.percent_of_charge_rate_percent,
+        lesser_of_charge_enabled=body.lesser_of_charge_enabled,
         rules=RuleInput(
             mppr_enabled=body.mppr_rule.enabled,
             mppr_second_rate_percent=body.mppr_rule.second_procedure_rate_percent,
@@ -75,12 +76,17 @@ def create_contract_version(
             mppr_exempt_codes=frozenset(body.mppr_rule.exempt_codes),
             bilateral_enabled=body.bilateral_rule.enabled,
             bilateral_total_rate_percent=body.bilateral_rule.total_rate_percent,
+            bilateral_convention=body.bilateral_rule.convention,
             assistant_enabled=body.assistant_surgeon_rule.enabled,
             assistant_rate_percent=body.assistant_surgeon_rule.rate_percent,
             assistant_modifiers=frozenset(body.assistant_surgeon_rule.applicable_modifiers),
             implant_enabled=body.implant_carveout_rule.enabled,
             implant_procedure_codes=frozenset(body.implant_carveout_rule.procedure_codes),
             implant_revenue_codes=frozenset(body.implant_carveout_rule.revenue_codes),
+            stop_loss_enabled=body.stop_loss_rule.enabled,
+            stop_loss_threshold=body.stop_loss_rule.threshold,
+            stop_loss_outlier_rate_percent=body.stop_loss_rule.outlier_rate_percent,
+            stop_loss_first_dollar=body.stop_loss_rule.first_dollar,
         ),
     )
     version_id = repository.create_contract_version(ctx.user_id, ctx.org_id, contract_id, data)

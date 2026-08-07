@@ -27,6 +27,7 @@ class RootCause(enum.Enum):
     MPPR_NOT_APPLIED = enum.auto()
     BILATERAL_MODIFIER_DROPPED = enum.auto()
     IMPLANT_NOT_CARVED_OUT = enum.auto()
+    STOP_LOSS_NOT_APPLIED = enum.auto()
     STALE_FEE_SCHEDULE = enum.auto()
     UNDETERMINED_VARIANCE = enum.auto()
 
@@ -155,6 +156,8 @@ def evaluate_claim(
                 root_cause = RootCause.BILATERAL_MODIFIER_DROPPED
             elif expected_line.pricing_method_used == PricingMethodUsed.INVOICE_COST_IMPLANT:
                 root_cause = RootCause.IMPLANT_NOT_CARVED_OUT
+            elif expected_line.pricing_method_used == PricingMethodUsed.STOP_LOSS_OUTLIER:
+                root_cause = RootCause.STOP_LOSS_NOT_APPLIED
             else:
                 root_cause = RootCause.UNDETERMINED_VARIANCE
                 if all_contract_versions is not None:

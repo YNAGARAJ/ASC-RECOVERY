@@ -280,6 +280,49 @@ def test_implant_correctly_carved_out_is_correct_no_variance(
     assert findings[0].root_cause == RootCause.CORRECT_NO_VARIANCE
 
 
+# --- Stop-loss / outlier (Phase 8) ----------------------------------------------
+
+
+def test_stop_loss_not_applied_when_actual_is_flat_fee_scheduled(
+    make_contract_version: ContractFactory,
+) -> None:
+    expected = priced_claim(
+        (
+            psl(
+                "27447",
+                Money("300.00"),
+                PricingMethodUsed.STOP_LOSS_OUTLIER,
+                raw_input=cli("27447", Money("1000.00")),
+            ),
+        ),
+        make_contract_version(),
+    )
+    actual = (actual_line("27447", Money("1000.00")),)  # payer paid flat fee schedule, not outlier
+    findings = evaluate_claim("CLAIM12", expected, actual)
+    f = findings[0]
+    assert f.root_cause == RootCause.STOP_LOSS_NOT_APPLIED
+    assert f.shortfall == Money("-700.00")
+
+
+def test_stop_loss_correctly_applied_is_correct_no_variance(
+    make_contract_version: ContractFactory,
+) -> None:
+    expected = priced_claim(
+        (
+            psl(
+                "27447",
+                Money("300.00"),
+                PricingMethodUsed.STOP_LOSS_OUTLIER,
+                raw_input=cli("27447", Money("1000.00")),
+            ),
+        ),
+        make_contract_version(),
+    )
+    actual = (actual_line("27447", Money("300.00")),)
+    findings = evaluate_claim("CLAIM13", expected, actual)
+    assert findings[0].root_cause == RootCause.CORRECT_NO_VARIANCE
+
+
 # --- Stale fee schedule (both sides of the optional-parameter branch) -------
 
 

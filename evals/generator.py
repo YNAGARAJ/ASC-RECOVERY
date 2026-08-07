@@ -43,6 +43,7 @@ from domain.contract import (
     ImplantCarveoutRule,
     MPPRRule,
     PricingMethod,
+    StopLossRule,
     price_claim,
 )
 from domain.money import Money, Rate
@@ -186,6 +187,13 @@ def _bill_charge(rng: random.Random, allowed: Money) -> Money:
     return allowed.times(Rate(pct / Decimal(100)))
 
 
+def _bill_charge_below(rng: random.Random, allowed: Money) -> Money:
+    """Phase 8: the opposite of _bill_charge -- a claim billed *below* its
+    fee-schedule amount, the scenario lesser-of pricing exists for."""
+    pct = Decimal(rng.randint(60, 90))
+    return allowed.times(Rate(pct / Decimal(100)))
+
+
 # --- Contract library ---------------------------------------------------------
 
 _PAYER_ID = "EVALPAYER1"
@@ -211,6 +219,15 @@ def _fee_schedule() -> dict[str, Money]:
 _PROCEDURE_CODES = tuple(_fee_schedule().keys())
 
 
+def _inert_stop_loss_rule() -> StopLossRule:
+    return StopLossRule(
+        enabled=False,
+        threshold=Money.zero(),
+        outlier_rate=Rate.percent(Decimal("0")),
+        first_dollar=True,
+    )
+
+
 def _make_contract(
     *,
     effective_from: date,
@@ -218,6 +235,13 @@ def _make_contract(
     fee_schedule: dict[str, Money] | None = None,
     percent_of_charge_rate: Rate | None = None,
     mppr_enabled: bool = True,
+    # Phase 8 (docs/MASTER-BUILD-PROMPT-V2.md): both default to their
+    # pre-Phase-8 inert state -- False / a disabled rule -- so every one
+    # of the ~448 pre-existing golden cases built via this factory is
+    # provably unaffected by these two new mandatory ContractVersion
+    # fields. Only the new lesser-of/stop-loss builders opt in.
+    lesser_of_charge_enabled: bool = False,
+    stop_loss_rule: StopLossRule | None = None,
 ) -> ContractVersion:
     return ContractVersion(
         payer_id=_PAYER_ID,
@@ -248,6 +272,8 @@ def _make_contract(
             procedure_codes=frozenset({_IMPLANT_CODE}),
             revenue_codes=frozenset({"0278"}),
         ),
+        lesser_of_charge_enabled=lesser_of_charge_enabled,
+        stop_loss_rule=stop_loss_rule if stop_loss_rule is not None else _inert_stop_loss_rule(),
     )
 
 
@@ -265,6 +291,19 @@ _CONTRACT_STALE_OLD = _make_contract(
     fee_schedule={code: amount.times(_OLD_FACTOR) for code, amount in _fee_schedule().items()},
 )
 _CONTRACT_STALE_NEW = _CONTRACT_CURRENT
+_CONTRACT_LESSER_OF = _make_contract(
+    effective_from=date(2023, 1, 1), lesser_of_charge_enabled=True
+)
+_STOP_LOSS_THRESHOLD = Money("10000.00")
+_CONTRACT_STOP_LOSS = _make_contract(
+    effective_from=date(2023, 1, 1),
+    stop_loss_rule=StopLossRule(
+        enabled=True,
+        threshold=_STOP_LOSS_THRESHOLD,
+        outlier_rate=Rate.percent(Decimal("35")),
+        first_dollar=True,
+    ),
+)
 
 _SHARED_CONTRACTS: dict[str, ContractVersion] = {
     "_CONTRACT_CURRENT": _CONTRACT_CURRENT,
@@ -272,6 +311,8 @@ _SHARED_CONTRACTS: dict[str, ContractVersion] = {
     "_CONTRACT_PERCENT": _CONTRACT_PERCENT,
     "_CONTRACT_STALE_OLD": _CONTRACT_STALE_OLD,
     "_CONTRACT_STALE_NEW": _CONTRACT_STALE_NEW,
+    "_CONTRACT_LESSER_OF": _CONTRACT_LESSER_OF,
+    "_CONTRACT_STOP_LOSS": _CONTRACT_STOP_LOSS,
 }
 
 
@@ -287,6 +328,7 @@ class DefectType(enum.Enum):
     REVERSAL_AFTER_PAYMENT = "reversal_after_payment"
     SECONDARY_PAYER_UNDERPAYMENT = "secondary_payer_underpayment"
     UNPRICED_CODE = "unpriced_code"
+    STOP_LOSS_NOT_APPLIED = "stop_loss_not_applied"
     CORRECT_PAYMENT = "correct_payment"
 
 
@@ -742,11 +784,69 @@ def _build_unpriced_cases(rng: random.Random, counter: Iterator[int]) -> list[Go
     return cases
 
 
+def _build_stop_loss_cases(rng: random.Random, counter: Iterator[int]) -> list[GoldenCase]:
+    """Phase 8: total charges above the outlier threshold, paid at the
+    flat fee-schedule rate instead of the stop-loss percentage of billed
+    charges. `code`/`flat_fee` are fixed (not randomly chosen) so the
+    "actual" side is always genuinely underpaid relative to the outlier
+    basis regardless of the charge jitter below -- picking a random,
+    possibly high-value procedure code risked an occasional overpayment
+    case sneaking into a category meant to be a pure underpayment defect."""
+    cases: list[GoldenCase] = []
+    code = "99213"
+    flat_fee = _fee_schedule()[code]
+    for i in range(_TARGET_PER_CATEGORY):
+        charge = _jitter_money(rng, Money("15000.00"), -20, 20)
+        svc_date = _vary_date(rng)
+        pcn, member_id, payer_claim = _next_ids(counter)
+        line = ClaimLineInput(code, (), None, charge, None, Decimal("1"))
+        expected = price_claim((line,), _CONTRACT_STOP_LOSS)
+        exp0 = expected.lines[0]
+        assert exp0.allowed is not None
+        actual_allowed = flat_fee
+        wire_line = WireLine(code, (), charge, actual_allowed, svc_date)
+        text = _build_transaction(
+            control_number=pcn.removeprefix("CLAIM"),
+            bpr_total_paid=actual_allowed,
+            claim_segments=_claim_segments(
+                patient_control_number=pcn,
+                claim_status="1",
+                total_charge=charge,
+                total_paid=actual_allowed,
+                payer_claim_control=payer_claim,
+                member_id=member_id,
+                lines=(wire_line,),
+            ),
+        )
+        cases.append(
+            GoldenCase(
+                case_id=f"stoploss-{i:04d}",
+                defect_type=DefectType.STOP_LOSS_NOT_APPLIED,
+                x835_text=text,
+                patient_control_number=pcn,
+                payer_id=_PAYER_ID,
+                date_of_service=svc_date,
+                claim_lines=(line,),
+                contract_versions=(_CONTRACT_STOP_LOSS,),
+                expected_findings=(
+                    ExpectedFinding(
+                        0,
+                        code,
+                        exp0.allowed,
+                        RootCause.STOP_LOSS_NOT_APPLIED,
+                        exp0.allowed - actual_allowed,
+                    ),
+                ),
+            )
+        )
+    return cases
+
+
 def _build_correct_cases(rng: random.Random, counter: Iterator[int]) -> list[GoldenCase]:
     cases: list[GoldenCase] = []
     fee = _fee_schedule()
     for i in range(_TARGET_PER_CATEGORY):
-        pattern = i % 5
+        pattern = i % 7
         svc_date = _vary_date(rng)
         pcn, member_id, payer_claim = _next_ids(counter)
         contract: ContractVersion
@@ -776,11 +876,21 @@ def _build_correct_cases(rng: random.Random, counter: Iterator[int]) -> list[Gol
             charge = _bill_charge(rng, fee[code].times(Rate.percent(Decimal("150"))))
             lines = (ClaimLineInput(code, ("50",), None, charge, None, Decimal("1")),)
             contract = _CONTRACT_CURRENT
-        else:  # correctly carved-out implant
+        elif pattern == 4:  # correctly carved-out implant
             invoice_cost = _jitter_money(rng, Money("2000.00"), -25, 25)
             charge = invoice_cost.times(Rate("1.3"))
             lines = (ClaimLineInput(_IMPLANT_CODE, (), None, charge, invoice_cost, Decimal("1")),)
             contract = _CONTRACT_CURRENT
+        elif pattern == 5:  # Phase 8: lesser-of, billed below fee schedule
+            code = rng.choice(_PROCEDURE_CODES)
+            charge = _bill_charge_below(rng, fee[code])
+            lines = (ClaimLineInput(code, (), None, charge, None, Decimal("1")),)
+            contract = _CONTRACT_LESSER_OF
+        else:  # Phase 8: stop-loss, correctly paid at the outlier percentage
+            code = "99213"
+            charge = _jitter_money(rng, Money("15000.00"), -20, 20)
+            lines = (ClaimLineInput(code, (), None, charge, None, Decimal("1")),)
+            contract = _CONTRACT_STOP_LOSS
 
         expected = price_claim(lines, contract)
         wire_lines: list[WireLine] = []
@@ -848,6 +958,7 @@ def build_golden_cases(seed: int = _GENERATOR_SEED) -> tuple[GoldenCase, ...]:
         _build_reversal_cases,
         _build_secondary_cases,
         _build_unpriced_cases,
+        _build_stop_loss_cases,
         _build_correct_cases,
     )
     cases: list[GoldenCase] = []
@@ -924,6 +1035,7 @@ def write_golden_dataset(path: Path) -> None:
         "    ImplantCarveoutRule,",
         "    MPPRRule,",
         "    PricingMethod,",
+        "    StopLossRule,",
         ")",
         "from domain.money import Money, Rate",
         "from domain.variance import RootCause",

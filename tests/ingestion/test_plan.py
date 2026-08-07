@@ -9,8 +9,8 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from domain.contract import ImplantCarveoutRule
-from domain.money import Money
+from domain.contract import BilateralConvention, BilateralRule, ImplantCarveoutRule, StopLossRule
+from domain.money import Money, Rate
 from domain.variance import RootCause
 from domain.x835 import parse_835
 from ingestion.plan import PriorFinding, build_ingestion_plan
@@ -261,3 +261,175 @@ def test_implant_line_is_detected_via_revenue_code_but_stays_unpriced() -> None:
     (finding,) = claim.findings
     assert finding.root_cause == RootCause.UNPRICED_CODE
     assert finding.shortfall == Money.zero()
+
+
+def test_lesser_of_prices_a_claim_billed_below_fee_schedule_correctly_through_real_ingestion() -> (
+    None
+):
+    """Phase 8's own audit amendment: every domain rule needs at least one
+    case through the real parsing/ingestion path, not only the pure
+    pricing function. A claim billed (and paid) below the fee schedule
+    must round-trip as CORRECT_NO_VARIANCE -- the literal false-positive
+    this phase exists to kill."""
+    contract = make_contract_version(
+        fee_schedule={"99213": Money("100.00")}, lesser_of_charge_enabled=True
+    )
+    segments = [
+        *envelope_head(),
+        seg(ELEMENT_SEP, "LX", "1"),
+        seg(
+            ELEMENT_SEP,
+            "CLP",
+            "CLAIM0300",
+            "1",
+            "80.00",
+            "80.00",
+            "0.00",
+            "12",
+            "PAYERCTRL0300",
+            "11",
+        ),
+        seg(ELEMENT_SEP, "DTM", "232", "20230110"),
+        seg(ELEMENT_SEP, "SVC", f"HC{SUB_ELEMENT_SEP}99213", "80.00", "80.00", "", "1"),
+        seg(ELEMENT_SEP, "DTM", "472", "20230110"),
+        *envelope_tail(segment_count="7"),
+    ]
+    result = parse_835(assemble(segments))
+
+    plan = build_ingestion_plan(
+        result,
+        contract_versions_by_payer={TEST_PAYER: (contract,)},
+        prior_findings_by_control_number={},
+    )
+
+    (transaction,) = plan.transactions
+    (claim,) = transaction.claims
+    assert claim.skip_reason is None
+    (finding,) = claim.findings
+    assert finding.root_cause == RootCause.CORRECT_NO_VARIANCE
+    assert finding.shortfall == Money.zero()
+
+
+def test_stop_loss_not_applied_is_detected_through_real_ingestion() -> None:
+    """A claim whose total charges cross the stop-loss threshold, paid at
+    a flat amount instead of the outlier percentage of billed charges --
+    round-tripped through real 835 parsing, not just price_claim called
+    directly."""
+    contract = make_contract_version(
+        fee_schedule={},
+        stop_loss_rule=StopLossRule(
+            enabled=True,
+            threshold=Money("1000.00"),
+            outlier_rate=Rate.percent(30),
+            first_dollar=True,
+        ),
+    )
+    segments = [
+        *envelope_head(),
+        seg(ELEMENT_SEP, "LX", "1"),
+        seg(
+            ELEMENT_SEP,
+            "CLP",
+            "CLAIM0301",
+            "1",
+            "2000.00",
+            "400.00",
+            "0.00",
+            "12",
+            "PAYERCTRL0301",
+            "11",
+        ),
+        seg(ELEMENT_SEP, "DTM", "232", "20230110"),
+        seg(ELEMENT_SEP, "SVC", f"HC{SUB_ELEMENT_SEP}27447", "2000.00", "400.00", "", "1"),
+        seg(ELEMENT_SEP, "DTM", "472", "20230110"),
+        seg(ELEMENT_SEP, "CAS", "CO", "45", "1600.00"),
+        *envelope_tail(segment_count="8"),
+    ]
+    result = parse_835(assemble(segments))
+
+    plan = build_ingestion_plan(
+        result,
+        contract_versions_by_payer={TEST_PAYER: (contract,)},
+        prior_findings_by_control_number={},
+    )
+
+    (transaction,) = plan.transactions
+    (claim,) = transaction.claims
+    assert claim.skip_reason is None
+    (finding,) = claim.findings
+    assert finding.root_cause == RootCause.STOP_LOSS_NOT_APPLIED
+    assert finding.shortfall == Money("200.00")
+
+
+def test_bilateral_two_line_split_underpayment_is_detected_through_real_ingestion() -> None:
+    """F-16 re-verification (Phase 8 audit amendment): TWO_LINE_SPLIT's
+    pricing branch was fixed at the domain layer, but -- until this test
+    -- was never round-tripped through real 835 parsing the way
+    SINGLE_LINE_150_PCT and every other rule already is. Two lines, same
+    procedure, both modifier 50, both paid at the full base rate (neither
+    the 100%/remainder split a real payer following this convention
+    should apply)."""
+    contract = make_contract_version(
+        fee_schedule={"27447": Money("1000.00")},
+        bilateral_rule=BilateralRule(
+            enabled=True,
+            total_rate=Rate.percent(150),
+            convention=BilateralConvention.TWO_LINE_SPLIT,
+        ),
+    )
+    segments = [
+        *envelope_head(),
+        seg(ELEMENT_SEP, "LX", "1"),
+        seg(
+            ELEMENT_SEP,
+            "CLP",
+            "CLAIM0302",
+            "1",
+            "2000.00",
+            "2000.00",
+            "0.00",
+            "12",
+            "PAYERCTRL0302",
+            "11",
+        ),
+        seg(ELEMENT_SEP, "DTM", "232", "20230110"),
+        seg(
+            ELEMENT_SEP,
+            "SVC",
+            f"HC{SUB_ELEMENT_SEP}27447{SUB_ELEMENT_SEP}50",
+            "1000.00",
+            "1000.00",
+            "",
+            "1",
+        ),
+        seg(ELEMENT_SEP, "DTM", "472", "20230110"),
+        seg(
+            ELEMENT_SEP,
+            "SVC",
+            f"HC{SUB_ELEMENT_SEP}27447{SUB_ELEMENT_SEP}50",
+            "1000.00",
+            "1000.00",
+            "",
+            "1",
+        ),
+        # Distinct line-level date from the first SVC line above -- avoids
+        # colliding on evaluate_claim's (procedure_code, service_date,
+        # charge) dedup key, which would otherwise misclassify the second
+        # line as DUPLICATE_LINE instead of exercising the bilateral
+        # variance branch this test is actually for.
+        seg(ELEMENT_SEP, "DTM", "472", "20230111"),
+        *envelope_tail(segment_count="9"),
+    ]
+    result = parse_835(assemble(segments))
+
+    plan = build_ingestion_plan(
+        result,
+        contract_versions_by_payer={TEST_PAYER: (contract,)},
+        prior_findings_by_control_number={},
+    )
+
+    (transaction,) = plan.transactions
+    (claim,) = transaction.claims
+    assert claim.skip_reason is None
+    root_causes = {f.root_cause for f in claim.findings}
+    assert RootCause.BILATERAL_MODIFIER_DROPPED in root_causes
