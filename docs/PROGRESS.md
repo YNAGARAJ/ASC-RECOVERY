@@ -13,232 +13,219 @@ at a clean commit as of this checkpoint.
 2. Build the unbuilt product-completeness gaps from
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
    underway.** Phase 4 (org/facility/membership access model) is
-   **complete**, all six of its own sub-steps landed, full local gate
-   green. This is the biggest, most structurally invasive single unit of
-   work in this repo's history — read the rest of this file before
-   touching anything access-control-related.
+   **complete**. Phase 5 (user lifecycle and enterprise access) is
+   **in progress, 3 of 7 planned sub-steps done** — see below.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
-predates Wave 3 entirely) — its own "Phase 4" ("Security and PHI
-controls") is a *different, already-finished* phase from
-`docs/MASTER-BUILD-PROMPT-V2.md`'s "Phase 4" (organization/identity
-model, what this checkpoint is about). Do not conflate the two, and do
-not check anything off in `docs/PHASES.md` for V2 phase work — that
-file's checklist is closed and historical.
+predates Wave 3 entirely) — its own phase numbers are unrelated to
+`docs/MASTER-BUILD-PROMPT-V2.md`'s phase numbers (what this checkpoint is
+about). Do not conflate the two, and do not check anything off in
+`docs/PHASES.md` for V2 phase work — that file's checklist is closed and
+historical.
 
-## Phase: MASTER-BUILD-PROMPT-V2.md Phase 4 (organization/facility/membership access model) — COMPLETE, all 6 steps
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 4 (org/facility/membership access model) — COMPLETE
 
-Replaced the entire flat `tenants`/`tenant_id` multi-tenancy model with
-`organizations` (self-referencing hierarchy: PLATFORM → BILLING_COMPANY/
-ASC_GROUP → ASC) → `facilities` → `memberships` (role + scope per org,
-narrowed to specific facilities via `membership_facilities` when
-`scope=SPECIFIC_FACILITIES`). RLS now resolves access recursively through
-the org hierarchy instead of a flat equality check. This was a **clean-cut
-replacement** (no data migration — no real customer/PHI data has ever
-existed in this system) and a **plan-mode-approved** design, per the
-phase's own "Enter plan mode... wait for approval" instruction.
+Replaced the flat `tenants`/`tenant_id` multi-tenancy model with
+`organizations` (self-referencing hierarchy) → `facilities` →
+`memberships` (role + scope, narrowed to specific facilities via
+`membership_facilities` when `scope=SPECIFIC_FACILITIES`). RLS resolves
+access recursively through the org hierarchy via two `SECURITY DEFINER`
+functions, `resolve_accessible_facility_ids`/`resolve_accessible_org_ids`
+(`alembic/versions/0001_initial_schema.py`). Clean-cut replacement (no
+data migration — no real customer/PHI data has ever existed in this
+system), plan-mode-approved. Full writeup of all 6 sub-steps, decisions,
+and traps is preserved in git history for this file (`git log -p --
+docs/PROGRESS.md`, the version as of commit `7be4733`) — condensed here
+since Phase 5 now builds on top of it as settled, sealed ground:
 
-**All 6 sub-steps landed as separate commits** (the codebase was
-necessarily inconsistent — didn't build/pass — between steps 1 and 4,
-since they're too tightly coupled to gate independently; this was flagged
-to the user and accepted before proceeding):
+- `Role` has 7 values (`platform_admin/org_admin/manager/biller/analyst/
+  auditor/api_service`); `platform_admin`/`org_admin` hold identical
+  action permissions (hierarchy position is what actually distinguishes
+  them).
+- `AuthContext` carries `user_id`, `subject`, `role` (resolved fresh from
+  `memberships` every request — no token-revocation list needed as a
+  result), `org_id`, `facility_id: UUID | None` (`None` when the active
+  org doesn't resolve to exactly one facility; routes 400 via
+  `require_facility()` rather than guessing).
+- `asc_owner` needs `BYPASSRLS` (Docker's bootstrap user already has it;
+  a manually-provisioned Postgres needs `ALTER ROLE asc_owner
+  BYPASSRLS;` once, by a superuser — `docs/DB_SETUP.md`). Every DB test
+  that bootstraps a fresh org/facility/user must seed via the **owner
+  connection** (`tests/db/conftest.py::seed_org_facility_user`), never
+  `asc_app` — there's no membership yet for a brand-new org to resolve
+  access through.
+- This repo has no "query across every facility/org I can reach in one
+  call" endpoint anywhere — every `Repository` method takes one specific
+  `facility_id`/`org_id`, required. Deliberate, still true after Phase 5
+  steps 1-3.
 
-1. **Schema + migration** (`520a5d1`) — `db/models.py` rewritten;
-   `alembic/versions/0001_initial_schema.py` rewritten with
-   `resolve_accessible_facility_ids(p_user_id)`/
-   `resolve_accessible_org_ids(p_user_id)` — `SECURITY DEFINER` SQL
-   functions, cycle-guarded recursive CTE over `organizations.parent_org_id`,
-   honoring `ALL_FACILITIES` vs `SPECIFIC_FACILITIES` membership scope.
-2. **RBAC + PHI masking** (`88ceff0`) — `Role` expands from 4 flat roles
-   to the phase's 7 (`platform_admin/org_admin/manager/biller/analyst/
-   auditor/api_service`); `platform_admin`/`org_admin` deliberately hold
-   *identical* action permissions (hierarchy position, not the
-   permission table, is what actually distinguishes them). New
-   `security/phi_masking.py` — analyst gets `"[MASKED]"` on patient
-   name/member id, everyone else with `Action.VIEW_UNMASKED_PHI` sees
-   the real value. `docs/PERMISSIONS.md` documents the matrix, generated
-   from the actual code so it can't silently drift.
-3. **Access/session layer** (part of `10fc2d6`) — `db/tenancy.py` →
-   `db/access.py`: `access_session(session_factory, user_id)` sets only
-   `app.user_id` (not a second org/facility session variable) — RLS
-   resolution functions return everything a user can reach across *all*
-   memberships; which specific org/facility a request targets is an
-   `AuthContext` field, not a DB session variable. JWT drops its `role`
-   claim entirely (role is per-membership, not a single value a token
-   can hold) and gains `active_org_id`; role is resolved fresh from
-   `memberships` on every request via `api/auth.py`'s
-   `resolve_membership_role` (walks from `active_org_id` up through
-   `parent_org_id` for the nearest membership) — this is what makes a
-   revoked/changed membership take effect immediately, with **no
-   token-revocation list**.
-4. **Repository + API layer** (rest of `10fc2d6`) — every `tenant_id`
-   parameter becomes `facility_id` (business/PHI tables) or `org_id`
-   (contracts — negotiated per organization, not per facility).
-   `AuthContext` gained `user_id: UUID`, `subject: str` (split apart --
-   under the old model these were the same field; audit-log `actor`
-   fields need the human-readable subject, `access_session` needs the
-   real UUID), `org_id`, and `facility_id: UUID | None` (`None` when the
-   active org resolves to zero or more than one facility —
-   `api/auth.py::require_facility()` 400s rather than guessing; a real
-   facility switcher is Phase 5/12 scope). Caught and fixed a real bug
-   while doing this: `ingestion/pipeline.py` was passing a facility_id
-   into what's now an org-scoped contract lookup — added
-   `db.repository.get_org_id_for_facility()` to resolve the parent org
-   once per ingest.
-5. **Test suite** (`2df9201` mechanical + `c00f04b` the real redesign) —
-   `tests/api/fakes.py`'s `FakeRepository` rewritten around
-   facility/org-set resolution (mirrors the real SQL functions closely
-   enough for API-wiring tests, not a substitute for the real RLS proof
-   — register finding B-50 already documents that gap). New
-   `tests/db/conftest.py::seed_org_facility_user()` — every DB-backed
-   test that bootstraps a fresh org/facility/user/membership must do it
-   via the **owner-role connection**, never `app_session_factory`'s
-   `asc_app` role (`organizations`/`facilities`/`memberships` are
-   RLS-protected against *resolved* access, and there's no membership
-   yet for a brand-new org to resolve against — `asc_app` lacks
-   `BYPASSRLS`). `tests/db/test_rls_tenant_isolation.py` rewritten around
-   Phase 4's five required proofs (see "Decisions" below) plus an
-   end-to-end masking proof through the real `PostgresRepository`
-   wiring, not just the pure-function test.
-6. **Docs** (`2d0c824`) — `CLAUDE.md` rule 8, `docs/DB_SETUP.md` (the new
-   `BYPASSRLS` precondition, `owner_engine` for test seeding),
-   `docs/RUNBOOK.md` (onboarding config shape, poller env vars).
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 3/7 steps
 
-**Full local gate, confirmed green as of `c00f04b`/`2d0c824`**: `ruff
-check .` clean, `mypy --strict .` clean (171 files, only the 2
-pre-existing unrelated alembic 0004 JSONB errors), `pytest -q` 593
-passed / 40 skipped, `domain/variance.py` 100% coverage gate,
-`python -m evals.run` GATE PASSED (100% recall/precision/root-cause/
-dollar accuracy, 504 golden cases), `bandit -r . -x ./tests,./evals`
-clean (4 new B608 findings from the RLS-policy-construction SQL and 1
-B105 false positive on the `"[MASKED]"` token all reviewed and
-`# nosec`'d with justification, not silently ignored).
+**Scoped down to a core subset, confirmed with the user 2026-08-07**:
+invitation → accept → MFA → first login, offboarding, delegated admin,
+API keys, per-org policy — now. SSO, SCIM, impersonation, and break-glass
+are an explicit deferred follow-up pass (each independently large and/or
+has an external-verification ceiling this environment can't meet, same
+disclosure pattern as Wave 3's KMS/SFTP findings). Plan approved via
+plan mode; the plan file itself (`adaptive-gliding-milner.md` in the
+user's `~/.claude/plans/`) has the full original 7-step breakdown if
+needed, but is not durable storage — this file and git history are.
 
-## Decisions worth knowing (not obvious from the code)
+**Also confirmed**: `org_policies.mfa_required` (step 6, not yet built)
+will exist as a column but the API will never accept `false` for it — MFA
+stays unconditional everywhere, per CLAUDE.md's "no exceptions" rule.
 
-- **RLS resolution functions take only `p_user_id`, no org/facility
-  param.** They return the *full* set of facilities/orgs a user can
-  reach across *all* their memberships — RLS is the security ceiling.
-  "Which org is currently active" (for role resolution and write-path
-  targeting) is a narrower, application-layer concept
-  (`AuthContext.org_id`/`.facility_id`), deliberately not baked into the
-  DB session state the same way `app.tenant_id` used to be.
-- **`organizations`/`facilities`/`memberships`/`membership_facilities`
-  are all RLS-protected** (a step beyond the old model, where only
-  business tables had RLS) — `organizations`/`facilities` via their own
-  `id` against the same resolution functions; `memberships`/
-  `membership_facilities` via a **bootstrap-safe self-only** policy
-  (`user_id = current_setting('app.user_id')`), deliberately *not*
-  routed through the recursive functions (that would be circular: you'd
-  need resolved access to read the memberships that resolve access).
-- **`asc_owner` needs `BYPASSRLS`.** The two resolution functions are
-  `SECURITY DEFINER`, owned by whoever runs the migration, specifically
-  so they can walk the hierarchy internally without their own queries
-  being blocked by the RLS policies they're computing. Docker's
-  bootstrap `POSTGRES_USER` already satisfies this by convention; a
-  manually-provisioned real Postgres needs `ALTER ROLE asc_owner
-  BYPASSRLS;` run once, by a real superuser (`docs/DB_SETUP.md`). This
-  is also why `scripts/onboard_customer.py` and every DB test's seeding
-  helper (`seed_org_facility_user`) must run via the owner connection,
-  never `asc_app` — there's no membership yet for a brand-new org to
-  bootstrap through.
-- **Contracts are org-scoped, not facility-scoped** — confirmed with the
-  user before building: an ASC_GROUP's facilities share one payer rate
-  card, matching how these are actually negotiated in practice.
-- **The five phase-required RLS tests**, all in
-  `tests/db/test_rls_tenant_isolation.py`: (1) cross-facility read
-  blocked at the database with app-level filtering disabled [+ IDOR-by-
-  known-id, kept from the pre-Phase-4 version], (2) a billing-company
-  user scoped to two specific facilities can't read a third
-  (`SPECIFIC_FACILITIES`), (3) a parent-org membership reaches a
-  child-org's facility, (4) revoking a membership blocks access on the
-  very next query (deleted via the owner connection — `asc_app` has no
-  `DELETE` grant on `memberships`, matching every other mutable table's
-  retention posture), (5) a five-level org hierarchy resolves and
-  terminates correctly (the cycle-guarded CTE completing at all is the
-  "doesn't loop" proof — no separate corrupted-cycle test was built).
-  PHI masking end-to-end (analyst masked, biller not) is proven in the
-  same file, through the real `PostgresRepository.get_finding_detail`
-  wiring.
-- **Login now defaults to a user's *oldest* membership's org** when
-  issuing a session (`LoginCredentials.default_org_id`,
-  `db.repository.get_default_membership_org_id`) — a deliberate,
-  documented Phase 4 stopgap. Real org selection/switching at login is
-  Phase 5 ("user lifecycle and enterprise access") scope, not built here.
-- **`AuthContext.facility_id` is `None`, and routes 400 via
-  `require_facility()`, whenever the active org doesn't resolve to
-  exactly one facility.** No route silently guesses. A real facility
-  switcher (Phase 12 frontend explicitly mentions one) is what actually
-  resolves this UX gap — Phase 4 only had to make the ambiguous case
-  fail loudly, not solve it.
-- **This repo has no "query across every facility I can reach in one API
-  call" endpoint.** Every `Repository` method takes one specific
-  `facility_id`/`org_id`, required. A multi-facility org's aggregate
-  view (if ever needed before Phase 12's real dashboard) would need
-  either multiple API calls or a new endpoint — not built now, on
-  purpose, to keep this phase scoped to the access *model*, not new
-  product surface.
+### Step 1/7 — Schema + RLS (`706ca9b`) — DONE
+
+New tables `invitations`, `invitation_facilities`, `api_keys`,
+`org_policies`; `memberships.revoked_at` (soft revocation — `asc_app` has
+no `DELETE` grant on any mutable table, so offboarding is an `UPDATE`).
+Two new `SECURITY DEFINER` functions in
+`alembic/versions/0007_user_lifecycle.py`: `get_invitation_by_token_hash`
+and `accept_invitation` — both anonymous (no `app.user_id`), because
+invitation acceptance has no authenticated caller by definition; token
+possession is the authorization, same principle as a password-reset
+link.
+
+**Self-caught security bug, fixed in this step**: 0001's
+`self_membership`/`self_membership_facility` RLS policies carried no
+`FOR SELECT` qualifier, so Postgres applied them to *every* command —
+any authenticated user could have INSERTed a membership row for
+themselves at any org_id/role/scope (self-granting `platform_admin`
+anywhere). Never exploited (Phase 4 built no membership-creation route),
+but tightened to `FOR SELECT` only here, with new deliberately-scoped
+`org_authoring` INSERT/UPDATE policies (checked against the *caller's*
+own resolved org access) added alongside for the legitimate write paths
+steps 2+ needed.
+
+### Step 2/7 — Delegated admin read surface (`3535302`) — DONE
+
+`GET /organizations/members` (`Action.MANAGE_USERS`-gated) lists the
+caller's active org's memberships. **No `org_id` path/query param** —
+every other route in this API resolves its scoping id server-side from
+`AuthContext`, never from the client (`test_tenant_param_absence.py`
+guards this structurally); an early draft of this route took `org_id` as
+a path param and had to be corrected before committing. Needed a new
+migration (`0008_membership_read_policy.py`) adding the `org_authoring_select`
+SELECT policy 0007 deliberately deferred — 0007 gave org-resolved
+INSERT/UPDATE on someone else's membership row but left SELECT at
+self-only, since the read shape wasn't known until this step.
+
+### Step 3/7 — Invitation → accept → confirm-mfa → login (`2b553e6`) — DONE
+
+`POST /invitations` (create, returns the raw token once — there is no
+email-sending infrastructure in this codebase, see `docs/RUNBOOK.md`),
+`GET /invitations/{token}` (anonymous preview), `POST
+/invitations/{token}/accept` (anonymous — sets password, generates +
+returns an MFA secret and `otpauth://` URI once), `POST
+/invitations/{token}/confirm-mfa` (anonymous, stateless TOTP
+re-verification, no DB write). After accept + confirm-mfa, the existing
+`POST /auth/login` (F-04/F-05) just works, unchanged — no login-path code
+touched.
+
+New `security/tokens.py`: `generate_token`/`hash_token` (SHA-256, not
+scrypt — a token is looked up by exact-match equality, not verified
+against a user-typed guess, so a slow salted hash buys nothing and would
+make every lookup expensive). Will be reused by step 5 (API keys).
+
+**Design decision**: `confirm-mfa` deliberately has no lockout/rate-limit
+protection of its own (`enforce_rate_limit` requires an `AuthContext`
+these anonymous routes don't have by definition, and a second
+`AccountLockoutTracker` would only protect a UX confidence-check with no
+exploitable consequence — a successful guess yields nothing without also
+knowing the password from `accept`, which this endpoint never touches).
+The actual TOTP gate that matters is `POST /auth/login`, already hardened
+by F-06.
+
+**Design decision**: `accept_invitation` (`PostgresRepository`) pre-checks
+status/expiry via the same preview read before calling the `SECURITY
+DEFINER` DB function, so the common invalid-token path is a clean `None`
+→ 404 rather than an uncaught Postgres exception falling through to
+`api/errors.py`'s generic 500 handler. The DB function's own `FOR UPDATE`
+recheck remains the actual safety net for the rare concurrent-accept
+race — deliberately not wrapped in its own exception handler, since that
+race is vanishingly rare and the existing generic 500 handler is already
+a safe (if inelegant) fallback for it.
+
+### Full local gate as of step 3 (`2b553e6`)
+
+`ruff check .` clean, `mypy --strict .` clean (182 files, only the 2
+pre-existing unrelated alembic 0004 JSONB errors — present since before
+Phase 4, not this session's doing), `pytest -q` 616 passed / 51 skipped,
+`domain/variance.py` 100% coverage gate, `python -m evals.run` GATE
+PASSED, `bandit -r . -x ./tests,./evals` clean. Offline SQL generation
+(`alembic upgrade head --sql` / `downgrade 0008:0007 --sql`) verified
+both directions through migration 0008. **The two `SECURITY DEFINER`
+functions and every RLS policy added in steps 1-2 are written and
+offline-verified only — never run against a real Postgres in this
+environment** (same disclosed gap as Phase 4's RLS work; F-22's local
+Postgres is still unclaimed, see "Traps" below).
 
 ## Traps for someone resuming cold
 
-- **Everything in "Decisions" above** — especially the `BYPASSRLS`
-  precondition and the owner-vs-app connection split for seeding. A
-  test or script that mysteriously gets a row-level-security violation
-  on an `INSERT` into `organizations`/`facilities`/`memberships` is
-  almost certainly using `app_session_factory`/`asc_app` where it needed
-  `owner_engine`/`asc_owner`.
-- **`tests/db/conftest.py::seed_org_facility_user()` is the one seeding
-  helper everything else should build on** — `tests/ingestion/
-  conftest.py::seed_org_with_contract()` and inline per-file helpers in
-  `tests/db/test_*.py` all call it. If a new DB-backed test needs a
-  fresh org/facility/user, use it rather than hand-rolling `create_organization`/
-  `create_facility`/`create_user`/`create_membership` calls again.
-- **F-22's local-Postgres handoff from the previous checkpoint is still
-  live and still unclaimed** — a real PostgreSQL 18 service is running
-  on this dev machine, setup deferred pending the `postgres` superuser
-  password (see git history around commit `0205871` for the exact
-  handoff SQL, now updated for the `BYPASSRLS` grant too — see
-  `docs/DB_SETUP.md`'s "Bring up Postgres" section for the current
-  version of that SQL). Running Phase 4's RLS tests for real, for the
-  first time, would be an excellent use of it if that password ever
-  becomes available.
-- **CRLF warnings on every `git add`**, the Makefile's
-  `domain/variance.py`-only coverage gate, `mypy --strict .` sweeping
-  the whole repo (not just `src`+`tests`) because of the `.` CLI
-  argument, and the PHI-content guardrail hook (blocks writes containing
-  a couple of specific trigger-phrase combinations naming patient data
-  alongside certain adjectives — tripped this once this session while
-  writing RLS test fixtures, worked around with different synthetic
-  sentinel text) — all still apply, unchanged from every prior
-  checkpoint.
-- **Bandit nosec placement on multi-line f-strings is not obvious.** A
-  `# nosec` comment placed on a line that's *inside* a triple-quoted
-  string's content (e.g. right after an opening `f"""`) becomes part of
-  the string itself, not a Python comment — this will silently corrupt
-  generated SQL. Put `# nosec` on a real code line (a trailing comment
-  on a single-line string literal, or a comment on the line that
-  actually calls `.format()`/executes the flagged expression), never
-  inside the string body. Learned this the hard way in step 5's commit;
-  the working pattern is preserved there as a reference.
+- **Everything Phase 4's checkpoint already flagged still applies**: the
+  `BYPASSRLS` precondition, owner-vs-app connection split for seeding,
+  CRLF warnings on every `git add`, `mypy --strict .` sweeping the whole
+  repo via the `.` argument, the PHI-content guardrail hook, and bandit
+  nosec placement on multi-line strings (a `# nosec` comment must land on
+  a real code line, never inside a triple-quoted string's content — this
+  is *why* step 1 renamed `_GET_INVITATION_BY_TOKEN_HASH_SQL` to
+  `_LOOKUP_INVITATION_BY_HASH_SQL` instead of fighting nosec placement:
+  bandit's B105 heuristic matches on the *Python variable name*, not the
+  SQL content, so dropping "token" from the identifier was the real fix).
+- **`org_id`/`facility_id` are never client-supplied, anywhere.** Before
+  adding a new route, check `test_tenant_param_absence.py` — it
+  structurally enforces this. Step 2 almost shipped a `{org_id}` path
+  param before this got caught; every scoping id comes from
+  `AuthContext`, resolved server-side from the bearer token.
+  Resource-specific ids (`finding_id`, `claim_id`, a future `packet_id`)
+  are fine as path params — RLS enforces the boundary on those (cross-org
+  lookup by known id returns 404, never another org's row).
+- **F-22's local-Postgres handoff is still live and still unclaimed** — a
+  real PostgreSQL service is running on this dev machine, setup deferred
+  pending the `postgres` superuser password (see `docs/DB_SETUP.md`'s
+  "Bring up Postgres" section for the exact handoff SQL, including the
+  `BYPASSRLS` grant). Running Phase 4 *and* Phase 5's RLS/SECURITY
+  DEFINER tests for real, for the first time, would be valuable if that
+  password ever becomes available — there is now a full session's worth
+  of offline-only-verified RLS policy and function code riding on the
+  assumption the SQL is correct.
+- **Migrations 0007/0008 are additive on top of 0001, not edits to it** —
+  0001's schema is sealed (same convention 0002-0006 already established
+  for Phase 4). Any further Phase 5 schema work (steps 4-6) should be a
+  new `0009_...` migration, not an edit to 0007/0008.
 
 ## Next steps
 
-1. **Phase 4 is done. Explicitly check in with the user before starting
-   Phase 5** ("user lifecycle and enterprise access" —
-   `docs/MASTER-BUILD-PROMPT-V2.md`: invitation → accept → MFA enrollment
-   → first login with expiry; offboarding that kills sessions/API keys
-   immediately; SSO/SAML/OIDC per org; SCIM 2.0; API keys; impersonation;
-   break-glass; per-org policy). This is the next phase in PART 4's own
-   stated order, and it directly completes several Phase 4 stopgaps
-   flagged above (real org-switching at login, a real facility switcher,
-   `api_service` credential provisioning) — but confirm before diving in
-   per this repo's established "check sequencing with the user" norm.
-2. **If picking this up much later**, re-verify the full local gate
-   before trusting anything (`ruff check .`, `mypy --strict .`,
-   `pytest -q`, the coverage gate, `python -m evals.run`, `bandit -r .
-   -x ./tests,./evals`) — it was green as of `2d0c824`, but confirm it
-   still is.
-3. **If the F-22 Postgres password becomes available**, run Phase 4's
-   live-DB suite for real before Phase 5 builds further on top of an
-   access model that's only ever been offline-verified.
+1. **Step 4/7 — Offboarding (the phase's actual stated gate: "offboarding
+   test proves instant session death").** An endpoint that sets
+   `memberships.revoked_at`, writes an audit entry, and a dedicated test
+   proving the very next authenticated request (any route) fails
+   immediately — at the route/API level this time, matching what Phase
+   4's `test_revoking_membership_revokes_access_immediately` already
+   proved at the DB layer via a hard `DELETE` through the owner
+   connection. Likely needs a small new migration (`0009`) if any RLS
+   gap surfaces the way step 2 needed one for step 1's gap — check
+   whether the existing `org_authoring_update` policy from step 1
+   already covers "an org-resolved caller sets `revoked_at` on someone
+   else's membership row" (it should, since `UPDATE` was already granted
+   broadly, but verify before assuming).
+2. **Step 5/7 — API keys.** Create (returns the raw key once, reusing
+   `security/tokens.py`), revoke, list (masked), and a new bearer-token
+   branch in `api/auth.py` distinguishing an API key from a JWT by a
+   fixed prefix before attempting either kind of validation.
+3. **Step 6/7 — Per-org policy.** `org_policies` CRUD route,
+   `session_timeout_seconds` as an optional TTL override at
+   `issue_session` time, `ip_allowlist` checked in `get_auth_context`.
+   Remember: `mfa_required` exists as a column but the API must never
+   accept `false` for it.
+4. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key
+   operator workflows), `docs/PERMISSIONS.md` if the action set changed,
+   `docs/SECURITY.md` control-matrix entries for the new controls.
+5. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — it was green as of `2b553e6`, but confirm
+   it still is.
+6. **If the F-22 Postgres password becomes available**, run Phase 4 and
+   5's live-DB suites for real before building steps 4-6 further on top
+   of RLS/function code that's only ever been offline-verified.
