@@ -613,7 +613,7 @@ under it, one without still gets the platform default).
 No API/route change, no new `Action` (`docs/PERMISSIONS.md` untouched).
 `docs/RUNBOOK.md` gained a "Per-org encryption keys (BYOK)" section.
 
-### Full local gate as of this commit
+### Full local gate as of `608653c`/`f320755` (BYOK)
 
 `ruff check .` clean, `mypy --strict .` clean (196 files, only the 2
 pre-existing unrelated alembic 0004 JSONB errors), `pytest -q` 690
@@ -623,10 +623,71 @@ clean. Offline SQL generation (`alembic upgrade head --sql` /
 `downgrade 0010:0009 --sql`) verified both directions through migration
 0010.
 
-**Only per-org data residency remains open in Phase 6** — everything
-else the phase's prompt named is now built or was already true before
-this session started (see this phase's section above in full for the
-audit that established that).
+### Per-org data residency — DONE, PHASE 6 COMPLETE
+
+Fourth and last Phase 6 item, user said "continue" a third time without
+re-scoping. Deliberately the smallest of the four: a stored declaration
+on the already-existing `org_policies` table (Phase 5 step 6's home for
+per-org settings), not a new table, not a technical control — the
+framing flagged as needing confirmation in this file's own prior
+checkpoint turned out uncontroversial to just build, since it was
+already the only honest option (this system runs one shared Postgres in
+one region; claiming physical enforcement would be fiction).
+
+**Schema**: `org_policies.data_residency_region` (nullable
+`String(100)`, `alembic/versions/0011_org_data_residency.py`, additive,
+same guarded idiom as 0002/0010). Lives on `org_policies`, not
+`organizations` — deliberately different from `kms_key_id` (BYOK,
+previous item), which correctly lives on `organizations` since it's
+closer to infrastructure/identity than to a configurable policy knob.
+
+**API**: extends the *existing* `GET`/`PUT /org-policy` endpoints
+(`docs/MASTER-BUILD-PROMPT-V2.md` Phase 5 step 6) rather than adding a
+new route — `org_policies` already is "per-org configurable settings,"
+and this is one more of those. Free-text, max 100 chars, no enum:
+constraining the value would imply a precision (real, validated regions)
+that doesn't exist. **Deliberately self-service** (`org_admin`/
+`platform_admin` via a normal `PUT`) — a real, considered asymmetry
+against BYOK's operator-only, direct-DB-write treatment: misdeclaring a
+region doesn't lock anyone out of their own data the way a wrong KMS key
+would, so the blast radius doesn't justify taking it out of the API.
+
+**Tests**: `tests/api/test_org_policy.py` (round-trip through the
+existing PUT/GET pair, the new `max_length=100` validation boundary,
+defaults to `None` when omitted — the existing dict-equality default
+test needed updating for the new field, not just extending) and
+`tests/db/test_org_policy.py` (round-trip and clear-on-omit at the
+repository layer, DB-backed, skips without `TEST_DATABASE_URL`). No new
+role-matrix test needed — `GET`/`PUT /org-policy` are already in the
+existing matrix tests, which don't need to know about individual field
+additions.
+
+`docs/SECURITY.md` gained a new control-matrix row explicitly contrasted
+against the BYOK row above it (same table, adjacent, so the self-service-
+vs-operator-only asymmetry reads as a deliberate design choice, not an
+inconsistency); its own "Not yet built" bullet for this item removed
+entirely, not just reworded, since there is nothing left to disclose as
+missing. `docs/RUNBOOK.md` gained a "Per-org data residency" section.
+
+### Full local gate as of this commit — Phase 6 complete
+
+`ruff check .` clean, `mypy --strict .` clean (197 files, only the 2
+pre-existing unrelated alembic 0004 JSONB errors), `pytest -q` 692
+passed / 69 skipped, `domain/variance.py` 100% coverage gate,
+`python -m evals.run` GATE PASSED, `bandit -r . -x ./tests,./evals`
+clean. Offline SQL generation verified both directions through
+migration 0011.
+
+**All four of Phase 6's genuinely-unbuilt items are now done**: forced
+re-auth for PHI export, the per-org rate-limiting ceiling, per-org
+encryption keys (BYOK-ready), and per-org data residency. Combined with
+everything the initial audit found already true (AES-256 at rest, MFA,
+PHI log redaction, rate limiting/lockout wiring, TLS 1.2+ on AWS), this
+closes every item `docs/MASTER-BUILD-PROMPT-V2.md`'s Phase 6 prompt
+names. **Not independently re-verified against a live Postgres** — same
+disclosed ceiling as Phases 4/5 (F-22's local-Postgres handoff, still
+unclaimed) — migrations 0010/0011 and every DB-backed test this phase
+added are offline-verified/skip-without-a-database only.
 
 ## Traps for someone resuming cold
 
