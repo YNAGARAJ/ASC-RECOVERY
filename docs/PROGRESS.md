@@ -14,7 +14,7 @@ at a clean commit as of this checkpoint.
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
    underway.** Phase 4 (org/facility/membership access model) is
    **complete**. Phase 5 (user lifecycle and enterprise access) is
-   **in progress, 4 of 7 planned sub-steps done** — see below.
+   **in progress, 5 of 7 planned sub-steps done** — see below.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
@@ -60,7 +60,7 @@ since Phase 5 now builds on top of it as settled, sealed ground:
   `facility_id`/`org_id`, required. Deliberate, still true after Phase 5
   steps 1-3.
 
-## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 4/7 steps
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 5/7 steps
 
 **Scoped down to a core subset, confirmed with the user 2026-08-07**:
 invitation → accept → MFA → first login, offboarding, delegated admin,
@@ -195,20 +195,91 @@ mirrors the real `resolve_membership_role`'s `AND m.revoked_at IS NULL`,
 and is what makes offboarding take effect on the fake repository's very
 next call, not just in the real DB path.
 
-### Full local gate as of step 4 (`964ec35`)
+### Step 5/7 — API keys (`edd5655`) — DONE
 
-`ruff check .` clean, `mypy --strict .` clean (184 files, only the 2
+`POST /api-keys` / `GET /api-keys` / `POST /api-keys/{id}/revoke`
+(`Action.MANAGE_USERS`-gated, same delegated-admin shape as everything
+else in Phase 5), plus the piece that actually makes a key useful: a new
+branch in `api/auth.py::get_auth_context` that lets a presented API key
+authenticate a request at all, not just be administered.
+
+**No new table needed** — `api_keys` (with its `org_access` RLS policy)
+was already created in step 1's `0007_user_lifecycle.py`, unused until
+now. One new migration, `0009_api_key_lookup_function.py`, adding a
+single `SECURITY DEFINER` function, `get_api_key_by_hash` — the same
+bootstrap problem `get_invitation_by_token_hash` (step 1) solves for
+anonymous invitation lookups: turning a presented key into a
+`user_id`/`org_id` has to happen *before* any `app.user_id` exists for
+RLS to resolve access from, so this one read has to bypass RLS by
+design, narrowly, same justification as every other `SECURITY DEFINER`
+function in this schema.
+
+**Deliberately no dedicated role/scope/facility columns on `ApiKey`
+itself** (`db.models.ApiKey`'s docstring, unchanged from step 1):
+creating a key provisions an ordinary service `User` (no
+password/MFA — unusable for interactive login) holding an ordinary
+`role=api_service` `Membership`. Authentication therefore reuses the
+*exact* `resolve_membership_role`/`resolve_default_facility_id`
+machinery a human session goes through — not a parallel authorization
+system to keep in sync. This has a real consequence worth remembering:
+**offboarding a service account works two ways**, either revoking the
+`ApiKey` row (`POST /api-keys/{id}/revoke`) or revoking the underlying
+`Membership` (`POST /organizations/members/{id}/revoke`, step 4, if the
+admin knows its `membership_id`) — both kill access on the very next
+request, no token-revocation list, same guarantee step 4 proved for
+humans.
+
+**`security/tokens.py`** gained `API_KEY_PREFIX = "ask_"` and
+`generate_api_key()` — a key is `API_KEY_PREFIX` + the same
+256-bit-random `generate_token()` value, hashed and stored whole
+(prefix included; never stripped, never decomposed). `api/auth.py`
+branches on this prefix *before* attempting either kind of token
+validation (`token.startswith(API_KEY_PREFIX)`), so a JWT is never
+hashed-and-looked-up as a key and an API key is never run through JWT
+signature verification — cheap to check, safe by construction against
+collision (every JWT starts with the base64 of `{"`, i.e. `eyJ`, never
+`ask_`). Both branches converge on one `_resolve_auth_context` helper,
+which is also where `ApiKey.last_used_at` (a column that existed since
+step 1 but had zero writers until now — the same "built but unwired"
+anti-pattern the master prompt's Phase 6 audit amendment names
+explicitly) gets touched, best-effort, after a successful
+authentication, via `touch_api_key_last_used` running inside an
+`access_session` scoped to the key's own service user (whose own
+membership is what makes the `org_access` UPDATE policy permit the
+write).
+
+`tests/api/test_api_keys.py` covers the full create/list/revoke role
+matrix and IDOR shape (mirroring `test_offboarding.py`), plus the
+distinctive part unique to this step: a freshly created key's raw value
+actually authenticates a real request (`GET /findings` returns 200), a
+revoked key is rejected (401) on its very next use, an expired key
+(seeded directly via a new `FakeRepository.seed_api_key` test helper,
+since the create endpoint's TTL is fixed and can't produce an
+already-expired key) is rejected the same way, an unknown key is
+rejected, and a key is bound to the org it was created in (can reach its
+own tenant's findings, never the other tenant's).
+`tests/db/test_api_keys.py` proves the same guarantees one layer down
+through real RLS: `get_api_key_by_hash` resolves anonymously with no
+`app.user_id` set at all (proving the `SECURITY DEFINER` bypass is what
+makes lookup possible, not an accident of a permissive policy), an
+org-resolved admin can revoke a key, an outsider's revoke attempt
+matches zero rows, double-revoke is a no-op, and `touch_api_key_last_used`
+succeeds via the owning service user's own resolved access.
+
+### Full local gate as of step 5 (`edd5655`)
+
+`ruff check .` clean, `mypy --strict .` clean (188 files, only the 2
 pre-existing unrelated alembic 0004 JSONB errors — present since before
-Phase 4, not this session's doing), `pytest -q` 627 passed / 54 skipped,
+Phase 4, not this session's doing), `pytest -q` 644 passed / 59 skipped,
 `domain/variance.py` 100% coverage gate, `python -m evals.run` GATE
 PASSED, `bandit -r . -x ./tests,./evals` clean. Offline SQL generation
-(`alembic upgrade head --sql` / `downgrade 0008:0007 --sql`) verified
-both directions through migration 0008 — step 4 added no new migration.
-**The two `SECURITY DEFINER` functions and every RLS policy added in
-steps 1-2, plus step 4's reliance on the `org_authoring_update` policy,
-are written and offline-verified only — never run against a real
-Postgres in this environment** (same disclosed gap as Phase 4's RLS
-work; F-22's local Postgres is still unclaimed, see "Traps" below).
+(`alembic upgrade head --sql` / `downgrade 0009:0008 --sql`) verified
+both directions through migration 0009.
+**Every RLS policy/`SECURITY DEFINER` function added across steps 1, 2,
+and 5 (including `get_api_key_by_hash`) is written and offline-verified
+only — never run against a real Postgres in this environment** (same
+disclosed gap as Phase 4's RLS work; F-22's local Postgres is still
+unclaimed, see "Traps" below).
 
 ## Traps for someone resuming cold
 
@@ -239,28 +310,28 @@ work; F-22's local Postgres is still unclaimed, see "Traps" below).
   password ever becomes available — there is now a full session's worth
   of offline-only-verified RLS policy and function code riding on the
   assumption the SQL is correct.
-- **Migrations 0007/0008 are additive on top of 0001, not edits to it** —
-  0001's schema is sealed (same convention 0002-0006 already established
-  for Phase 4). Any further Phase 5 schema work (steps 4-6) should be a
-  new `0009_...` migration, not an edit to 0007/0008.
+- **Migrations 0007/0008/0009 are additive on top of 0001, not edits to
+  it** — 0001's schema is sealed (same convention 0002-0006 already
+  established for Phase 4). Any further Phase 5 schema work (step 6)
+  should be a new `0010_...` migration, not an edit to 0007/0008/0009.
 
 ## Next steps
 
-1. **Step 5/7 — API keys.** Create (returns the raw key once, reusing
-   `security/tokens.py`), revoke, list (masked), and a new bearer-token
-   branch in `api/auth.py` distinguishing an API key from a JWT by a
-   fixed prefix before attempting either kind of validation.
-2. **Step 6/7 — Per-org policy.** `org_policies` CRUD route,
+1. **Step 6/7 — Per-org policy.** `org_policies` CRUD route,
    `session_timeout_seconds` as an optional TTL override at
    `issue_session` time, `ip_allowlist` checked in `get_auth_context`.
    Remember: `mfa_required` exists as a column but the API must never
-   accept `false` for it.
-3. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key
+   accept `false` for it. `org_policies` (with its `org_access` RLS
+   policy) already exists from step 1's `0007_user_lifecycle.py`, same
+   as `api_keys` was before step 5 — likely no new migration needed,
+   verify before assuming otherwise (same check step 4 did for
+   `org_authoring_update` before concluding it needed nothing new).
+2. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key
    operator workflows), `docs/PERMISSIONS.md` if the action set changed,
    `docs/SECURITY.md` control-matrix entries for the new controls.
-4. **If picking this up much later**, re-verify the full local gate
-   before trusting anything — it was green as of `964ec35`, but confirm
+3. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — it was green as of `edd5655`, but confirm
    it still is.
-5. **If the F-22 Postgres password becomes available**, run Phase 4 and
-   5's live-DB suites for real before building steps 5-6 further on top
-   of RLS/function code that's only ever been offline-verified.
+4. **If the F-22 Postgres password becomes available**, run Phase 4 and
+   5's live-DB suites for real before building step 6 further on top of
+   RLS/function code that's only ever been offline-verified.
