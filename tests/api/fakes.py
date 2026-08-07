@@ -31,6 +31,7 @@ from api.repository import (
     FindingFilters,
     FindingSummary,
     LoginCredentials,
+    OrgMemberSummary,
     Page,
     PagedResult,
     RecordOutcomeInput,
@@ -62,6 +63,7 @@ class _Membership:
     role: str
     scope: str
     facility_ids: frozenset[uuid.UUID]
+    created_at: datetime
 
 
 @dataclass
@@ -122,6 +124,7 @@ class FakeRepository:
                 role=role_value,
                 scope=scope,
                 facility_ids=facility_ids,
+                created_at=now(),
             )
         )
         return membership_id
@@ -329,6 +332,32 @@ class FakeRepository:
             for oid, summary in self.contracts.values()
             if oid == org_id and oid in accessible
         ]
+        total = len(items)
+        page_items = items[page.offset : page.offset + page.limit]
+        return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
+
+    def list_org_members(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[OrgMemberSummary]:
+        accessible = self._accessible_org_ids(user_id)
+        items = []
+        if org_id in accessible:
+            for m in self.memberships:
+                if m.org_id != org_id:
+                    continue
+                member_user = next((u for u in self.users.values() if u.id == m.user_id), None)
+                subject = member_user.subject if member_user is not None else ""
+                items.append(
+                    OrgMemberSummary(
+                        membership_id=m.id,
+                        user_id=m.user_id,
+                        subject=subject,
+                        role=Role(m.role),
+                        scope=m.scope,
+                        facility_ids=tuple(m.facility_ids),
+                        created_at=m.created_at,
+                    )
+                )
         total = len(items)
         page_items = items[page.offset : page.offset + page.limit]
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)

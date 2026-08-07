@@ -19,6 +19,7 @@ from api.repository import (
     ContractSummary,
     FindingDetail,
     FindingSummary,
+    OrgMemberSummary,
     PacketGenerationFailed,
     PagedResult,
     RecoveryPacketSummary,
@@ -183,6 +184,40 @@ class ContractListOut(BaseModel):
     def from_domain(cls, result: PagedResult[ContractSummary]) -> ContractListOut:
         return cls(
             items=[ContractSummaryOut.from_domain(item) for item in result.items],
+            page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
+
+
+class OrgMemberOut(BaseModel):
+    membership_id: uuid.UUID
+    user_id: uuid.UUID
+    subject: str
+    role: str
+    scope: str
+    facility_ids: list[uuid.UUID]
+    created_at: datetime
+
+    @classmethod
+    def from_domain(cls, row: OrgMemberSummary) -> OrgMemberOut:
+        return cls(
+            membership_id=row.membership_id,
+            user_id=row.user_id,
+            subject=row.subject,
+            role=row.role.value,
+            scope=row.scope,
+            facility_ids=list(row.facility_ids),
+            created_at=row.created_at,
+        )
+
+
+class OrgMemberListOut(BaseModel):
+    items: list[OrgMemberOut]
+    page: PageMeta
+
+    @classmethod
+    def from_domain(cls, result: PagedResult[OrgMemberSummary]) -> OrgMemberListOut:
+        return cls(
+            items=[OrgMemberOut.from_domain(item) for item in result.items],
             page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
         )
 

@@ -190,6 +190,23 @@ class ContractSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class OrgMemberSummary:
+    """One row of `GET /organizations/members` (Phase 5 step 2).
+    `facility_ids` is only meaningful when `scope == "SPECIFIC_FACILITIES"`
+    -- empty for `ALL_FACILITIES`, where access is the full resolved
+    subtree rather than an enumerated list (see `db.repository.OrgMember`'s
+    docstring)."""
+
+    membership_id: uuid.UUID
+    user_id: uuid.UUID
+    subject: str
+    role: Role
+    scope: str
+    facility_ids: tuple[uuid.UUID, ...]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class AuditLogEntry:
     id: uuid.UUID
     actor: str
@@ -368,6 +385,10 @@ class Repository(Protocol):
     def list_contracts(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
     ) -> PagedResult[ContractSummary]: ...
+
+    def list_org_members(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[OrgMemberSummary]: ...
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
@@ -735,6 +756,27 @@ class PostgresRepository:
             items = [
                 ContractSummary(
                     id=row.id, payer_id=row.payer_id, name=row.name, created_at=row.created_at
+                )
+                for row in rows
+            ]
+        return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
+
+    def list_org_members(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[OrgMemberSummary]:
+        with access_session(self._session_factory, user_id) as session:
+            rows, total = db_repository.list_org_memberships(
+                session, org_id, limit=page.limit, offset=page.offset
+            )
+            items = [
+                OrgMemberSummary(
+                    membership_id=row.membership.id,
+                    user_id=row.membership.user_id,
+                    subject=row.subject,
+                    role=Role(row.membership.role),
+                    scope=row.membership.scope,
+                    facility_ids=tuple(row.facility_ids),
+                    created_at=row.membership.created_at,
                 )
                 for row in rows
             ]

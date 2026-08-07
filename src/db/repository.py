@@ -337,6 +337,70 @@ def resolve_membership_role(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class OrgMember:
+    """One row of `GET /organizations/members` (Phase 5 step 2) --
+    a `Membership` joined with the user's `subject` (memberships carries no
+    human-readable identity of its own, see `db.models.User`'s docstring)
+    and, for a `SPECIFIC_FACILITIES`-scoped membership, the facility_ids
+    it's narrowed to (empty for `ALL_FACILITIES`, where access is the full
+    resolved subtree instead, not "no facilities")."""
+
+    membership: MembershipModel
+    subject: str
+    facility_ids: list[uuid.UUID]
+
+
+def list_org_memberships(
+    session: Session, org_id: uuid.UUID, *, limit: int = 20, offset: int = 0
+) -> tuple[list[OrgMember], int]:
+    """Active (non-revoked) memberships directly on this one org -- not the
+    resolved subtree; a caller wanting the whole tree calls this once per
+    org_id they can resolve, same pattern as `list_contracts`. Requires the
+    `org_authoring_select` RLS policy
+    (`alembic/versions/0008_membership_read_policy.py`); a caller without
+    resolved access to `org_id` sees zero rows, never an error -- same "no
+    such thing as a global read" contract as every other resolved-access
+    query in this module."""
+    total = session.execute(
+        select(func.count())
+        .select_from(MembershipModel)
+        .where(MembershipModel.org_id == org_id, MembershipModel.revoked_at.is_(None))
+    ).scalar_one()
+    rows = (
+        session.execute(
+            select(MembershipModel)
+            .where(MembershipModel.org_id == org_id, MembershipModel.revoked_at.is_(None))
+            .order_by(MembershipModel.created_at.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    members = []
+    for membership in rows:
+        user = session.get(UserModel, membership.user_id)
+        if user is None:
+            raise RuntimeError(
+                f"membership {membership.id} references a user that no longer "
+                "exists -- FK constraints should make this impossible"
+            )
+        facility_ids = list(
+            session.execute(
+                select(MembershipFacilityModel.facility_id).where(
+                    MembershipFacilityModel.membership_id == membership.id
+                )
+            )
+            .scalars()
+            .all()
+        )
+        members.append(
+            OrgMember(membership=membership, subject=user.subject, facility_ids=facility_ids)
+        )
+    return members, total
+
+
 # --- Users (ungated, like organizations/facilities -- see db.models.User's docstring) --
 
 
