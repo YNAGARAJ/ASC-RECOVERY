@@ -691,6 +691,208 @@ disclosed ceiling as Phases 4/5 (F-22's local-Postgres handoff, still
 unclaimed) — migrations 0010/0011 and every DB-backed test this phase
 added are offline-verified/skip-without-a-database only.
 
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 7 (async job infrastructure) — COMPLETE
+
+Genuinely new ground, unlike Phase 6 — v1 of this codebase never had any
+job queue/worker layer at all, so there was no "already built by an
+earlier phase" overlap to audit away this time. Plan-moded given the
+size (`C:\Users\523na\.claude\plans\temporal-crunching-bear.md`), scoped
+down via two `AskUserQuestion` decisions confirmed with the user before
+writing it: **Postgres-backed queue** (`SELECT ... FOR UPDATE SKIP
+LOCKED`), not Redis+Celery/arq — this environment has zero existing
+Redis infrastructure, and Postgres is already provisioned, already
+verified via CI's real-Postgres container, and keeps the stack
+cloud-agnostic per CLAUDE.md rule 7; and **generic job infrastructure +
+ingestion as the one real, fully-wired job type** — the prompt names six
+job types, only ingestion has existing business logic to move onto a
+queue, so the other five (variance recomputation, report generation,
+notification dispatch, reprocessing, export) are named, scoped, and
+explicitly deferred, not built.
+
+### What was built
+
+- **`jobs` table** (`alembic/versions/0012_jobs.py`) — facility-scoped,
+  RLS via the same `facility_access` policy shape every table since 0001
+  uses. `payload_encrypted` reuses `security/phi_columns.py`'s existing
+  `encrypt_phi_field`/`decrypt_phi_field` (the same machinery
+  `claims.patient_name_encrypted` already uses, including Phase 6's
+  per-org BYOK key resolution) for an ingestion job's raw file
+  content — no new crypto. `dedup_key` (unique with `facility_id`/
+  `job_type`) is the file's content hash, same idempotency property
+  `record_remittance_if_new` already gave the old synchronous path.
+- **Queue primitives** (`db/repository.py`'s new "Jobs" section) —
+  `enqueue_job`, `get_job`, `list_jobs`, `cancel_job` (API-facing,
+  ordinary RLS-scoped `access_session`) versus `claim_next_job`,
+  `update_job_progress`, `is_cancel_requested`, `complete_job`,
+  `fail_job`, `cancel_job_as_cancelled` (worker-facing, owner-privileged
+  `BYPASSRLS` session — a worker sees the whole queue across every
+  facility, which is not any single user's resolved access, the same
+  reason `scripts/onboard_customer.py` needs `asc_owner`). The actual
+  *business-logic execution* is neither of those: `src/jobs/runner.py`
+  re-establishes the job's own submitter's resolved access via
+  `access_session(session_factory, job.user_id)` — this is what makes
+  "a worker can't read outside its facility scope" true, and why a
+  revoked membership takes effect on a not-yet-run job exactly like it
+  already does everywhere else.
+- **Per-org concurrency limiting** lives entirely inside
+  `claim_next_job`'s one query (a `facilities` join + `GROUP BY org_id
+  HAVING count(*) >= per_org_limit` subquery on `running` jobs) — the
+  phase's own wording is "per-org," not "per-facility," so an org owning
+  several facilities is bounded in aggregate, mirroring the design
+  language Phase 6's per-org rate-limiting ceiling already established
+  (a different mechanism: that bounds HTTP request rate, this bounds
+  concurrent job execution).
+- **Stale-lock reclaim is built into the claim query itself**
+  (`locked_at < now() - stale_lock_after`) — no separate sweep process.
+  A worker that dies mid-claim leaves a row a later `claim_next_job`
+  call picks back up once the lock goes stale.
+- **Cancellation is cooperative**, checked every 25 claims
+  (`ingestion/apply.py::_CALLBACK_INTERVAL`) inside
+  `apply_ingestion_plan`'s loop via a new `should_cancel` callback;
+  `True` raises `JobCancelledError`, which propagates out of
+  `access_session`'s `with` block uncaught, triggering an automatic
+  rollback — a cancelled job leaves zero partial claims/findings behind,
+  the same "clean slate" property idempotent re-processing already
+  relied on elsewhere in this module. The terminal `cancelled` status is
+  recorded afterward, on the separate owner connection, only once the
+  rollback has already happened.
+- **Progress reporting** — same 25-claim interval, an `on_progress`
+  callback that writes `progress_percent`/`progress_message` via the
+  owner connection, avoiding a DB round-trip per claim.
+- **Exponential backoff + dead-letter queue with alerting** —
+  `src/jobs/runner.py::_backoff_seconds` (30s base, capped at 1h,
+  doubling per attempt); `fail_job` transitions to `dead_letter` once
+  `attempts >= max_attempts` (default 5); a new, threshold-free
+  `observability/alerts.py::evaluate_job_dead_lettered_alert` fires on
+  that exact transition via the existing `NotificationPort`, plus a
+  `job_dead_lettered` audit-log entry. Errors are
+  `security/redaction.py::scrub_text`'d before storage — CLAUDE.md rule
+  6, never a raw exception message that might echo PHI.
+- **`queue_depth` OpenTelemetry `UpDownCounter`** — previously a
+  hardcoded-zero stub (`observability/metrics.py`), now `+1` on a
+  genuinely new enqueue, `-1` on claim. Disclosed as *approximate*, not
+  exact (doesn't track every later transition like retries or
+  cancel-while-queued) — `SELECT count(*) FROM jobs WHERE status IN
+  ('queued','failed')` is named as the authoritative source of truth in
+  both the metric's docstring and `docs/RUNBOOK.md` if exact numbers
+  matter.
+- **API**: `POST /remittances` now enqueues and returns `202` with a
+  `JobOut` (job id + `status: "queued"`) instead of running ingestion
+  synchronously and returning `201` with the outcome. `GET /jobs`,
+  `GET /jobs/{id}`, `POST /jobs/{id}/cancel` — all reuse the existing
+  `upload_remittance` action (`docs/PERMISSIONS.md`), no new `Action`
+  needed. `api.repository.JobSummary`/`JobOut` deliberately have **no
+  field for `payload_encrypted`** — structurally incapable of leaking a
+  job's PHI payload, not just filtered out at the response-building step.
+- **Worker entrypoint** — `src/worker.py` (`python -m worker`), a thin
+  `while True: claim_and_run_once(...) or sleep` loop around the
+  testable `src/jobs/runner.py::claim_and_run_once` core, same
+  testable-core/thin-CLI-wrapper split `scripts/ingestion/
+  poll_remittances.py` already established. Needs **two** database
+  connections: `DATABASE_URL` (`asc_app`, RLS-scoped, for job execution)
+  and a new `QUEUE_DATABASE_URL` (`asc_owner`, `BYPASSRLS`, for queue
+  bookkeeping) — never the same role for both.
+- **`src/composition.py`** (new) — extracted the environment-driven
+  adapter construction (`KMS_PROVIDER` switch, OTLP exporter selection,
+  secrets validation) that used to live only in `src/main.py`, since
+  `src/worker.py` now needs the identical logic and duplicating it would
+  have meant two places to keep in sync on every future KMS/observability
+  change.
+- **Deployment** — `docker-compose.yml` gained a `worker` service
+  (`entrypoint:` override, not `command:` — the Dockerfile's `ENTRYPOINT`
+  is exec-form, so `command:` alone would only append to `uvicorn ...`,
+  never replace it). AWS: a new `QUEUE_DATABASE_URL` Secrets Manager
+  secret (assembled from the RDS-managed `asc_owner` master password,
+  `data.aws_secretsmanager_secret_version.db_master` — previously read
+  but never actually consumed anywhere in the module, now it is) plus a
+  second `aws_ecs_task_definition`/`aws_ecs_service` (no ALB target
+  group — the worker accepts no inbound traffic; `entryPoint` override to
+  run the worker instead of uvicorn; reuses the app's own IAM role/
+  security group rather than a new narrower one, since the worker's
+  actual permission needs are a subset). Azure: the equivalent
+  `queue-database-url` Key Vault secret (this module already
+  Terraform-generates the admin password, `random_password.admin`,
+  unlike AWS's RDS-managed one) plus a second `azurerm_container_app`
+  with **no `ingress` block at all** (omitted entirely, not
+  `external_enabled = false`), `command` override, reusing the app's
+  user-assigned identity/Key Vault access policy. New Terraform
+  variables: `worker_desired_count` (AWS), `worker_min_replicas`/
+  `worker_max_replicas` (Azure) — scaling the worker is independent of
+  scaling the API. **Written and reviewed, not exercised** — same
+  disclosed ceiling as every other Terraform change in this project; no
+  Docker or live cloud account in this environment, no `terraform`
+  binary either (offline SQL generation is the only thing actually run
+  for the migration; the `.tf` changes are unverified beyond careful
+  reading against the existing app resources they mirror).
+- **`docs/RUNBOOK.md`** gained an "Operating the job queue" section:
+  scaling worker throughput (independent from API scaling, and
+  concurrency is capped per org regardless of worker count), inspecting
+  `jobs` directly for stuck/dead-lettered rows, and how cooperative
+  cancellation actually behaves (not instant, rolls back cleanly).
+
+### Deliberately deferred, named not silently dropped
+
+- The other five job types (variance recomputation, report generation,
+  notification dispatch, reprocessing, export) — the infrastructure
+  supports them (`job_type` is a plain string + a handler-registry
+  entry in `src/jobs/runner.py::_HANDLERS`), no business logic built,
+  since none has an existing implementation to move onto a queue the way
+  ingestion did.
+- `scripts/ingestion/poll_remittances.py` (SFTP/S3 polling) stays
+  calling `ingest_file` directly, unrouted through the new queue — it
+  already satisfies "not inside an HTTP request" via its own existing
+  external-cron scheduling; this phase's gate is specifically about the
+  `POST /remittances` upload path.
+- A Redis-backed rate-limiter adapter, if this ever runs as more than one
+  API replica — unrelated to this phase's own Postgres-backed queue
+  choice, same "single-process today" ceiling `security/rate_limit.py`
+  already discloses.
+
+### Tests added this phase
+
+Pure: `tests/jobs/test_payload.py` (payload serialization round-trip,
+including non-UTF8 binary content); `evaluate_job_dead_lettered_alert`
+in `tests/observability/test_alerts.py`. DB-backed (skip without
+`TEST_DATABASE_URL`): `tests/ingestion/test_apply_progress_cancel.py`
+(`on_progress`/`should_cancel` checked every `_CALLBACK_INTERVAL` claims,
+never every claim; `should_cancel() -> True` raises before any claim
+persists); `tests/db/test_jobs_queue.py` (enqueue/dedup, API-facing
+get/list/cancel with an RLS-outsider proof, claim/stale-lock-reclaim/
+progress/cancel-check/complete/fail-with-backoff/dead-letter/
+cancel-as-cancelled, and the per-org-concurrency-is-org-wide-not-
+per-facility proof with two facilities under one org); `tests/jobs/
+test_runner_live_db.py` (the actual Phase 7 gate — upload via the real
+`POST /remittances`, run it with the real `claim_and_run_once`, observe
+the outcome via the real `GET /jobs/{id}`, never leaking
+`payload_encrypted`; a claim abandoned by a simulated dead worker gets
+reclaimed by `stale_lock_after=0` and completes with exactly one
+remittance/claim, never two, despite being claimed twice; the
+ingestion-failure-rate alert's wiring proof, relocated here from
+`tests/api/test_alerts_live_db.py` now that ingestion runs inside a job,
+not inside `PostgresRepository`, at all).
+
+### Full local gate as of this commit — Phase 7 complete
+
+`ruff check .` clean, `mypy --strict .` clean (210 files, only the 2
+pre-existing unrelated alembic 0004 JSONB errors — fixed one genuinely
+new error this phase, `main.py`'s re-export of
+`MissingConfigurationError` from the new `composition.py` needing an
+explicit `as MissingConfigurationError` self-alias under
+`--no-implicit-reexport`), `pytest -q` 696 passed / 84 skipped,
+`domain/variance.py` 100% coverage gate, `python -m evals.run` GATE
+PASSED, `bandit -r . -x ./tests,./evals` clean. `pip-audit` reports 17
+pre-existing vulnerabilities across 5 packages (`ecdsa`, `pytest`,
+`python-dotenv`, `python-jose`, `starlette`) — none introduced this
+phase (no `pyproject.toml`/`requirements.lock.txt` change at all),
+already the documented status quo in `docs/SECURITY.md`'s dependency-
+scanning row; bumping them is an unrelated, separately-scoped task, not
+this phase's. Offline SQL generation verified both directions through
+migration 0012. **Not independently re-verified against a live
+Postgres** — same disclosed ceiling as every phase since 4 (F-22's
+local-Postgres handoff, still unclaimed) — every DB-backed test this
+phase added is offline-verified/skip-without-a-database only, including
+the actual Phase 7 gate test itself.
+
 ## Traps for someone resuming cold
 
 - **Everything Phase 4's checkpoint already flagged still applies**: the
@@ -720,10 +922,10 @@ added are offline-verified/skip-without-a-database only.
   password ever becomes available — there is now a full session's worth
   of offline-only-verified RLS policy and function code riding on the
   assumption the SQL is correct.
-- **Migrations 0007-0010 are additive on top of 0001, not edits to it** —
+- **Migrations 0007-0012 are additive on top of 0001, not edits to it** —
   0001's schema is sealed (same convention 0002-0006 already established
-  for Phase 4). Phase 6's BYOK work ended at migration `0010`; any
-  further schema work should be a new `0011_...` migration.
+  for Phase 4). Phase 7's `jobs` table ended at migration `0012`; any
+  further schema work should be a new `0013_...` migration.
 - **`organizations.kms_key_id` is only safe to set once `KMS_PROVIDER`
   is `aws-kms`/`azure-keyvault`** — setting it while the deployment
   still runs `EnvKMS` (the default) breaks ingestion for that org
@@ -740,46 +942,91 @@ added are offline-verified/skip-without-a-database only.
   adding without checking whether an existing action already covers it,
   the way step 4 verified `org_authoring_update` already covered
   offboarding before concluding no new RLS policy was needed.
+- **`POST /remittances` no longer runs ingestion synchronously** — it
+  enqueues and returns `202`. Anything that used to assume a `201` with
+  claim/finding counts in the response body (a script, a frontend call,
+  a test) needs to poll `GET /jobs/{id}` instead; `tests/api/
+  test_authz_matrix.py` and `test_openapi.py` both needed exactly this
+  update this phase, and both are easy to miss if grepping only for
+  `ingest_remittance` (the repository method was renamed to
+  `enqueue_remittance_ingestion`, not just re-pointed).
+- **The worker needs `QUEUE_DATABASE_URL` (`asc_owner`) in addition to
+  `DATABASE_URL` (`asc_app`)** — `src/worker.py` will `MissingConfigurationError`
+  at startup without it. `docker-compose.yml`'s `worker` service already
+  sets both; a real deployment's Terraform provisions the
+  `QUEUE_DATABASE_URL` secret but still needs the `asc_owner` role's
+  actual database grants applied via the same migration-step handoff
+  `docs/RUNBOOK.md` already documents for `asc_app` — provisioning the
+  secret is not the same as the role having `BYPASSRLS` in the actual
+  database.
+- **A job's `payload_encrypted` is real PHI (an ingestion job's raw file
+  bytes)** — never add a field for it to `JobSummary`/`JobOut`, even
+  temporarily for debugging. If a future job type's payload is *not*
+  PHI, that's a reason to reconsider whether it needs
+  `payload_encrypted` at all, not a reason to relax this one column's
+  existing contract.
+- **`src/jobs/runner.py::_HANDLERS` is the one place a future job type
+  gets registered** — before building variance recomputation/report
+  generation/notification dispatch/reprocessing/export (this phase's
+  deliberately-deferred five), re-read this phase's writeup above for
+  what's already generic (queue primitives, RLS, encryption, retry/
+  backoff/dead-letter, per-org concurrency) versus what's ingestion-
+  specific (`src/jobs/payload.py`'s `build_ingestion_payload`/
+  `parse_ingestion_payload`, `run_ingestion_job`'s own decrypt-then-call-
+  `ingest_file` shape) and shouldn't be assumed to generalize without
+  checking.
 
 ## Next steps
 
-Phase 6 is complete. Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order,
-**Phase 7 (async job infrastructure) is next** — genuinely new ground,
-unlike Phase 6 (v1 never had any job queue/worker layer at all, so there
-is no "already built by an earlier phase" overlap to audit away this
-time; don't assume otherwise without checking). The prompt's own
-summary: nothing heavy may run inside an HTTP request. A job queue and
-workers (Celery/arq + Redis, or Postgres-backed — must stay
-cloud-portable per CLAUDE.md rule 7); job types covering ingestion,
-variance recomputation, report generation, notification dispatch,
-reprocessing, export; idempotent jobs; retry with exponential backoff;
-a dead-letter queue with alerting; **per-org concurrency limits** (a
-different mechanism from Phase 6's per-org *rate-limiting* ceiling —
-that bounds HTTP request rate, this bounds concurrent job execution, and
-they'll likely want to share the "don't let one large customer starve
-everyone else" design language but are not the same control); progress
-reporting; cancellation; job history with actor and outcome; and
-**jobs carry the access context** so a worker can't read outside its
-facility scope (this needs real thought — a job dispatched from an
-HTTP request has `AuthContext`, but a job's *execution* happens outside
-any request, so whatever carries facility/org scope into the job needs
-its own serialization and RLS-session-setup story, not just reusing
-`AuthContext` directly). **Gate**: a 5,000-claim 835 processes end to
-end via a job, with progress visible, and a killed worker resumes
-without duplicating findings. This is a substantially bigger phase than
-Phase 5 or 6 — plan-mode it, and don't assume it fits in one sitting the
-way the per-org rate-limit/data-residency additions did.
+Phase 7 is complete. Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order,
+**Phase 8 (contract modeling depth) is next** — the prompt's own framing:
+"v1's contract model produces false positives on correctly paid claims.
+Fix it properly," and it explicitly says to plan-mode it first, same as
+Phase 7. All terms are data in versioned tables, effective-dated, never
+code: lesser-of-billed-vs-fee-schedule logic (**implement first** — the
+prompt is explicit that without it, any claim billed below the fee
+schedule is misreported as underpaid), stop-loss/outlier with
+first-dollar-language support, configurable-per-payer multiple-procedure
+reduction percentages, bilateral/assistant-surgeon/co-surgeon/
+discontinued-procedure modifiers, implant carve-outs (invoice-cost-plus-
+markup, percent-of-billed, flat-rate), case rates/per-diems/percent-of-
+charge/RVU-based pricing, annual escalators, global periods and NCCI
+edits, payer-type-specific rules (Medicare/Medicaid/commercial/workers'
+comp/auto), prompt-pay interest (configurable per state), and recovery
+statute-of-limitations per state (a finding outside the window must be
+marked non-actionable, never silently listed). **Gate**: precision on
+the extended golden set ≥ 98%, with lesser-of and stop-loss cases
+producing zero false positives. **Audit amendment (register F-16, F-17)**
+— v1 shipped two silent pricing defects the domain-layer tests never
+caught because they exercised the pricing function directly with
+hand-built inputs, never through the real ingestion path: an enum value
+(`BilateralConvention.TWO_LINE_SPLIT`) with no pricing branch
+implemented, and implant carve-out logic that was correct in isolation
+but never fired because the ingestion layer hardcoded the invoice-cost
+field to empty. **Every enum value this phase introduces must have an
+implementation before it can be stored on a contract, and every domain
+rule's test must include at least one case through the real parsing/
+ingestion path end to end, not only the pure pricing function called
+directly** — don't repeat v1's mistake.
+
+Before assuming any of this is unbuilt, audit the actual code against
+the actual prompt first — Phase 6 turned out to have most of its
+checklist already true from earlier phases/Wave 3 remediation, and
+Phase 8 may have partial overlap with whatever `domain/contract.py`
+already does (worth checking before planning as if starting from zero).
 
 1. **If picking this up much later**, re-verify the full local gate
    before trusting anything — confirm the current commit's status
    before trusting it.
-2. **If the F-22 Postgres password becomes available**, run Phases 4,
-   5, and 6's live-DB suites for real before trusting any of their
+2. **If the F-22 Postgres password becomes available**, run Phases 4-7's
+   live-DB suites for real before trusting any of their
    RLS/function code beyond what's offline-verified — this now includes
-   migrations 0010/0011 and every BYOK/data-residency DB test
+   migrations 0010-0012 and every BYOK/data-residency/job-queue DB test
    (`tests/db/test_organization_kms_key.py`,
    `tests/ingestion/test_apply_org_kms_key.py`,
-   `tests/db/test_org_policy.py`'s new data-residency tests), never run
-   against a real Postgres in this environment. Doing this before
-   starting Phase 7's own DB-backed work (job history, most likely)
-   would mean verifying one large batch together instead of two.
+   `tests/db/test_org_policy.py`'s data-residency tests,
+   `tests/db/test_jobs_queue.py`, `tests/jobs/test_runner_live_db.py`,
+   `tests/ingestion/test_apply_progress_cancel.py`), never run against a
+   real Postgres in this environment. Doing this before starting Phase
+   8's own DB-backed work would mean verifying one large batch together
+   instead of several small ones.
