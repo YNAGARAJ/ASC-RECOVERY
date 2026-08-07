@@ -114,7 +114,7 @@ _ORG_TREE_CTE = """
     )
 """
 
-_RESOLVE_FACILITY_IDS_SQL = f"""
+_RESOLVE_FACILITY_IDS_SQL = """
 CREATE FUNCTION resolve_accessible_facility_ids(p_user_id uuid)
 RETURNS TABLE(facility_id uuid)
 LANGUAGE sql
@@ -122,7 +122,7 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-    {_ORG_TREE_CTE.format(scope_filter=" AND m.scope = 'ALL_FACILITIES'")}
+    {org_tree_cte}
     SELECT DISTINCT f.id
     FROM facilities f
     JOIN org_tree ot ON f.org_id = ot.id
@@ -134,7 +134,7 @@ AS $$
 $$;
 """
 
-_RESOLVE_ORG_IDS_SQL = f"""
+_RESOLVE_ORG_IDS_SQL = """
 CREATE FUNCTION resolve_accessible_org_ids(p_user_id uuid)
 RETURNS TABLE(org_id uuid)
 LANGUAGE sql
@@ -142,15 +142,22 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-    {_ORG_TREE_CTE.format(scope_filter="")}
+    {org_tree_cte}
     SELECT DISTINCT id FROM org_tree;
 $$;
 """
 
 
 def _create_access_resolution_functions() -> None:
-    op.execute(text(_RESOLVE_FACILITY_IDS_SQL))
-    op.execute(text(_RESOLVE_ORG_IDS_SQL))
+    # nosec B608 -- `.format()` here only ever substitutes the two
+    # module-level _ORG_TREE_CTE variants above (fixed DDL text, no
+    # external/user input reaches either of these two templates).
+    facility_sql = _RESOLVE_FACILITY_IDS_SQL.format(
+        org_tree_cte=_ORG_TREE_CTE.format(scope_filter=" AND m.scope = 'ALL_FACILITIES'")
+    )
+    org_sql = _RESOLVE_ORG_IDS_SQL.format(org_tree_cte=_ORG_TREE_CTE.format(scope_filter=""))
+    op.execute(text(facility_sql))
+    op.execute(text(org_sql))
     function_signatures = (
         "resolve_accessible_facility_ids(uuid)",
         "resolve_accessible_org_ids(uuid)",
@@ -165,7 +172,10 @@ def _secure_facility_scoped(table: str) -> None:
     op.execute(text(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
     op.execute(
         text(
-            f"CREATE POLICY facility_access ON {table} "
+            # `table` is always one of the module-level
+            # _FACILITY_SCOPED_TABLES entries, a fixed internal tuple,
+            # never external/user input.
+            f"CREATE POLICY facility_access ON {table} "  # nosec B608
             "USING (facility_id IN (SELECT facility_id FROM "
             "resolve_accessible_facility_ids(current_setting('app.user_id')::uuid))) "
             "WITH CHECK (facility_id IN (SELECT facility_id FROM "
@@ -179,7 +189,10 @@ def _secure_org_scoped(table: str) -> None:
     op.execute(text(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
     op.execute(
         text(
-            f"CREATE POLICY org_access ON {table} "
+            # `table` is always one of the module-level
+            # _ORG_SCOPED_TABLES entries, a fixed internal tuple, never
+            # external/user input.
+            f"CREATE POLICY org_access ON {table} "  # nosec B608
             "USING (org_id IN (SELECT org_id FROM "
             "resolve_accessible_org_ids(current_setting('app.user_id')::uuid))) "
             "WITH CHECK (org_id IN (SELECT org_id FROM "

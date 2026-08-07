@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from security.rbac import Action, Role, can
 
-_MASK_TOKEN = "[MASKED]"
+_MASK_TOKEN = "[MASKED]"  # nosec B105 -- a display placeholder, not a credential
 
 
 def mask_phi_value(role: Role, value: str | None) -> str | None:
