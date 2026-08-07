@@ -37,6 +37,15 @@ ordinary service user with an ordinary `Membership` row
 service account work exactly like offboarding a human one: revoking that
 `Membership` (not the `ApiKey` row itself) makes `resolve_membership_role`
 return `None` on the very next request either way.
+
+**Per-org IP allowlist (Phase 5 step 6)** is enforced in
+`_resolve_auth_context`, after role resolution -- both the JWT and
+API-key branches converge here, so a configured `org_policies
+.ip_allowlist` restricts either kind of credential identically. A
+missing policy row or an empty/unset list means no restriction (the
+lazy-creation default, `db.models.OrgPolicy`'s docstring); matching
+itself is `security.ip_allowlist.ip_allowed`, a pure function this module
+never re-implements.
 """
 
 from __future__ import annotations
@@ -48,6 +57,7 @@ from datetime import UTC, datetime
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from api.repository import Repository
+from security.ip_allowlist import ip_allowed
 from security.rbac import Action, Role, can
 from security.session import InvalidTokenError, validate_access_token
 from security.tokens import API_KEY_PREFIX
@@ -151,6 +161,16 @@ def _resolve_auth_context(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="no active membership grants access to this organization",
         )
+
+    policy = repository.get_org_policy(user_id, org_id)
+    if policy is not None and policy.ip_allowlist:
+        client_ip = request.client.host if request.client is not None else None
+        if not ip_allowed(client_ip, policy.ip_allowlist):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="request origin not permitted by organization policy",
+            )
+
     facility_id = repository.resolve_default_facility_id(user_id, org_id)
 
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))

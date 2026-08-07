@@ -39,6 +39,7 @@ from api.repository import (
     InvitationSummary,
     LoginCredentials,
     OrgMemberSummary,
+    OrgPolicySummary,
     Page,
     PagedResult,
     RecordOutcomeInput,
@@ -92,6 +93,14 @@ class _ApiKey:
 
 
 @dataclass(frozen=True, slots=True)
+class _OrgPolicy:
+    session_timeout_seconds: int | None
+    mfa_required: bool
+    ip_allowlist: tuple[str, ...]
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _Invitation:
     id: uuid.UUID
     org_id: uuid.UUID
@@ -115,6 +124,7 @@ class FakeRepository:
     memberships: list[_Membership] = field(default_factory=list)
     invitations: dict[uuid.UUID, _Invitation] = field(default_factory=dict)
     api_keys: dict[uuid.UUID, _ApiKey] = field(default_factory=dict)
+    org_policies: dict[uuid.UUID, _OrgPolicy] = field(default_factory=dict)
     findings: dict[uuid.UUID, tuple[uuid.UUID, FindingDetail]] = field(default_factory=dict)
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
@@ -623,6 +633,41 @@ class FakeRepository:
         key = self.api_keys.get(api_key_id)
         if key is not None:
             self.api_keys[api_key_id] = replace(key, last_used_at=now())
+
+    def get_org_policy(self, user_id: uuid.UUID, org_id: uuid.UUID) -> OrgPolicySummary | None:
+        if org_id not in self._accessible_org_ids(user_id):
+            return None
+        policy = self.org_policies.get(org_id)
+        if policy is None:
+            return None
+        return OrgPolicySummary(
+            session_timeout_seconds=policy.session_timeout_seconds,
+            mfa_required=policy.mfa_required,
+            ip_allowlist=policy.ip_allowlist,
+            updated_at=policy.updated_at,
+        )
+
+    def set_org_policy(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        session_timeout_seconds: int | None,
+        ip_allowlist: Sequence[str] | None,
+    ) -> OrgPolicySummary:
+        policy = _OrgPolicy(
+            session_timeout_seconds=session_timeout_seconds,
+            mfa_required=True,
+            ip_allowlist=tuple(ip_allowlist) if ip_allowlist else (),
+            updated_at=now(),
+        )
+        self.org_policies[org_id] = policy
+        return OrgPolicySummary(
+            session_timeout_seconds=policy.session_timeout_seconds,
+            mfa_required=policy.mfa_required,
+            ip_allowlist=policy.ip_allowlist,
+            updated_at=policy.updated_at,
+        )
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str

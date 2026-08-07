@@ -47,6 +47,7 @@ from db.models import InvitationFacility as InvitationFacilityModel
 from db.models import Membership as MembershipModel
 from db.models import MembershipFacility as MembershipFacilityModel
 from db.models import Organization as OrganizationModel
+from db.models import OrgPolicy as OrgPolicyModel
 from db.models import PHIAccessLog as PHIAccessLogModel
 from db.models import RecoveryPacket as RecoveryPacketModel
 from db.models import Remittance as RemittanceModel
@@ -670,6 +671,47 @@ def touch_api_key_last_used(session: Session, api_key_id: uuid.UUID) -> None:
     session.execute(
         update(ApiKeyModel).where(ApiKeyModel.id == api_key_id).values(last_used_at=func.now())
     )
+
+
+# --- Per-org policy (Phase 5 step 6) -------------------------------------------
+
+
+def get_org_policy(session: Session, org_id: uuid.UUID) -> OrgPolicyModel | None:
+    """A missing row means "use the application defaults" -- lazy
+    creation, `db.models.OrgPolicy`'s docstring. RLS-scoped like every
+    other org-resolved read; a caller without resolved access to `org_id`
+    gets `None` here indistinguishably from "no policy configured yet"."""
+    return session.get(OrgPolicyModel, org_id)
+
+
+def upsert_org_policy(
+    session: Session,
+    org_id: uuid.UUID,
+    *,
+    session_timeout_seconds: int | None,
+    ip_allowlist: Sequence[str] | None,
+) -> OrgPolicyModel:
+    """`mfa_required` is deliberately never a parameter here -- by explicit
+    product decision (`db.models.OrgPolicy`'s docstring) there is no code
+    path anywhere that can set it to anything but its `true` default; a
+    freshly created row gets it set explicitly (rather than left for the
+    server default) so the returned object is correct without a second
+    round trip to refresh it."""
+    policy = session.get(OrgPolicyModel, org_id)
+    if policy is None:
+        policy = OrgPolicyModel(
+            org_id=org_id,
+            session_timeout_seconds=session_timeout_seconds,
+            mfa_required=True,
+            ip_allowlist=list(ip_allowlist) if ip_allowlist else None,
+        )
+        session.add(policy)
+    else:
+        policy.session_timeout_seconds = session_timeout_seconds
+        policy.ip_allowlist = list(ip_allowlist) if ip_allowlist else None
+        policy.updated_at = datetime.now(UTC)
+    session.flush()
+    return policy
 
 
 # --- Effective-dated contracts --------------------------------------------------

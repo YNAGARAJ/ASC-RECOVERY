@@ -25,6 +25,7 @@ from api.repository import (
     InvitationPreview,
     InvitationSummary,
     OrgMemberSummary,
+    OrgPolicySummary,
     PacketGenerationFailed,
     PagedResult,
     RecoveryPacketSummary,
@@ -356,6 +357,30 @@ class ApiKeyListOut(BaseModel):
         return cls(
             items=[ApiKeyOut.from_domain(item) for item in result.items],
             page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
+
+
+class UpdateOrgPolicyIn(BaseModel):
+    # 60s floor / 24h ceiling -- a sanity guardrail against a policy that
+    # would make the product nearly unusable (near-zero) or meaningless
+    # (multi-week) rather than a considered security boundary either way.
+    session_timeout_seconds: int | None = Field(default=None, ge=60, le=86_400)
+    ip_allowlist: list[str] = Field(default_factory=list)
+
+
+class OrgPolicyOut(BaseModel):
+    session_timeout_seconds: int | None
+    mfa_required: bool
+    ip_allowlist: list[str]
+    updated_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, row: OrgPolicySummary) -> OrgPolicyOut:
+        return cls(
+            session_timeout_seconds=row.session_timeout_seconds,
+            mfa_required=row.mfa_required,
+            ip_allowlist=list(row.ip_allowlist),
+            updated_at=row.updated_at,
         )
 
 

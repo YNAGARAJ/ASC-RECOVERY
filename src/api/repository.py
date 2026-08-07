@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from opentelemetry.trace import Tracer
 from sqlalchemy import text
@@ -303,6 +303,23 @@ class ApiKeyAuthLookup:
 
 
 @dataclass(frozen=True, slots=True)
+class OrgPolicySummary:
+    """`mfa_required` is always `True` -- no code path in this codebase
+    can ever produce anything else (`db.models.OrgPolicy`'s docstring);
+    it's surfaced here purely so `GET /org-policy` can state the fact
+    truthfully rather than omitting it and leaving a reader to wonder."""
+
+    session_timeout_seconds: int | None
+    mfa_required: bool
+    ip_allowlist: tuple[str, ...]
+    # None only when no policy row exists yet for this org -- the
+    # lazy-creation default (`db.models.OrgPolicy`'s docstring); every
+    # other field above is still meaningful in that state (the
+    # application defaults), this alone has nothing to report.
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class AuditLogEntry:
     id: uuid.UUID
     actor: str
@@ -426,6 +443,19 @@ def _rule_input_to_contract_version(data: ContractVersionInput) -> ContractVersi
     )
 
 
+def _org_policy_summary(row: Any) -> OrgPolicySummary:
+    """Shared by both `get_org_policy`/`set_org_policy` -- `row` is a
+    `db.models.OrgPolicy` instance; typed `Any` to avoid importing the ORM
+    model into this module's public surface for a private helper only
+    this file calls."""
+    return OrgPolicySummary(
+        session_timeout_seconds=row.session_timeout_seconds,
+        mfa_required=row.mfa_required,
+        ip_allowlist=tuple(row.ip_allowlist or ()),
+        updated_at=row.updated_at,
+    )
+
+
 class Repository(Protocol):
     """`user_id` (first positional param on every access-scoped method) is
     who this call runs as -- it's what `access_session` sets `app.user_id`
@@ -524,6 +554,17 @@ class Repository(Protocol):
     def get_api_key_for_auth(self, raw_key: str) -> ApiKeyAuthLookup | None: ...
 
     def touch_api_key_last_used(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> None: ...
+
+    def get_org_policy(self, user_id: uuid.UUID, org_id: uuid.UUID) -> OrgPolicySummary | None: ...
+
+    def set_org_policy(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        session_timeout_seconds: int | None,
+        ip_allowlist: Sequence[str] | None,
+    ) -> OrgPolicySummary: ...
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
@@ -1104,6 +1145,30 @@ class PostgresRepository:
     def touch_api_key_last_used(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> None:
         with access_session(self._session_factory, user_id) as session:
             db_repository.touch_api_key_last_used(session, api_key_id)
+
+    def get_org_policy(self, user_id: uuid.UUID, org_id: uuid.UUID) -> OrgPolicySummary | None:
+        with access_session(self._session_factory, user_id) as session:
+            row = db_repository.get_org_policy(session, org_id)
+        if row is None:
+            return None
+        return _org_policy_summary(row)
+
+    def set_org_policy(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        session_timeout_seconds: int | None,
+        ip_allowlist: Sequence[str] | None,
+    ) -> OrgPolicySummary:
+        with access_session(self._session_factory, user_id) as session:
+            row = db_repository.upsert_org_policy(
+                session,
+                org_id,
+                session_timeout_seconds=session_timeout_seconds,
+                ip_allowlist=ip_allowlist,
+            )
+        return _org_policy_summary(row)
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str

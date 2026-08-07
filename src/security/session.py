@@ -30,7 +30,23 @@ username/password and MFA verification -- the login endpoint
 succeed. It does not implement the OIDC handshake itself (there's no
 FastAPI app yet to host it).
 
-Access tokens are short-lived (`ACCESS_TOKEN_TTL`). Refresh tokens rotate
+**Per-org session timeout (Phase 5 step 6).** `issue_session`'s optional
+`access_token_ttl` lets a caller override `ACCESS_TOKEN_TTL` for one
+session -- `api/routes/auth.py`'s login route passes
+`org_policies.session_timeout_seconds` here when the logging-in user's
+org has one configured. This module has no database access itself and
+does not know what "an org" is; the override is a bare `timedelta`, kept
+that way deliberately so this module's own tests never need a
+`Repository`. Only the access token's lifetime is affected -- the refresh
+token keeps `REFRESH_TOKEN_TTL` regardless, and `refresh_session` (no
+`Repository` access either, by the same design) always re-mints at the
+default `ACCESS_TOKEN_TTL`, not the original session's override; carrying
+a per-org override across a refresh needs a repository lookup this
+module deliberately doesn't have, so it's out of this step's scope (no
+`POST /auth/refresh` route exists yet to call `refresh_session` from at
+all).
+
+Access tokens are short-lived (`ACCESS_TOKEN_TTL` by default). Refresh tokens rotate
 on every use: the caller must track used refresh-token ids (`revoked_ids`)
 so a stolen-then-replayed refresh token is rejected.
 `require_recent_auth()` is for callers that must force re-auth for a
@@ -84,6 +100,7 @@ def issue_session(
     active_org_id: str,
     *,
     mfa_verified: bool,
+    access_token_ttl: timedelta | None = None,
     now: datetime | None = None,
 ) -> SessionTokens:
     if not mfa_verified:
@@ -97,6 +114,7 @@ def issue_session(
         active_org_id=active_org_id,
         auth_time=issued_at,
         issued_at=issued_at,
+        access_token_ttl=access_token_ttl or ACCESS_TOKEN_TTL,
     )
 
 
@@ -138,6 +156,7 @@ def refresh_session(
         active_org_id=payload["active_org_id"],
         auth_time=original_auth_time,
         issued_at=issued_at,
+        access_token_ttl=ACCESS_TOKEN_TTL,
     )
 
 
@@ -150,7 +169,13 @@ def require_recent_auth(claims: AccessTokenClaims, *, now: datetime | None = Non
 
 
 def _mint_pair(
-    secret_key: str, *, user_id: str, active_org_id: str, auth_time: datetime, issued_at: datetime
+    secret_key: str,
+    *,
+    user_id: str,
+    active_org_id: str,
+    auth_time: datetime,
+    issued_at: datetime,
+    access_token_ttl: timedelta,
 ) -> SessionTokens:
     refresh_token_id = str(uuid.uuid4())
     access_payload = {
@@ -158,7 +183,7 @@ def _mint_pair(
         "active_org_id": active_org_id,
         "auth_time": auth_time.timestamp(),
         "iat": issued_at.timestamp(),
-        "exp": (issued_at + ACCESS_TOKEN_TTL).timestamp(),
+        "exp": (issued_at + access_token_ttl).timestamp(),
         "type": "access",
     }
     refresh_payload = {

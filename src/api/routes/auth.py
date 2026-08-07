@@ -31,6 +31,8 @@ consecutive-failure count rather than keeping a second, separate one.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from api.auth import get_repository
@@ -125,10 +127,21 @@ def login(
         )
 
     lockout.record_success(body.subject)
+    # Phase 5 step 6: an org's own session_timeout_seconds, if configured,
+    # overrides the default access-token lifetime for this login -- read
+    # via the now-authenticated user's own resolved access, same as any
+    # other org-resolved query (password + MFA already verified above).
+    policy = repository.get_org_policy(credentials.user_id, credentials.default_org_id)
+    access_token_ttl = (
+        timedelta(seconds=policy.session_timeout_seconds)
+        if policy is not None and policy.session_timeout_seconds is not None
+        else None
+    )
     tokens = issue_session(
         _secret_key(request),
         credentials.subject,
         str(credentials.default_org_id),
         mfa_verified=True,
+        access_token_ttl=access_token_ttl,
     )
     return LoginOut(access_token=tokens.access_token, refresh_token=tokens.refresh_token)

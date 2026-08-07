@@ -7,10 +7,12 @@ from __future__ import annotations
 import inspect
 from datetime import UTC, datetime, timedelta
 
+import jwt
 import pytest
 
 import security.session as session_module
 from security.session import (
+    ACCESS_TOKEN_TTL,
     InvalidTokenError,
     MFANotVerifiedError,
     issue_session,
@@ -146,6 +148,62 @@ def test_access_token_expires_after_its_ttl() -> None:
     tokens = issue_session(_SECRET, "user-1", _ORG_ID, mfa_verified=True, now=long_ago)
     with pytest.raises(InvalidTokenError):
         validate_access_token(_SECRET, tokens.access_token)
+
+
+# --- access_token_ttl override (Phase 5 step 6, per-org session timeout) -------
+
+
+def test_access_token_ttl_override_can_shorten_the_default_window() -> None:
+    """A token minted 2 seconds ago is still well within the 15-minute
+    default TTL -- proves a 1-second override actually took effect,
+    rather than this just being the default expiring normally."""
+    almost_now = datetime.now(UTC) - timedelta(seconds=2)
+    tokens = issue_session(
+        _SECRET,
+        "user-1",
+        _ORG_ID,
+        mfa_verified=True,
+        access_token_ttl=timedelta(seconds=1),
+        now=almost_now,
+    )
+    with pytest.raises(InvalidTokenError):
+        validate_access_token(_SECRET, tokens.access_token)
+
+
+def test_access_token_ttl_override_can_lengthen_the_default_window() -> None:
+    """The same `long_ago` timestamp that expires under the default TTL
+    (`test_access_token_expires_after_its_ttl`) still validates under a
+    long enough override -- proves the override, not just the default,
+    governs expiry."""
+    long_ago = datetime(2020, 1, 1, tzinfo=UTC)
+    tokens = issue_session(
+        _SECRET,
+        "user-1",
+        _ORG_ID,
+        mfa_verified=True,
+        access_token_ttl=timedelta(days=999_999),
+        now=long_ago,
+    )
+    claims = validate_access_token(_SECRET, tokens.access_token)
+    assert claims.user_id == "user-1"
+
+
+def test_refresh_session_ignores_the_original_sessions_ttl_override() -> None:
+    """`refresh_session` has no `Repository` access (module docstring), so
+    it always re-mints at the default `ACCESS_TOKEN_TTL` -- a refreshed
+    token from a session that was issued with a *shorter* override does
+    not inherit that shorter window. Decodes the raw JWT payload directly
+    (bypassing `validate_access_token`'s real-wall-clock expiry check) so
+    this is a deterministic proof about the `exp`/`iat` gap, not a timing-
+    dependent one about whether the token happens to still be valid when
+    the assertion runs."""
+    original = issue_session(
+        _SECRET, "user-1", _ORG_ID, mfa_verified=True, access_token_ttl=timedelta(seconds=1)
+    )
+    refreshed = refresh_session(_SECRET, original.refresh_token, revoked_ids=set())
+    payload = jwt.decode(refreshed.access_token, _SECRET, algorithms=["HS256"])
+    ttl_seconds = payload["exp"] - payload["iat"]
+    assert ttl_seconds == pytest.approx(ACCESS_TOKEN_TTL.total_seconds())
 
 
 # --- require_recent_auth --------------------------------------------------------

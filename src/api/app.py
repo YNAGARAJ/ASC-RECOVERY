@@ -22,6 +22,7 @@ from api.routes import (
     findings,
     health,
     invitations,
+    org_policy,
     organizations,
     packets,
     remittances,
@@ -80,6 +81,7 @@ def create_app(
     app.include_router(organizations.router)
     app.include_router(invitations.router)
     app.include_router(api_keys.router)
+    app.include_router(org_policy.router)
     app.include_router(audit.router)
     app.include_router(packets.router)
 
