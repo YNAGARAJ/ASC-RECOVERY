@@ -23,18 +23,34 @@ the same bootstrap problem `organizations`/`facilities` don't have).
 `db.models.User.subject`) is carried separately from `user_id` (the
 opaque DB primary key `access_session` needs) specifically for audit-log
 `actor` fields -- those want something a reviewer can read, not a UUID.
+
+**API keys (Phase 5 step 5)** authenticate the same bearer header, just
+never a JWT: `token.startswith(API_KEY_PREFIX)` branches to
+`_auth_context_from_api_key` *before* `validate_access_token` is ever
+called, so an API key is never run through JWT signature verification (it
+isn't one) and a JWT is never hashed and looked up as a key (wasted
+work). Both branches converge on the same `_resolve_auth_context` --
+role/facility resolution is identical either way, reusing the exact same
+`memberships`-backed machinery, since an API key's `user_id` is an
+ordinary service user with an ordinary `Membership` row
+(`db.models.ApiKey`'s docstring). This is also what makes offboarding a
+service account work exactly like offboarding a human one: revoking that
+`Membership` (not the `ApiKey` row itself) makes `resolve_membership_role`
+return `None` on the very next request either way.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from api.repository import Repository
 from security.rbac import Action, Role, can
 from security.session import InvalidTokenError, validate_access_token
+from security.tokens import API_KEY_PREFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +89,9 @@ async def get_auth_context(
         )
     token = authorization.removeprefix("Bearer ")
 
+    if token.startswith(API_KEY_PREFIX):
+        return _auth_context_from_api_key(request, repository, token)
+
     try:
         claims = validate_access_token(_secret_key(request), token)
     except InvalidTokenError as exc:
@@ -85,22 +104,59 @@ async def get_auth_context(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unknown user")
 
     org_id = uuid.UUID(claims.active_org_id)
-    role = repository.resolve_membership_role(user.id, org_id)
+    return _resolve_auth_context(
+        request, repository, user_id=user.id, subject=user.subject, org_id=org_id
+    )
+
+
+def _auth_context_from_api_key(
+    request: Request, repository: Repository, token: str
+) -> AuthContext:
+    record = repository.get_api_key_for_auth(token)
+    if record is None or record.revoked_at is not None or record.expires_at < datetime.now(UTC):
+        # Unknown, revoked, and expired all collapse to the same response
+        # -- an attacker probing a dead key learns nothing about which of
+        # the three it was.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid or expired API key"
+        )
+    ctx = _resolve_auth_context(
+        request,
+        repository,
+        user_id=record.user_id,
+        subject=f"api-key:{record.name}",
+        org_id=record.org_id,
+    )
+    # Best-effort bookkeeping, after the fact -- never blocks the request
+    # this key just legitimately authenticated.
+    repository.touch_api_key_last_used(record.user_id, record.id)
+    return ctx
+
+
+def _resolve_auth_context(
+    request: Request,
+    repository: Repository,
+    *,
+    user_id: uuid.UUID,
+    subject: str,
+    org_id: uuid.UUID,
+) -> AuthContext:
+    role = repository.resolve_membership_role(user_id, org_id)
     if role is None:
-        # No membership at active_org_id (or any ancestor of it) for this
-        # user -- revoked, never existed, or the org itself no longer
-        # exists. The safe default is to trust nothing and force
-        # re-auth/re-selection of an org, not to guess.
+        # No membership at org_id (or any ancestor of it) for this user --
+        # revoked, never existed, or the org itself no longer exists. The
+        # safe default is to trust nothing and force re-auth/re-selection
+        # of an org, not to guess.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="no active membership grants access to this organization",
         )
-    facility_id = repository.resolve_default_facility_id(user.id, org_id)
+    facility_id = repository.resolve_default_facility_id(user_id, org_id)
 
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     return AuthContext(
-        user_id=user.id,
-        subject=user.subject,
+        user_id=user_id,
+        subject=subject,
         role=role,
         org_id=org_id,
         facility_id=facility_id,

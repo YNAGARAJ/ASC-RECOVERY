@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from db.access_history import AccessEvent, merge_access_history
 from db.models import Adjustment as AdjustmentModel
+from db.models import ApiKey as ApiKeyModel
 from db.models import AuditLog as AuditLogModel
 from db.models import Claim as ClaimModel
 from db.models import Contract as ContractModel
@@ -554,6 +555,121 @@ def create_user(
     session.add(user)
     session.flush()
     return user
+
+
+# --- API keys (Phase 5 step 5) -----------------------------------------------
+
+
+def create_api_key(
+    session: Session,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    name: str,
+    key_hash: str,
+    created_by: uuid.UUID,
+    expires_at: datetime,
+) -> ApiKeyModel:
+    """Ordinary RLS-scoped write, same convention as `create_invitation` --
+    must run inside `access_session` as the creating (already-authenticated)
+    admin. `user_id` is a freshly created service `User` row (see
+    `api.repository.PostgresRepository.create_api_key`), not the admin's
+    own -- `key_hash` is computed by the caller (`security.tokens.hash_token`);
+    this function never sees the raw key."""
+    api_key = ApiKeyModel(
+        org_id=org_id,
+        user_id=user_id,
+        name=name,
+        key_hash=key_hash,
+        created_by=created_by,
+        expires_at=expires_at,
+    )
+    session.add(api_key)
+    session.flush()
+    return api_key
+
+
+def list_api_keys(
+    session: Session, org_id: uuid.UUID, *, limit: int = 20, offset: int = 0
+) -> tuple[list[ApiKeyModel], int]:
+    """Every key on this org, active or not -- masking (never returning
+    `key_hash`) and any "active only" filtering is an API-layer concern,
+    same split as `list_org_memberships` deliberately returning revoked
+    memberships too and letting callers decide."""
+    total = session.execute(
+        select(func.count()).select_from(ApiKeyModel).where(ApiKeyModel.org_id == org_id)
+    ).scalar_one()
+    rows = (
+        session.execute(
+            select(ApiKeyModel)
+            .where(ApiKeyModel.org_id == org_id)
+            .order_by(ApiKeyModel.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows), total
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyAuthLookup:
+    """What `get_api_key_by_hash` (the `SECURITY DEFINER` function,
+    `alembic/versions/0009_api_key_lookup_function.py`) returns -- an
+    anonymous, hash-authorized read, so this runs on a plain session, not
+    `access_session` (there is no `user_id` yet; see that function's own
+    docstring for why it bypasses RLS by design)."""
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    user_id: uuid.UUID
+    name: str
+    revoked_at: datetime | None
+    expires_at: datetime
+
+
+def get_api_key_by_hash(session: Session, key_hash: str) -> ApiKeyAuthLookup | None:
+    row = (
+        session.execute(
+            text(
+                "SELECT id, org_id, user_id, name, revoked_at, expires_at "
+                "FROM get_api_key_by_hash(:key_hash)"
+            ),
+            {"key_hash": key_hash},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    return ApiKeyAuthLookup(**row)
+
+
+def revoke_api_key(session: Session, api_key_id: uuid.UUID) -> bool:
+    """Offboarding's API-key counterpart -- same soft-revoke-via-UPDATE
+    shape as `revoke_membership`, gated by the same `org_access` RLS
+    policy an org-resolved admin already has on `api_keys` (0007)."""
+    result = session.execute(
+        update(ApiKeyModel)
+        .where(ApiKeyModel.id == api_key_id, ApiKeyModel.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    return result.rowcount > 0
+
+
+def touch_api_key_last_used(session: Session, api_key_id: uuid.UUID) -> None:
+    """Best-effort bookkeeping, called from the authenticated (already
+    resolved-to-a-user_id) side of api-key auth, inside `access_session`
+    scoped to that key's own service user -- `org_access`'s UPDATE grant
+    covers it because that user's own membership resolves access to
+    `api_key.org_id`. Not gated on `revoked_at`/`expires_at` -- by the time
+    this is called, `api/auth.py` has already rejected a revoked or
+    expired key, so this only ever runs for a key that just successfully
+    authenticated."""
+    session.execute(
+        update(ApiKeyModel).where(ApiKeyModel.id == api_key_id).values(last_used_at=func.now())
+    )
 
 
 # --- Effective-dated contracts --------------------------------------------------

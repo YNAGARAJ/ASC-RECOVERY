@@ -16,6 +16,8 @@ from pydantic import BaseModel, Field
 from api.repository import (
     AcceptedInvitation,
     AccessEventSummary,
+    ApiKeyListItem,
+    ApiKeySummary,
     AuditLogEntry,
     ContractSummary,
     FindingDetail,
@@ -297,6 +299,64 @@ class ConfirmInvitationMfaIn(BaseModel):
 
 class ConfirmInvitationMfaOut(BaseModel):
     verified: bool
+
+
+class CreateApiKeyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    scope: Literal["ALL_FACILITIES", "SPECIFIC_FACILITIES"] = "ALL_FACILITIES"
+    facility_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class ApiKeyCreatedOut(BaseModel):
+    id: uuid.UUID
+    key: str
+    name: str
+    scope: str
+    facility_ids: list[uuid.UUID]
+    expires_at: datetime
+
+    @classmethod
+    def from_domain(cls, row: ApiKeySummary) -> ApiKeyCreatedOut:
+        return cls(
+            id=row.id,
+            key=row.key,
+            name=row.name,
+            scope=row.scope,
+            facility_ids=list(row.facility_ids),
+            expires_at=row.expires_at,
+        )
+
+
+class ApiKeyOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, row: ApiKeyListItem) -> ApiKeyOut:
+        return cls(
+            id=row.id,
+            name=row.name,
+            created_at=row.created_at,
+            expires_at=row.expires_at,
+            revoked_at=row.revoked_at,
+            last_used_at=row.last_used_at,
+        )
+
+
+class ApiKeyListOut(BaseModel):
+    items: list[ApiKeyOut]
+    page: PageMeta
+
+    @classmethod
+    def from_domain(cls, result: PagedResult[ApiKeyListItem]) -> ApiKeyListOut:
+        return cls(
+            items=[ApiKeyOut.from_domain(item) for item in result.items],
+            page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
 
 
 class CreateContractIn(BaseModel):

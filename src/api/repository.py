@@ -67,10 +67,11 @@ from security.passwords import hash_password
 from security.phi_columns import decrypt_phi_field, encrypt_phi_field
 from security.phi_masking import mask_patient_fields
 from security.rbac import Role
-from security.tokens import generate_token, hash_token
+from security.tokens import generate_api_key, generate_token, hash_token
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
 _INVITATION_TTL = timedelta(days=7)
+_API_KEY_TTL = timedelta(days=365)
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +258,48 @@ class AcceptedInvitation:
     membership_id: uuid.UUID
     mfa_secret: str
     mfa_provisioning_uri: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeySummary:
+    """Returned once, at creation (`POST /api-keys`) -- `key` is the raw,
+    unhashed value; only its hash is ever persisted (`db.models.ApiKey`'s
+    docstring). Same never-shown-again discipline as
+    `InvitationSummary.token`: a lost key must be revoked and re-created,
+    not recovered."""
+
+    id: uuid.UUID
+    key: str
+    name: str
+    scope: str
+    facility_ids: tuple[uuid.UUID, ...]
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyListItem:
+    """`GET /api-keys` -- masked, never carries the raw key or its hash."""
+
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyAuthLookup:
+    """What `api/auth.py` needs to turn a presented API key into an
+    `AuthContext` -- `revoked_at`/`expires_at` let it reject a dead key
+    before ever calling `resolve_membership_role`."""
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    user_id: uuid.UUID
+    name: str
+    revoked_at: datetime | None
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +504,26 @@ class Repository(Protocol):
     def accept_invitation(self, token: str, *, password: str) -> AcceptedInvitation | None: ...
 
     def verify_invitation_mfa(self, token: str, *, totp_code: str) -> bool | None: ...
+
+    def create_api_key(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        name: str,
+        scope: str,
+        facility_ids: Sequence[uuid.UUID] = (),
+    ) -> ApiKeySummary: ...
+
+    def list_api_keys(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[ApiKeyListItem]: ...
+
+    def revoke_api_key(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> bool: ...
+
+    def get_api_key_for_auth(self, raw_key: str) -> ApiKeyAuthLookup | None: ...
+
+    def touch_api_key_last_used(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> None: ...
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
@@ -952,6 +1015,95 @@ class PostgresRepository:
         if credentials is None or credentials.mfa_secret is None:
             return None
         return verify_code(credentials.mfa_secret, totp_code)
+
+    def create_api_key(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        name: str,
+        scope: str,
+        facility_ids: Sequence[uuid.UUID] = (),
+    ) -> ApiKeySummary:
+        """Creates a service `User` (no password/MFA -- unusable for
+        interactive login) holding its own ordinary `role=api_service`
+        `Membership`, then the `ApiKey` row pointing at it -- reusing the
+        exact same resolution/RLS machinery a human user goes through
+        rather than a parallel authorization system (`db.models.ApiKey`'s
+        docstring). All three writes share one transaction via a single
+        `access_session` block, same as `accept_invitation`'s multi-insert
+        shape."""
+        raw_key = generate_api_key()
+        expires_at = datetime.now(UTC) + _API_KEY_TTL
+        with access_session(self._session_factory, user_id) as session:
+            service_user = db_repository.create_user(session, subject=f"api-key:{uuid.uuid4()}")
+            db_repository.create_membership(
+                session,
+                service_user.id,
+                org_id,
+                role=Role.API_SERVICE.value,
+                scope=scope,
+                facility_ids=facility_ids,
+            )
+            row = db_repository.create_api_key(
+                session,
+                org_id,
+                service_user.id,
+                name=name,
+                key_hash=hash_token(raw_key),
+                created_by=user_id,
+                expires_at=expires_at,
+            )
+        return ApiKeySummary(
+            id=row.id,
+            key=raw_key,
+            name=row.name,
+            scope=scope,
+            facility_ids=tuple(facility_ids),
+            expires_at=row.expires_at,
+        )
+
+    def list_api_keys(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[ApiKeyListItem]:
+        with access_session(self._session_factory, user_id) as session:
+            rows, total = db_repository.list_api_keys(
+                session, org_id, limit=page.limit, offset=page.offset
+            )
+            items = [
+                ApiKeyListItem(
+                    id=row.id,
+                    name=row.name,
+                    created_at=row.created_at,
+                    expires_at=row.expires_at,
+                    revoked_at=row.revoked_at,
+                    last_used_at=row.last_used_at,
+                )
+                for row in rows
+            ]
+        return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
+
+    def revoke_api_key(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> bool:
+        with access_session(self._session_factory, user_id) as session:
+            return db_repository.revoke_api_key(session, api_key_id)
+
+    def get_api_key_for_auth(self, raw_key: str) -> ApiKeyAuthLookup | None:
+        with self._session_factory() as session:
+            row = db_repository.get_api_key_by_hash(session, hash_token(raw_key))
+        if row is None:
+            return None
+        return ApiKeyAuthLookup(
+            id=row.id,
+            org_id=row.org_id,
+            user_id=row.user_id,
+            name=row.name,
+            revoked_at=row.revoked_at,
+            expires_at=row.expires_at,
+        )
+
+    def touch_api_key_last_used(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> None:
+        with access_session(self._session_factory, user_id) as session:
+            db_repository.touch_api_key_last_used(session, api_key_id)
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str

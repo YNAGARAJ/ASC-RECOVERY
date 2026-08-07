@@ -15,6 +15,7 @@ from api.rate_limit import default_rate_limiter
 from api.repository import Repository
 from api.request_context import RequestIDMiddleware
 from api.routes import (
+    api_keys,
     audit,
     auth,
     contracts,
@@ -78,6 +79,7 @@ def create_app(
     app.include_router(contracts.router)
     app.include_router(organizations.router)
     app.include_router(invitations.router)
+    app.include_router(api_keys.router)
     app.include_router(audit.router)
     app.include_router(packets.router)
 

@@ -39,7 +39,10 @@ no clean single-facility target for an `ALL_FACILITIES`-scoped
 membership anyway. The gate's actual proof is the instant-session-death
 test, not an audit row.
 
-Invitation/API-key provisioning are separate, later steps.
+Invitation provisioning lives in its own module (`api/routes/invitations.py`);
+API-key provisioning in `api/routes/api_keys.py` (Phase 5 step 5) -- both
+the same delegated-admin (`Action.MANAGE_USERS`) pattern as everything
+above.
 """
 
 from __future__ import annotations

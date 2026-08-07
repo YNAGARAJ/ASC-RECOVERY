@@ -25,6 +25,9 @@ from decimal import Decimal
 from api.repository import (
     AcceptedInvitation,
     AccessEventSummary,
+    ApiKeyAuthLookup,
+    ApiKeyListItem,
+    ApiKeySummary,
     AuditLogEntry,
     AuditLogFilters,
     ContractSummary,
@@ -52,10 +55,11 @@ from security.mfa import generate_enrollment_secret, provisioning_uri, verify_co
 from security.passwords import hash_password
 from security.phi_masking import mask_patient_fields
 from security.rbac import Role
-from security.tokens import generate_token, hash_token
+from security.tokens import generate_api_key, generate_token, hash_token
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
 _INVITATION_TTL = timedelta(days=7)
+_API_KEY_TTL = timedelta(days=365)
 
 
 def now() -> datetime:
@@ -72,6 +76,19 @@ class _Membership:
     facility_ids: frozenset[uuid.UUID]
     created_at: datetime
     revoked_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ApiKey:
+    id: uuid.UUID
+    org_id: uuid.UUID
+    user_id: uuid.UUID
+    name: str
+    key_hash: str
+    created_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    last_used_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +114,7 @@ class FakeRepository:
     facilities: dict[uuid.UUID, uuid.UUID] = field(default_factory=dict)
     memberships: list[_Membership] = field(default_factory=list)
     invitations: dict[uuid.UUID, _Invitation] = field(default_factory=dict)
+    api_keys: dict[uuid.UUID, _ApiKey] = field(default_factory=dict)
     findings: dict[uuid.UUID, tuple[uuid.UUID, FindingDetail]] = field(default_factory=dict)
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
@@ -150,6 +168,34 @@ class FakeRepository:
             )
         )
         return membership_id
+
+    def seed_api_key(
+        self,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID,
+        *,
+        name: str = "test key",
+        raw_key: str | None = None,
+        expires_at: datetime | None = None,
+        revoked_at: datetime | None = None,
+    ) -> str:
+        """Test-only: seeds an `ApiKey` row directly, bypassing
+        `create_api_key`'s service-user/membership creation, so a test can
+        pin the raw key or force an expired/revoked state precisely.
+        Returns the raw key (never stored -- only its hash is)."""
+        raw_key = raw_key or generate_api_key()
+        api_key_id = uuid.uuid4()
+        self.api_keys[api_key_id] = _ApiKey(
+            id=api_key_id,
+            org_id=org_id,
+            user_id=user_id,
+            name=name,
+            key_hash=hash_token(raw_key),
+            created_at=now(),
+            expires_at=expires_at or (now() + _API_KEY_TTL),
+            revoked_at=revoked_at,
+        )
+        return raw_key
 
     def seed_login_credentials(
         self, subject: str, *, password: str | None, mfa_secret: str | None
@@ -490,6 +536,93 @@ class FakeRepository:
         if credentials is None or credentials.mfa_secret is None:
             return None
         return verify_code(credentials.mfa_secret, totp_code)
+
+    def create_api_key(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        name: str,
+        scope: str,
+        facility_ids: Sequence[uuid.UUID] = (),
+    ) -> ApiKeySummary:
+        service_user_id = self.seed_user(f"api-key:{uuid.uuid4()}")
+        self.seed_membership(
+            service_user_id,
+            org_id,
+            role=Role.API_SERVICE,
+            scope=scope,
+            facility_ids=frozenset(facility_ids),
+        )
+        raw_key = generate_api_key()
+        api_key_id = uuid.uuid4()
+        expires_at = now() + _API_KEY_TTL
+        self.api_keys[api_key_id] = _ApiKey(
+            id=api_key_id,
+            org_id=org_id,
+            user_id=service_user_id,
+            name=name,
+            key_hash=hash_token(raw_key),
+            created_at=now(),
+            expires_at=expires_at,
+        )
+        return ApiKeySummary(
+            id=api_key_id,
+            key=raw_key,
+            name=name,
+            scope=scope,
+            facility_ids=tuple(facility_ids),
+            expires_at=expires_at,
+        )
+
+    def list_api_keys(
+        self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[ApiKeyListItem]:
+        accessible = self._accessible_org_ids(user_id)
+        items = []
+        if org_id in accessible:
+            items = [
+                ApiKeyListItem(
+                    id=k.id,
+                    name=k.name,
+                    created_at=k.created_at,
+                    expires_at=k.expires_at,
+                    revoked_at=k.revoked_at,
+                    last_used_at=k.last_used_at,
+                )
+                for k in self.api_keys.values()
+                if k.org_id == org_id
+            ]
+        total = len(items)
+        page_items = items[page.offset : page.offset + page.limit]
+        return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
+
+    def revoke_api_key(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> bool:
+        accessible = self._accessible_org_ids(user_id)
+        key = self.api_keys.get(api_key_id)
+        if key is None or key.revoked_at is not None or key.org_id not in accessible:
+            return False
+        self.api_keys[api_key_id] = replace(key, revoked_at=now())
+        return True
+
+    def get_api_key_for_auth(self, raw_key: str) -> ApiKeyAuthLookup | None:
+        key_hash = hash_token(raw_key)
+        for k in self.api_keys.values():
+            if k.key_hash == key_hash:
+                return ApiKeyAuthLookup(
+                    id=k.id,
+                    org_id=k.org_id,
+                    user_id=k.user_id,
+                    name=k.name,
+                    revoked_at=k.revoked_at,
+                    expires_at=k.expires_at,
+                )
+        return None
+
+    def touch_api_key_last_used(self, user_id: uuid.UUID, api_key_id: uuid.UUID) -> None:
+        key = self.api_keys.get(api_key_id)
+        if key is not None:
+            self.api_keys[api_key_id] = replace(key, last_used_at=now())
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
