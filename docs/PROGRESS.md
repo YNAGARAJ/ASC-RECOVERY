@@ -530,6 +530,104 @@ row updated to describe both limiters; the "Not yet built" bullet
 narrowed to the two items still actually outstanding (per-org
 encryption keys, per-org data residency).
 
+### Per-org encryption keys (BYOK-ready) — DONE
+
+Third of the four Phase 6 items, user said "continue" without
+re-scoping — proceeded since the design was already sketched in this
+file's own "Next steps" from the prior checkpoint. Turned out smaller
+than expected once the actual `EnvelopeEncryptor`/`KeyManagementService`
+port shape was re-read: `EncryptedPayload.kek_id` already travels with
+every ciphertext, and `decrypt`/`unwrap_key` already resolve whichever
+key a given payload actually needs — the entire gap was on the *write*
+side only (nothing let a caller choose a non-default `kek_id` to
+encrypt under in the first place).
+
+**Schema**: `organizations.kms_key_id` (nullable `String(500)`,
+`alembic/versions/0010_org_kms_key.py`, additive on top of the sealed
+0001 schema, same guarded-`add_column` idiom as every migration since
+0002). `NULL` = "use the platform default" — same meaning
+`EnvelopeEncryptor.encrypt`'s own `kek_id=None` fallback already has, so
+the two defaults line up by construction, not by convention someone has
+to remember.
+
+**Encryption layer**: `EnvelopeEncryptor.encrypt` gained an optional
+`kek_id` keyword (falls back to `self._kms.current_kek_id()` when
+`None`); `security/phi_columns.py::encrypt_phi_field` forwards it.
+`decrypt`/`decrypt_phi_field` needed **zero changes** — already correct
+for mixed keys per record.
+
+**KMS adapters — a real behavior change, not just plumbing**:
+`AwsKmsAdapter.wrap_key` and `AzureKeyVaultAdapter.wrap_key` used to
+raise `KeyError` for any `kek_id` other than the adapter's own
+configured one. That restriction was self-imposed, not something either
+cloud's real API requires (AWS's `Encrypt`/Azure's `wrap_key` both
+already take an arbitrary key id per call) — removed it from both, so
+`current_kek_id()` remains "the platform default when the caller has
+nothing more specific" while `wrap_key` now honors whatever `kek_id` an
+org's own key resolves to. Azure's docstring needed care here: the
+existing restriction conflated two different properties (rotation-
+safety: `current_kek_id()` must never be stale vs. blocking any
+caller-supplied key at all), and only the second one needed to go.
+**`EnvKMS` (the default stopgap adapter) deliberately keeps its
+restriction** — it holds exactly one static key, so there's no safe way
+for it to honor a per-org key even if asked; its docstring now explains
+why, and `docs/RUNBOOK.md` states the ordering constraint explicitly:
+**do not set `organizations.kms_key_id` until `KMS_PROVIDER` is
+`aws-kms`/`azure-keyvault`**, or ingestion breaks (loudly, `KeyError`,
+not silently) for that org's claims the moment a patient name needs
+encrypting.
+
+**Application wiring**: `ingestion/pipeline.py`'s `_ingest_file_impl`
+already resolved a claim's org (`get_org_id_for_facility`, for contract
+lookups) — added one more cheap lookup right next to it
+(`get_organization_kms_key_id`), then threaded the result down through
+`apply_ingestion_plan` → `_apply_claim` → `encrypt_phi_field` for both
+`patient_name_encrypted`/`patient_member_id_encrypted`. Resolved once
+per file, not once per claim.
+
+**Key assignment is deliberately not a self-service API** — set at
+onboarding time via `scripts/onboard_customer.py`'s new optional
+`kms_key_id` config field, or afterward via a direct, operator-reviewed
+`UPDATE organizations SET kms_key_id = ...` through the owner
+connection. Same reasoning `onboard_customer.py` itself already
+established for org creation: no "platform superadmin" API surface
+exists, and misconfiguring an org's encryption key is exactly the kind
+of high-blast-radius mistake that shouldn't be one HTTP call away for
+an org_admin to trigger on themselves. **Existing data is never
+re-encrypted by changing this column** — only future writes pick up a
+new key; each payload's own stored `kek_id` is what it always decrypts
+under, so flipping the column is safe and instant, not a migration.
+
+**Tests**: pure — `tests/security/test_encryption.py` (explicit `kek_id`
+used and defaults to `current_kek_id()` when omitted),
+`test_phi_columns.py` (the override survives serialization),
+`test_kms_aws.py`/`test_kms_azure.py` (both adapters' `wrap_key` now
+accept an arbitrary kek_id and round-trip correctly; the old
+raises-on-mismatch tests replaced, not just added to, since that
+behavior is gone). DB-backed (skip without `TEST_DATABASE_URL`):
+`tests/db/test_organization_kms_key.py` (the lookup itself, including
+the `None`-default case) and `tests/ingestion/test_apply_org_kms_key.py`
+(the full `ingest_file` path — an org with a dedicated key encrypts
+under it, one without still gets the platform default).
+
+No API/route change, no new `Action` (`docs/PERMISSIONS.md` untouched).
+`docs/RUNBOOK.md` gained a "Per-org encryption keys (BYOK)" section.
+
+### Full local gate as of this commit
+
+`ruff check .` clean, `mypy --strict .` clean (196 files, only the 2
+pre-existing unrelated alembic 0004 JSONB errors), `pytest -q` 690
+passed / 68 skipped, `domain/variance.py` 100% coverage gate,
+`python -m evals.run` GATE PASSED, `bandit -r . -x ./tests,./evals`
+clean. Offline SQL generation (`alembic upgrade head --sql` /
+`downgrade 0010:0009 --sql`) verified both directions through migration
+0010.
+
+**Only per-org data residency remains open in Phase 6** — everything
+else the phase's prompt named is now built or was already true before
+this session started (see this phase's section above in full for the
+audit that established that).
+
 ## Traps for someone resuming cold
 
 - **Everything Phase 4's checkpoint already flagged still applies**: the
@@ -559,10 +657,19 @@ encryption keys, per-org data residency).
   password ever becomes available — there is now a full session's worth
   of offline-only-verified RLS policy and function code riding on the
   assumption the SQL is correct.
-- **Migrations 0007/0008/0009 are additive on top of 0001, not edits to
-  it** — 0001's schema is sealed (same convention 0002-0006 already
-  established for Phase 4). Phase 5 ended at migration `0009`; any V2
-  Phase 6 schema work should be a new `0010_...` migration.
+- **Migrations 0007-0010 are additive on top of 0001, not edits to it** —
+  0001's schema is sealed (same convention 0002-0006 already established
+  for Phase 4). Phase 6's BYOK work ended at migration `0010`; any
+  further schema work should be a new `0011_...` migration.
+- **`organizations.kms_key_id` is only safe to set once `KMS_PROVIDER`
+  is `aws-kms`/`azure-keyvault`** — setting it while the deployment
+  still runs `EnvKMS` (the default) breaks ingestion for that org
+  (`KeyError`, loud, not silent) the moment a patient name needs
+  encrypting. `docs/RUNBOOK.md`'s "Per-org encryption keys (BYOK)"
+  section has the full ordering constraint. Don't add a self-service API
+  for setting this column later without re-reading why it was
+  deliberately left operator-only (same section, and this file's Phase 6
+  writeup above).
 - **Phase 5 added no new `Action`** — offboarding, API keys, and
   per-org policy all reuse `Action.MANAGE_USERS`. If Phase 6 (security
   and PHI controls) needs a new permission boundary, check
@@ -576,27 +683,23 @@ encryption keys, per-org data residency).
 Phase 6 is in progress, scope already resolved (see its section above --
 don't re-litigate what's already built vs. deferred, it was just
 audited item by item against the actual code). Forced re-auth for PHI
-export and the per-org rate-limiting ceiling are both done. Two items
-remain, already scoped, not started:
+export, the per-org rate-limiting ceiling, and per-org encryption keys
+(BYOK-ready) are all done. One item remains, already scoped, not
+started:
 
-1. **Per-org encryption keys (BYOK-ready).** Medium-sized, real design
-   work — an org-level KEK reference (likely a new nullable column on
-   `organizations`, or a new `org_encryption_keys` table if more than
-   one field ends up needed), threaded through `EnvelopeEncryptor`'s
-   call sites (`ingestion/apply.py` write path, `api/repository.py` read
-   path) instead of the one global KEK `main.py` wires today. Touches
-   more surface than the other two — plan-mode this one before writing
-   code, the way every schema-shaped phase in this project has.
-2. **Per-org data residency flag.** Small to build, but confirm the
+1. **Per-org data residency flag.** Small to build, but confirm the
    "stored preference, not physical enforcement" framing
    (`docs/SECURITY.md`'s "Not yet built" section already states it) is
    still acceptable before writing it — this build is one shared
    Postgres in one region, so anything claiming more would be fiction.
-3. **If picking this up much later**, re-verify the full local gate
+   Once this lands, Phase 6 is fully complete.
+2. **If picking this up much later**, re-verify the full local gate
    before trusting anything — confirm the current commit's status
    before trusting it.
-4. **If the F-22 Postgres password becomes available**, run Phase 4 and
-   5's live-DB suites for real before trusting any of their RLS/function
-   code beyond what's offline-verified — independent of Phase 6, and
-   worth doing before Phase 6 adds more RLS-adjacent work (the per-org
-   BYOK item above will, if built).
+3. **If the F-22 Postgres password becomes available**, run Phase 4, 5,
+   and 6's live-DB suites for real before trusting any of their
+   RLS/function code beyond what's offline-verified — this now includes
+   migration 0010 and the BYOK-specific DB tests
+   (`tests/db/test_organization_kms_key.py`,
+   `tests/ingestion/test_apply_org_kms_key.py`), never run against a
+   real Postgres in this environment.
