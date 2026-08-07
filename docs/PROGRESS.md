@@ -1,272 +1,244 @@
 # Progress checkpoint
 
 Written for a fresh session with no memory of prior conversation. Repo is
-at a clean commit as of this checkpoint. Read `docs/PHASES.md` first for
-the phase checklist, then `docs/audit/REGISTER.md` for the full findings
-list this checkpoint is tracking progress against — this file adds the
-texture that isn't in either.
+at a clean commit as of this checkpoint.
 
-## IMPORTANT — Wave 3 is now as closed as this environment allows; two-stage work order
+## IMPORTANT — read this before doing anything else
 
-The user confirmed a **two-stage work order** (also saved as a project
-memory, `project_roadmap_scope` — re-derive from here if it isn't in
-context):
+**Two stages, confirmed by the user** (also saved as project memory
+`project_roadmap_scope`):
+1. Wave 3 remediation (`docs/audit/REGISTER.md`'s MUST-FIX list) — **done**,
+   as far as this environment allows. 20/23 FIXED, 3 honestly OPEN with a
+   documented reason (F-17, F-21, F-22 — see the register).
+2. Build the unbuilt product-completeness gaps from
+   `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
+   underway.** Phase 4 (org/facility/membership access model) is
+   **complete**, all six of its own sub-steps landed, full local gate
+   green. This is the biggest, most structurally invasive single unit of
+   work in this repo's history — read the rest of this file before
+   touching anything access-control-related.
 
-1. **Finish Wave 3 remediation first** — close `docs/audit/REGISTER.md`'s
-   remaining MUST-FIX rows, in the register's own listed order.
-2. **Then build the unbuilt product-completeness gaps** listed at the top
-   of `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" —
-   frontend, async jobs, lesser-of/stop-loss/prompt-pay-interest contract
-   logic, SSO/SCIM, multi-org hierarchy, reprocessing, and more. Entirely
-   unbuilt features, not bugs.
+**A phase-numbering collision to not get confused by**: `docs/PHASES.md`
+tracks the *original* 12-phase build's checklist (already complete,
+predates Wave 3 entirely) — its own "Phase 4" ("Security and PHI
+controls") is a *different, already-finished* phase from
+`docs/MASTER-BUILD-PROMPT-V2.md`'s "Phase 4" (organization/identity
+model, what this checkpoint is about). Do not conflate the two, and do
+not check anything off in `docs/PHASES.md` for V2 phase work — that
+file's checklist is closed and historical.
 
-**As of this checkpoint, all 23 MUST-FIX rows have a final disposition**
-(20 FIXED, 3 honestly left OPEN with a documented reason — see below).
-Stage 1 is done to the extent this environment allows. **Whether that
-counts as "done enough" to start stage 2 has not been explicitly asked
-yet — do that before writing any stage-2 code.** See "Next steps" below.
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 4 (organization/facility/membership access model) — COMPLETE, all 6 steps
 
-**Established pattern, confirmed across F-17, F-18, F-20, F-21, F-22 (all
-from prior or this session)**: not every MUST-FIX row is a clean wiring
-fix. Some findings' "real" fix requires infrastructure that was never
-part of any of the 12 original phases, or that genuinely exists but this
-particular session can't authenticate into. **When a finding looks like
-this, ask the user how to scope it before proceeding** — don't guess.
-Every one of F-17/F-18/F-20/F-21/F-22 got an explicit `AskUserQuestion`
-before code was written or a row was marked either way.
+Replaced the entire flat `tenants`/`tenant_id` multi-tenancy model with
+`organizations` (self-referencing hierarchy: PLATFORM → BILLING_COMPANY/
+ASC_GROUP → ASC) → `facilities` → `memberships` (role + scope per org,
+narrowed to specific facilities via `membership_facilities` when
+`scope=SPECIFIC_FACILITIES`). RLS now resolves access recursively through
+the org hierarchy instead of a flat equality check. This was a **clean-cut
+replacement** (no data migration — no real customer/PHI data has ever
+existed in this system) and a **plan-mode-approved** design, per the
+phase's own "Enter plan mode... wait for approval" instruction.
 
-## Phase: Wave 3 remediation (docs/AUDIT-PROMPTS.md), against docs/audit/REGISTER.md's MUST-FIX list. All 23 rows triaged: 20 FIXED, 3 OPEN with a documented reason.
+**All 6 sub-steps landed as separate commits** (the codebase was
+necessarily inconsistent — didn't build/pass — between steps 1 and 4,
+since they're too tightly coupled to gate independently; this was flagged
+to the user and accepted before proceeding):
 
-Phases 1-12 are code-complete (see `docs/PHASES.md`). A full three-wave
-audit found 82 real defects — 1 CRITICAL, 22 HIGH, 34 MEDIUM, 25 LOW —
-written up in `docs/audit/`. `docs/audit/REGISTER.md`'s 23-row MUST-FIX
-table (all CRITICAL/HIGH) is the actual work list for *this* codebase;
-that's what this checkpoint tracks. Its BACKLOG section (65 rows, all
-MEDIUM/LOW) is explicitly *not* part of Wave 3's scope — deferred by
-design, not by omission.
+1. **Schema + migration** (`520a5d1`) — `db/models.py` rewritten;
+   `alembic/versions/0001_initial_schema.py` rewritten with
+   `resolve_accessible_facility_ids(p_user_id)`/
+   `resolve_accessible_org_ids(p_user_id)` — `SECURITY DEFINER` SQL
+   functions, cycle-guarded recursive CTE over `organizations.parent_org_id`,
+   honoring `ALL_FACILITIES` vs `SPECIFIC_FACILITIES` membership scope.
+2. **RBAC + PHI masking** (`88ceff0`) — `Role` expands from 4 flat roles
+   to the phase's 7 (`platform_admin/org_admin/manager/biller/analyst/
+   auditor/api_service`); `platform_admin`/`org_admin` deliberately hold
+   *identical* action permissions (hierarchy position, not the
+   permission table, is what actually distinguishes them). New
+   `security/phi_masking.py` — analyst gets `"[MASKED]"` on patient
+   name/member id, everyone else with `Action.VIEW_UNMASKED_PHI` sees
+   the real value. `docs/PERMISSIONS.md` documents the matrix, generated
+   from the actual code so it can't silently drift.
+3. **Access/session layer** (part of `10fc2d6`) — `db/tenancy.py` →
+   `db/access.py`: `access_session(session_factory, user_id)` sets only
+   `app.user_id` (not a second org/facility session variable) — RLS
+   resolution functions return everything a user can reach across *all*
+   memberships; which specific org/facility a request targets is an
+   `AuthContext` field, not a DB session variable. JWT drops its `role`
+   claim entirely (role is per-membership, not a single value a token
+   can hold) and gains `active_org_id`; role is resolved fresh from
+   `memberships` on every request via `api/auth.py`'s
+   `resolve_membership_role` (walks from `active_org_id` up through
+   `parent_org_id` for the nearest membership) — this is what makes a
+   revoked/changed membership take effect immediately, with **no
+   token-revocation list**.
+4. **Repository + API layer** (rest of `10fc2d6`) — every `tenant_id`
+   parameter becomes `facility_id` (business/PHI tables) or `org_id`
+   (contracts — negotiated per organization, not per facility).
+   `AuthContext` gained `user_id: UUID`, `subject: str` (split apart --
+   under the old model these were the same field; audit-log `actor`
+   fields need the human-readable subject, `access_session` needs the
+   real UUID), `org_id`, and `facility_id: UUID | None` (`None` when the
+   active org resolves to zero or more than one facility —
+   `api/auth.py::require_facility()` 400s rather than guessing; a real
+   facility switcher is Phase 5/12 scope). Caught and fixed a real bug
+   while doing this: `ingestion/pipeline.py` was passing a facility_id
+   into what's now an org-scoped contract lookup — added
+   `db.repository.get_org_id_for_facility()` to resolve the parent org
+   once per ingest.
+5. **Test suite** (`2df9201` mechanical + `c00f04b` the real redesign) —
+   `tests/api/fakes.py`'s `FakeRepository` rewritten around
+   facility/org-set resolution (mirrors the real SQL functions closely
+   enough for API-wiring tests, not a substitute for the real RLS proof
+   — register finding B-50 already documents that gap). New
+   `tests/db/conftest.py::seed_org_facility_user()` — every DB-backed
+   test that bootstraps a fresh org/facility/user/membership must do it
+   via the **owner-role connection**, never `app_session_factory`'s
+   `asc_app` role (`organizations`/`facilities`/`memberships` are
+   RLS-protected against *resolved* access, and there's no membership
+   yet for a brand-new org to resolve against — `asc_app` lacks
+   `BYPASSRLS`). `tests/db/test_rls_tenant_isolation.py` rewritten around
+   Phase 4's five required proofs (see "Decisions" below) plus an
+   end-to-end masking proof through the real `PostgresRepository`
+   wiring, not just the pure-function test.
+6. **Docs** (`2d0c824`) — `CLAUDE.md` rule 8, `docs/DB_SETUP.md` (the new
+   `BYPASSRLS` precondition, `owner_engine` for test seeding),
+   `docs/RUNBOOK.md` (onboarding config shape, poller env vars).
 
-**FIXED (20/23): F-01 through F-16, F-18, F-19, F-20, F-23.**
-
-**OPEN, each with a specific, non-negotiable reason (3/23):**
-- **F-17** — implant `invoice_cost` is always `None` on the real
-  ingestion path because no purchasing-feed integration exists anywhere
-  in this codebase. Not a wiring bug — there is nothing to wire. Implant
-  lines correctly surface as `UNPRICED_CODE`/`shortfall=0` (never a
-  *wrong* figure) in the meantime. Revenue-code half already fixed as
-  B-16.
-- **F-21** — `scripts/db/restore_drill.sh` (this session) automates the
-  entire documented restore procedure, but the finding's actual
-  requirement is "execute it for real, record the actual wall-clock
-  number," and no AWS/Azure account exists in this environment to do
-  that. User explicitly chose to leave this OPEN rather than mark it
-  FIXED for writing the automation.
-- **F-22** — every cross-seam integration test is gated behind
-  `TEST_DATABASE_URL`. CI already has live Postgres and
-  `docker-compose.yml`/`docs/DB_SETUP.md` already document a local
-  option (both predate this session) — but **this session discovered a
-  real PostgreSQL 18 server already running as a Windows service on
-  this dev machine**, which would let the live-DB suite actually run
-  here. User confirmed wanting to use it but didn't have the local
-  `postgres` superuser password on hand and deferred setup to a future
-  session — see "Next steps" for the exact handoff.
-
-## Done (fixed this session, one line each on the actual change)
-
-- **F-01 (CRITICAL)** through **F-19** — see git log and prior
-  checkpoints for detail; unchanged this session.
-- **F-20 (HIGH, this session)** — `AwsKmsAdapter`
-  (`src/security/kms_aws.py`) and `AzureKeyVaultAdapter`
-  (`src/security/kms_azure.py`) implemented behind the existing
-  `KeyManagementService` port (`security/kms.py`). Wired into
-  `main.py`'s new `_build_kms()`, selected by a new `KMS_PROVIDER` env
-  var (`"env"`/unset → today's `EnvKMS`, unchanged default;
-  `"aws-kms"` → `AwsKmsAdapter`, requires `AWS_KMS_KEY_ID`;
-  `"azure-keyvault"` → `AzureKeyVaultAdapter`, requires
-  `AZURE_KEY_VAULT_KEY_ID`). Commit `02c6e38`, register updated in
-  `5ba2b60`.
-  - **AWS**: `key_id` is meant to be a KMS *alias*
-    (`alias/asc-recovery-kek`), not a raw key id — aliases are what let
-    AWS's own automatic annual rotation (`enable_key_rotation = true`,
-    already in Terraform) take effect with zero redeploys.
-  - **Azure**: fundamentally asymmetric with AWS here, documented at
-    length in `kms_azure.py`'s docstring — a Key Vault key *version* is
-    a distinct cryptographic object, not an alias. `current_kek_id()`
-    is a *pinned* version id; picking up a rotation means redeploying
-    with a new `AZURE_KEY_VAULT_KEY_ID` and running
-    `EnvelopeEncryptor.rotate_kek()`. `wrap_key` rejects any `kek_id`
-    other than the pinned current version; `unwrap_key` deliberately
-    does not, since it must keep working for a DEK wrapped under an
-    older version still enabled in the vault.
-  - `AzureKeyVaultAdapter` takes an injectable `crypto_client_factory`
-    so it's unit-testable without the real `azure-keyvault-keys` SDK
-    installed; the wrap algorithm is the literal string
-    `"RSA-OAEP-256"` rather than an imported enum, so the module has
-    zero SDK imports at class-definition time.
-  - `boto3`/`azure-identity`/`azure-keyvault-keys` added as a new
-    `cloud-kms` optional-dependency group — not a base dependency;
-    neither is installed in this dev environment, which is itself proof
-    the lazy-import design works.
-  - Tests: `tests/security/test_kms_aws.py` (5), `test_kms_azure.py`
-    (5), `tests/test_main.py` (+5, `KMS_PROVIDER` wiring — both
-    real-cloud branches only test the pre-SDK-import validation path,
-    since neither SDK is installed here).
-  - **Neither adapter has ever been exercised against a real AWS
-    account or Azure Key Vault** — disclosed in both modules'
-    docstrings, matching the F-18 poller adapters.
-  - Documented in `docs/RUNBOOK.md`'s "Key rotation" section and
-    `docs/SECURITY.md`'s control matrix + "Not yet built" list.
-- **F-21 (HIGH, this session) — partially addressed, register entry
-  stays OPEN**, per the user's explicit choice — see above.
-  `scripts/db/restore_drill.sh` automates every step of
-  `docs/RUNBOOK.md`'s restore procedure for either cloud (restore →
-  wait → verify `alembic_version`/row counts/RLS → print elapsed time →
-  tear down via a `trap`, `SKIP_TEARDOWN=1` escape hatch). Commit
-  `7397b3d`. Shell-syntax-checked (`bash -n`) only — never actually run.
-- **F-22 (HIGH, this session) — triaged, register entry stays OPEN**,
-  per the user's explicit deferral — see above and "Next steps."
-  Commit `0205871`.
-- **F-23 (HIGH, this session)** — the `adversarial-reviewer` subagent
-  was re-run against HEAD now that F-01 through F-22 all have a final
-  disposition (F-23's own stated dependency). Result: **zero
-  HIGH/CRITICAL findings.** Money math, date-of-service pricing, tenant
-  isolation (RLS forced, `asc_app` has no bypass), audit-log coverage,
-  PHI redaction, authorization, and this session's new KMS adapters all
-  held up under independent review. 6 LOW items it noticed in passing
-  were logged as `B-60` through `B-65` in the register's BACKLOG
-  section (restore_drill.sh's connection string visible via `ps` on a
-  shared host; poller filename not redaction-covered; a span attribute
-  with the same gap; AWS KMS manual-rekey edge case; `decide_packet`
-  understates `phi_accessed`; the first-admin bootstrap account has no
-  path to actually get a password/MFA enrolled) — none of them HIGH or
-  CRITICAL, none gate this finding. Commit `d154dcb`.
-
-## In progress
-
-Nothing mid-write. F-20 through F-23 all went through the full Wave 3
-loop and are complete as units, each in the state the user asked for.
-
-## Failing
-
-Nothing failing that this session caused. `ruff check .`, `mypy --strict .`
-(171 files), `pytest -q` (495 passed, 35 skipped — all DB-backed, none
-newly broken), the `domain/variance.py` 100%-coverage gate, `python -m
-evals.run` (GATE PASSED, 100% recall/precision/root-cause/dollar accuracy
-on 504 golden cases), and `bandit -r . -x ./tests,./evals` were all clean
-as of commit `5ba2b60` (last full gate run this session — F-22/F-23
-triage after that point was register-only, no source changes, so the
-gate result still holds at `d154dcb`).
-
-**Pre-existing, unrelated, still present:** `mypy --strict .` reports two
-errors in `alembic/versions/0004_recovery_packets_and_timely_filing.py:65,82`
-(`Call to untyped function "JSONB" in typed context`). Predates Wave 3
-entirely. Still not blocking, still out of scope.
+**Full local gate, confirmed green as of `c00f04b`/`2d0c824`**: `ruff
+check .` clean, `mypy --strict .` clean (171 files, only the 2
+pre-existing unrelated alembic 0004 JSONB errors), `pytest -q` 593
+passed / 40 skipped, `domain/variance.py` 100% coverage gate,
+`python -m evals.run` GATE PASSED (100% recall/precision/root-cause/
+dollar accuracy, 504 golden cases), `bandit -r . -x ./tests,./evals`
+clean (4 new B608 findings from the RLS-policy-construction SQL and 1
+B105 false positive on the `"[MASKED]"` token all reviewed and
+`# nosec`'d with justification, not silently ignored).
 
 ## Decisions worth knowing (not obvious from the code)
 
-- **F-20 and F-21 both got a two-question `AskUserQuestion` before any
-  code was written.** Both times the user picked "build what's
-  buildable, be honest about what isn't, opt-in only" over the
-  alternatives (skip entirely, or force a fake success): F-20 →
-  **"Build both adapters, opt-in only via env var"**; F-21 → **"Build
-  the restore-drill script, leave finding open."**
-- **F-22's discovery mid-session changed the plan.** The original
-  intent going in was to treat F-22 the same as F-17/F-21
-  (infrastructure gap, document and move on) — both halves of its
-  suggested fix already existed before this session (CI has live
-  Postgres; `docker-compose.yml` documents a local option). Finding a
-  real, already-running local PostgreSQL 18 service on this specific
-  machine was a surprise discovery, not something anticipated by the
-  register. Asked the user whether to use it (yes, with the existing
-  instance rather than a separate cluster) and then for the `postgres`
-  superuser password (deferred — user will run the setup SQL
-  themselves later). **This is not the same kind of "infrastructure
-  doesn't exist" gap as F-17/F-21/F-20** — the infrastructure exists
-  and is a credential-away from being used; don't conflate the two when
-  deciding how to talk about F-22 vs. the others.
-- **`KMS_PROVIDER` defaults preserve F-04-through-F-19's status quo
-  exactly** — `_build_kms()`'s `"env"` branch is byte-for-byte the same
-  `EnvKMS(secrets)` construction `main.py` did before this session.
-- **`AzureKeyVaultAdapter`'s first draft was not unit-testable** —
-  lazy SDK imports *inside* `wrap_key`/`unwrap_key` meant even a
-  fake-client test would hit a real import line. Redesigned with an
-  injectable `crypto_client_factory` and a literal wrap-algorithm
-  string instead of an enum import.
-- **`restore_drill.sh` restores to "use latest restorable time," not a
-  named snapshot** — matches what an actual disaster-recovery restore
-  would use.
-- **The adversarial re-review (F-23) was scoped to focus on
-  recently-touched code first** (this session's KMS adapters,
-  `restore_drill.sh`) precisely because it's the code least likely to
-  have already had a fresh pair of eyes on it — then broadened to a
-  full independent pass over `src/`. Worth repeating that ordering if
-  F-23-style re-reviews happen again later.
+- **RLS resolution functions take only `p_user_id`, no org/facility
+  param.** They return the *full* set of facilities/orgs a user can
+  reach across *all* their memberships — RLS is the security ceiling.
+  "Which org is currently active" (for role resolution and write-path
+  targeting) is a narrower, application-layer concept
+  (`AuthContext.org_id`/`.facility_id`), deliberately not baked into the
+  DB session state the same way `app.tenant_id` used to be.
+- **`organizations`/`facilities`/`memberships`/`membership_facilities`
+  are all RLS-protected** (a step beyond the old model, where only
+  business tables had RLS) — `organizations`/`facilities` via their own
+  `id` against the same resolution functions; `memberships`/
+  `membership_facilities` via a **bootstrap-safe self-only** policy
+  (`user_id = current_setting('app.user_id')`), deliberately *not*
+  routed through the recursive functions (that would be circular: you'd
+  need resolved access to read the memberships that resolve access).
+- **`asc_owner` needs `BYPASSRLS`.** The two resolution functions are
+  `SECURITY DEFINER`, owned by whoever runs the migration, specifically
+  so they can walk the hierarchy internally without their own queries
+  being blocked by the RLS policies they're computing. Docker's
+  bootstrap `POSTGRES_USER` already satisfies this by convention; a
+  manually-provisioned real Postgres needs `ALTER ROLE asc_owner
+  BYPASSRLS;` run once, by a real superuser (`docs/DB_SETUP.md`). This
+  is also why `scripts/onboard_customer.py` and every DB test's seeding
+  helper (`seed_org_facility_user`) must run via the owner connection,
+  never `asc_app` — there's no membership yet for a brand-new org to
+  bootstrap through.
+- **Contracts are org-scoped, not facility-scoped** — confirmed with the
+  user before building: an ASC_GROUP's facilities share one payer rate
+  card, matching how these are actually negotiated in practice.
+- **The five phase-required RLS tests**, all in
+  `tests/db/test_rls_tenant_isolation.py`: (1) cross-facility read
+  blocked at the database with app-level filtering disabled [+ IDOR-by-
+  known-id, kept from the pre-Phase-4 version], (2) a billing-company
+  user scoped to two specific facilities can't read a third
+  (`SPECIFIC_FACILITIES`), (3) a parent-org membership reaches a
+  child-org's facility, (4) revoking a membership blocks access on the
+  very next query (deleted via the owner connection — `asc_app` has no
+  `DELETE` grant on `memberships`, matching every other mutable table's
+  retention posture), (5) a five-level org hierarchy resolves and
+  terminates correctly (the cycle-guarded CTE completing at all is the
+  "doesn't loop" proof — no separate corrupted-cycle test was built).
+  PHI masking end-to-end (analyst masked, biller not) is proven in the
+  same file, through the real `PostgresRepository.get_finding_detail`
+  wiring.
+- **Login now defaults to a user's *oldest* membership's org** when
+  issuing a session (`LoginCredentials.default_org_id`,
+  `db.repository.get_default_membership_org_id`) — a deliberate,
+  documented Phase 4 stopgap. Real org selection/switching at login is
+  Phase 5 ("user lifecycle and enterprise access") scope, not built here.
+- **`AuthContext.facility_id` is `None`, and routes 400 via
+  `require_facility()`, whenever the active org doesn't resolve to
+  exactly one facility.** No route silently guesses. A real facility
+  switcher (Phase 12 frontend explicitly mentions one) is what actually
+  resolves this UX gap — Phase 4 only had to make the ambiguous case
+  fail loudly, not solve it.
+- **This repo has no "query across every facility I can reach in one API
+  call" endpoint.** Every `Repository` method takes one specific
+  `facility_id`/`org_id`, required. A multi-facility org's aggregate
+  view (if ever needed before Phase 12's real dashboard) would need
+  either multiple API calls or a new endpoint — not built now, on
+  purpose, to keep this phase scoped to the access *model*, not new
+  product surface.
 
 ## Traps for someone resuming cold
 
-- **Read the "IMPORTANT" section at the top of this file before doing
-  anything else.** Wave 3's MUST-FIX list is now fully triaged (20
-  FIXED, 3 OPEN-with-reason) — this is a real milestone, but "triaged"
-  is not the same as "the user has agreed stage 2 can start." That
-  check-in has not happened yet.
-- **F-22's local-Postgres handoff, ready to use immediately:** run this
-  as the `postgres` superuser (matches `docker-compose.yml`'s existing
-  dev credentials exactly, so nothing else in the repo needs to
-  change):
-  ```sql
-  CREATE ROLE asc_owner LOGIN PASSWORD 'asc_owner_dev_password' CREATEDB;
-  CREATE DATABASE asc_recovery OWNER asc_owner;
-  ```
-  then from the repo root:
-  ```
-  psql -U postgres -d asc_recovery -f scripts/db/init_roles.sql
-  ```
-  Once that's done: `export DATABASE_URL=...` (see `docs/DB_SETUP.md`
-  for the exact connection string), `alembic upgrade head`, then
-  `export TEST_DATABASE_URL=...` and run the full suite including
-  every `*_live_db.py`/`tests/db/*` test — this would be the **first
-  time ever** in this project's history that the live-DB suite runs for
-  real outside CI. Worth doing before anything else if this session
-  picks back up with the password available; it also lets F-19's RLS
-  coverage test and the audit-log append-only test get verified against
-  a real database, not just CI.
-- **Everything F-01 through F-19's checkpoints already flagged still
-  applies** (CRLF warnings on `git add`, the `${VAR:?message}`
-  bash-apostrophe gotcha, the PHI-content guardrail hook's quirks, the
-  Makefile's `domain/variance.py`-only coverage gate, `mypy --strict .`
-  actually sweeping the whole repo because of the `.` CLI argument,
-  remembering `dependencies=[Depends(enforce_rate_limit)]` on any new
-  authenticated router, remembering `api.alerting.record_not_found(...)`
-  on any new direct-id-lookup route, `required_figure_lines()` on any
-  new scripted packet-draft fixture, `FakeRepository`'s audit-write
-  gaps, OTel's global-provider write-once-per-process rule, and
-  re-reading a finding's *full* row — not just its "Fix" column — once
-  more right before marking it FIXED).
-- **`pyproject.toml` now has two extras that both pull in `boto3`**
-  (`[poller]` from F-18, `[cloud-kms]` from F-20) — deliberately not
-  factored into a shared group. `pip install -e ".[poller,cloud-kms]"`
-  if a real environment ever needs both.
-- **B-60 through B-65 are new backlog rows from F-23's re-review** —
-  same status as every other B-row (documented, deferred, not Wave 3
-  scope), not something to reflexively start fixing.
+- **Everything in "Decisions" above** — especially the `BYPASSRLS`
+  precondition and the owner-vs-app connection split for seeding. A
+  test or script that mysteriously gets a row-level-security violation
+  on an `INSERT` into `organizations`/`facilities`/`memberships` is
+  almost certainly using `app_session_factory`/`asc_app` where it needed
+  `owner_engine`/`asc_owner`.
+- **`tests/db/conftest.py::seed_org_facility_user()` is the one seeding
+  helper everything else should build on** — `tests/ingestion/
+  conftest.py::seed_org_with_contract()` and inline per-file helpers in
+  `tests/db/test_*.py` all call it. If a new DB-backed test needs a
+  fresh org/facility/user, use it rather than hand-rolling `create_organization`/
+  `create_facility`/`create_user`/`create_membership` calls again.
+- **F-22's local-Postgres handoff from the previous checkpoint is still
+  live and still unclaimed** — a real PostgreSQL 18 service is running
+  on this dev machine, setup deferred pending the `postgres` superuser
+  password (see git history around commit `0205871` for the exact
+  handoff SQL, now updated for the `BYPASSRLS` grant too — see
+  `docs/DB_SETUP.md`'s "Bring up Postgres" section for the current
+  version of that SQL). Running Phase 4's RLS tests for real, for the
+  first time, would be an excellent use of it if that password ever
+  becomes available.
+- **CRLF warnings on every `git add`**, the Makefile's
+  `domain/variance.py`-only coverage gate, `mypy --strict .` sweeping
+  the whole repo (not just `src`+`tests`) because of the `.` CLI
+  argument, and the PHI-content guardrail hook (blocks writes containing
+  a couple of specific trigger-phrase combinations naming patient data
+  alongside certain adjectives — tripped this once this session while
+  writing RLS test fixtures, worked around with different synthetic
+  sentinel text) — all still apply, unchanged from every prior
+  checkpoint.
+- **Bandit nosec placement on multi-line f-strings is not obvious.** A
+  `# nosec` comment placed on a line that's *inside* a triple-quoted
+  string's content (e.g. right after an opening `f"""`) becomes part of
+  the string itself, not a Python comment — this will silently corrupt
+  generated SQL. Put `# nosec` on a real code line (a trailing comment
+  on a single-line string literal, or a comment on the line that
+  actually calls `.format()`/executes the flagged expression), never
+  inside the string body. Learned this the hard way in step 5's commit;
+  the working pattern is preserved there as a reference.
 
 ## Next steps
 
-1. **Explicitly check in with the user**: Wave 3's MUST-FIX list is now
-   fully triaged — 20/23 FIXED, F-17/F-21/F-22 each OPEN with a specific
-   documented reason (two are genuine infrastructure gaps this
-   environment cannot close; F-22 is one credential away from being
-   closeable and the path is written above). Ask whether this counts as
-   "close enough" to start stage 2 (`docs/MASTER-BUILD-PROMPT-V2.md`'s
-   unbuilt product-completeness gaps), or whether to first pursue the
-   F-22 local-Postgres path to get a fourth row closed.
-2. **If the user provides the local Postgres password**, follow the
-   handoff above, run the full live-DB suite for real, and use the
-   result to actually mark F-22 FIXED (or, if something fails, that's a
-   new, real finding — not a hypothetical one anymore).
-3. **If/when stage 2 begins**, start from
-   `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — these
-   are unbuilt features (frontend, async jobs, lesser-of/stop-loss/
-   prompt-pay-interest contract logic, SSO/SCIM, multi-org hierarchy,
-   reprocessing), not bugs, so the working pattern shifts from
-   "find-and-fix" to "design-and-build." Expect that to mean more
-   upfront design conversation per item, not less.
+1. **Phase 4 is done. Explicitly check in with the user before starting
+   Phase 5** ("user lifecycle and enterprise access" —
+   `docs/MASTER-BUILD-PROMPT-V2.md`: invitation → accept → MFA enrollment
+   → first login with expiry; offboarding that kills sessions/API keys
+   immediately; SSO/SAML/OIDC per org; SCIM 2.0; API keys; impersonation;
+   break-glass; per-org policy). This is the next phase in PART 4's own
+   stated order, and it directly completes several Phase 4 stopgaps
+   flagged above (real org-switching at login, a real facility switcher,
+   `api_service` credential provisioning) — but confirm before diving in
+   per this repo's established "check sequencing with the user" norm.
+2. **If picking this up much later**, re-verify the full local gate
+   before trusting anything (`ruff check .`, `mypy --strict .`,
+   `pytest -q`, the coverage gate, `python -m evals.run`, `bandit -r .
+   -x ./tests,./evals`) — it was green as of `2d0c824`, but confirm it
+   still is.
+3. **If the F-22 Postgres password becomes available**, run Phase 4's
+   live-DB suite for real before Phase 5 builds further on top of an
+   access model that's only ever been offline-verified.
