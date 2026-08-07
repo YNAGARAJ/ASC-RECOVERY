@@ -102,6 +102,29 @@ def test_rotate_kek_produces_a_payload_that_still_decrypts_correctly() -> None:
     assert encryptor.decrypt(rotated) == plaintext
 
 
+def test_encrypt_with_an_explicit_kek_id_uses_it_instead_of_current() -> None:
+    """Phase 6, per-org encryption keys: an org with its own dedicated
+    key wraps under that key, not whatever the KMS's `current_kek_id()`
+    happens to be."""
+    kms = LocalKMS()
+    kms.generate_kek("platform-default")
+    kms.generate_kek("org-dedicated-key")
+    encryptor = EnvelopeEncryptor(kms)
+
+    payload = encryptor.encrypt(b"data", kek_id="org-dedicated-key")
+
+    assert payload.kek_id == "org-dedicated-key"
+    assert encryptor.decrypt(payload) == b"data"
+
+
+def test_encrypt_without_a_kek_id_falls_back_to_current() -> None:
+    encryptor = EnvelopeEncryptor(_kms_with_kek("the-current-one"))
+
+    payload = encryptor.encrypt(b"data")
+
+    assert payload.kek_id == "the-current-one"
+
+
 def test_rotate_kek_does_not_mutate_or_break_the_original_payload() -> None:
     """rotate_kek returns a new payload; the original is untouched and, as
     long as its KEK hasn't been deleted from the store, still decrypts."""

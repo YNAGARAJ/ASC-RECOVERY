@@ -12,8 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import pytest
-
 from security.kms_azure import AzureKeyVaultAdapter
 
 _CURRENT_KEY_ID = "https://asc-vault.vault.azure.net/keys/asc-kek/v2"
@@ -74,13 +72,21 @@ def test_current_kek_id_is_the_pinned_version() -> None:
     assert kms.current_kek_id() == _CURRENT_KEY_ID
 
 
-def test_wrap_with_a_kek_id_other_than_the_pinned_current_version_raises() -> None:
+def test_wrap_accepts_a_kek_id_other_than_the_pinned_current_version() -> None:
+    """Phase 6 (docs/MASTER-BUILD-PROMPT-V2.md), per-org/BYOK encryption
+    keys: an org with its own dedicated Key Vault key wraps under that
+    key's id, not this adapter's pinned default -- previously restricted
+    to the pinned current version only, which conflated rotation-safety
+    (current_kek_id() must never be stale) with blocking any caller-
+    supplied kek_id at all (which would make BYOK impossible)."""
     kms = AzureKeyVaultAdapter(
         credential=object(), current_key_id=_CURRENT_KEY_ID, crypto_client_factory=_fake_factory()
     )
+    dek = b"a-32-byte-data-encryption-key!!!"
 
-    with pytest.raises(KeyError):
-        kms.wrap_key(_OLD_KEY_ID, b"a-32-byte-data-encryption-key!!!")
+    wrapped = kms.wrap_key(_OLD_KEY_ID, dek)
+
+    assert kms.unwrap_key(_OLD_KEY_ID, wrapped) == dek
 
 
 def test_unwrap_works_against_an_older_pinned_version_still_in_the_vault() -> None:

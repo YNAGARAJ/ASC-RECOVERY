@@ -156,8 +156,13 @@ def _ingest_file_impl(
     # Contracts are org-scoped, not facility-scoped (db/models.py's module
     # docstring) -- one ASC_GROUP's facilities share a payer rate card.
     # Ingestion only ever knows the target facility, so resolve its
-    # parent org once here for the contract-version lookups below.
+    # parent org once here for the contract-version lookups below, and
+    # for Phase 6's per-org encryption key (same org_id, one extra cheap
+    # lookup, not worth threading a second facility->org resolution).
     org_id = repository.get_org_id_for_facility(session, facility_id)
+    org_kms_key_id = (
+        repository.get_organization_kms_key_id(session, org_id) if org_id is not None else None
+    )
 
     payer_ids = {payer_key(txn.payer) for txn in parse_result.transactions}
     contract_versions_by_payer: dict[str, tuple[ContractVersion, ...]] = {}
@@ -200,6 +205,7 @@ def _ingest_file_impl(
         actor=uploaded_by,
         contract_version_ids=contract_version_ids_typed,
         encryptor=encryptor,
+        org_kms_key_id=org_kms_key_id,
     )
 
 

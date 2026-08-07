@@ -57,3 +57,19 @@ def test_round_trips_unicode_names() -> None:
     encryptor = _encryptor()
     serialized = encrypt_phi_field(encryptor, "PATIENT NAME WITH ACCENTS: JOSE MUNOZ")
     assert decrypt_phi_field(encryptor, serialized) == "PATIENT NAME WITH ACCENTS: JOSE MUNOZ"
+
+
+def test_encrypt_with_an_explicit_kek_id_stores_it_and_still_round_trips() -> None:
+    """Phase 6, per-org encryption keys: `kek_id` is forwarded straight
+    through to `EnvelopeEncryptor.encrypt`, and the serialized form
+    carries whichever kek_id was actually used, same as always."""
+    kms = LocalKMS()
+    kms.generate_kek("test-kek")
+    kms.generate_kek("org-dedicated-key")
+    encryptor = EnvelopeEncryptor(kms)
+
+    serialized = encrypt_phi_field(encryptor, "PATIENT ONE", kek_id="org-dedicated-key")
+
+    assert serialized is not None
+    assert '"kek_id": "org-dedicated-key"' in serialized
+    assert decrypt_phi_field(encryptor, serialized) == "PATIENT ONE"

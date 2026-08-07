@@ -123,6 +123,12 @@ def onboard(database_url: str, config: dict[str, Any]) -> None:
         raise ConfigError(
             f"membership_scope must be one of {sorted(_VALID_SCOPES)}, got {membership_scope!r}"
         )
+    # Phase 6 (docs/MASTER-BUILD-PROMPT-V2.md), per-org/BYOK encryption
+    # keys -- optional, omit for "no dedicated key, use the platform
+    # default" (db.models.Organization.kms_key_id's docstring). Only
+    # meaningful once KMS_PROVIDER is aws-kms/azure-keyvault; EnvKMS (the
+    # default stopgap adapter) ignores this entirely.
+    kms_key_id = config.get("kms_key_id")
 
     session_factory = make_session_factory(make_engine(database_url))
 
@@ -138,7 +144,7 @@ def onboard(database_url: str, config: dict[str, Any]) -> None:
     # runtime role, exactly like running migrations does.
     with session_factory() as session, session.begin():
         org = db_repository.create_organization(
-            session, parent_org_id=None, type=org_type, name=org_name
+            session, parent_org_id=None, type=org_type, name=org_name, kms_key_id=kms_key_id
         )
         facility = db_repository.create_facility(session, org.id, name=facility_name)
         user = db_repository.create_user(session, subject=admin_subject)

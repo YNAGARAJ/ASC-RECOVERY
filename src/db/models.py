@@ -71,6 +71,19 @@ class Organization(Base):
     settings: Mapped[dict[str, object]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+    # Phase 6 (docs/MASTER-BUILD-PROMPT-V2.md), BYOK-ready per-org
+    # encryption: NULL means "no dedicated key -- encrypt this org's PHI
+    # under the platform's default KEK" (EnvelopeEncryptor.encrypt's own
+    # fallback when no kek_id is given). Non-NULL is a full KMS key
+    # identifier (an AWS KMS key/alias ARN, or an Azure Key Vault key's
+    # versioned URL) meaningful only once the app actually runs against a
+    # real cloud KMS (security/kms_aws.py, security/kms_azure.py) --
+    # EnvKMS, the default stopgap adapter, is deliberately single-key and
+    # ignores this column entirely (security/kms_env.py's docstring). The
+    # same column serves both a platform-provisioned dedicated key and a
+    # genuinely customer-supplied one ("bring your own key") -- from this
+    # schema's perspective they're identical, just a key id string.
+    kms_key_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

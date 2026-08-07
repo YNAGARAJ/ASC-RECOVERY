@@ -12,6 +12,17 @@ trail at the KMS layer and no automatic rotation. The KEK's own protection
 is only as good as whatever secret store hands it to `EnvSecretStore`
 (Secrets Manager / Key Vault in a real deployment, per terraform/README.md)
 -- this adapter never writes the key material anywhere itself.
+
+**Deliberately incompatible with per-org encryption keys (Phase 6,
+`docs/MASTER-BUILD-PROMPT-V2.md`)** -- `wrap_key` raises `KeyError` for
+any `kek_id` other than its one static key, on purpose: this adapter
+holds exactly one key, so there is no safe way to honor an org's
+`organizations.kms_key_id` even if one is configured. Setting that
+column on an org while `KMS_PROVIDER` is unset/`"env"` is an operator
+misconfiguration (`docs/RUNBOOK.md`), not a state this codebase silently
+tolerates or works around -- per-org keys only become real once
+`KMS_PROVIDER` is `aws-kms`/`azure-keyvault` (`security/kms_aws.py`,
+`security/kms_azure.py`, both of which accept any `kek_id`).
 """
 
 from __future__ import annotations

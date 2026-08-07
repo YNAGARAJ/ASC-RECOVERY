@@ -214,6 +214,16 @@ def get_org_id_for_facility(session: Session, facility_id: uuid.UUID) -> uuid.UU
     ).scalar_one_or_none()
 
 
+def get_organization_kms_key_id(session: Session, org_id: uuid.UUID) -> str | None:
+    """Phase 6 per-org encryption keys -- `None` means "no dedicated key,
+    encrypt this org's PHI under the platform default"
+    (`db.models.Organization.kms_key_id`'s docstring), same meaning
+    `EnvelopeEncryptor.encrypt`'s own `kek_id=None` default has."""
+    return session.execute(
+        select(OrganizationModel.kms_key_id).where(OrganizationModel.id == org_id)
+    ).scalar_one_or_none()
+
+
 def create_organization(
     session: Session,
     *,
@@ -221,9 +231,14 @@ def create_organization(
     type: str,
     name: str,
     settings: dict[str, Any] | None = None,
+    kms_key_id: str | None = None,
 ) -> OrganizationModel:
     org = OrganizationModel(
-        parent_org_id=parent_org_id, type=type, name=name, settings=settings or {}
+        parent_org_id=parent_org_id,
+        type=type,
+        name=name,
+        settings=settings or {},
+        kms_key_id=kms_key_id,
     )
     session.add(org)
     session.flush()

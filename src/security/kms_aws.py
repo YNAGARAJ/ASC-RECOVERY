@@ -12,7 +12,17 @@ the current backing key material is, and its `Decrypt` API resolves the
 right key from the ciphertext blob's own embedded metadata regardless of
 which key version originally encrypted it -- so `unwrap_key` below never
 needs to track key versions itself the way the Azure adapter does.
-"""
+
+**`wrap_key` accepts any `kek_id`, not just this adapter's own configured
+default** (Phase 6, per-org/BYOK encryption keys,
+`docs/MASTER-BUILD-PROMPT-V2.md`) -- real AWS KMS's `Encrypt` API already
+takes an arbitrary `KeyId` per call, so restricting this adapter to only
+ever wrap under its own `key_id` was a self-imposed limitation, not a
+reflection of anything the cloud API requires. `current_kek_id()` still
+returns this adapter's configured default, for callers (an org with no
+`organizations.kms_key_id` of its own) that don't have a more specific
+key to ask for -- `EnvelopeEncryptor.encrypt`'s own docstring covers the
+default-vs-explicit-kek_id split."""
 
 from __future__ import annotations
 
@@ -30,8 +40,6 @@ class AwsKmsAdapter(KeyManagementService):
         return self._key_id
 
     def wrap_key(self, kek_id: str, dek: bytes) -> bytes:
-        if kek_id != self._key_id:
-            raise KeyError(kek_id)
         response = self._kms.encrypt(KeyId=kek_id, Plaintext=dek)
         result: bytes = response["CiphertextBlob"]
         return result

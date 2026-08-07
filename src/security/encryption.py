@@ -7,6 +7,16 @@ key), used exactly once. The DEK itself is "wrapped" (encrypted) by a KEK
 (key-encryption key) obtained from a KeyManagementService port -- this is
 what makes key rotation cheap: rotating the KEK only means re-wrapping the
 small DEK, never touching the (potentially large) ciphertext.
+
+**Per-org encryption keys (Phase 6, `docs/MASTER-BUILD-PROMPT-V2.md`)**:
+`encrypt`'s optional `kek_id` lets a caller wrap under a specific key --
+an org's own dedicated `organizations.kms_key_id`, resolved by the
+caller (`ingestion/apply.py`) -- instead of always using
+`self._kms.current_kek_id()`. `decrypt` never needed an equivalent
+parameter: `EncryptedPayload.kek_id` already travels with the ciphertext
+itself, so decryption has always used whichever key a given payload was
+actually wrapped under, regardless of what the platform's "current" key
+is today.
 """
 
 from __future__ import annotations
@@ -40,8 +50,8 @@ class EnvelopeEncryptor:
     def __init__(self, kms: KeyManagementService) -> None:
         self._kms = kms
 
-    def encrypt(self, plaintext: bytes) -> EncryptedPayload:
-        kek_id = self._kms.current_kek_id()
+    def encrypt(self, plaintext: bytes, *, kek_id: str | None = None) -> EncryptedPayload:
+        kek_id = kek_id if kek_id is not None else self._kms.current_kek_id()
         dek = AESGCM.generate_key(bit_length=_DEK_BITS)
         nonce = os.urandom(_NONCE_LENGTH_BYTES)
         ciphertext = AESGCM(dek).encrypt(nonce, plaintext, None)

@@ -7,8 +7,6 @@ tests/ingestion/test_sources.py's fake SFTP/S3 clients).
 
 from __future__ import annotations
 
-import pytest
-
 from security.kms_aws import AwsKmsAdapter
 
 _KEY_ID = "alias/asc-recovery-kek"
@@ -46,11 +44,19 @@ def test_current_kek_id_is_the_configured_key_id() -> None:
     assert kms.current_kek_id() == _KEY_ID
 
 
-def test_wrap_with_a_different_kek_id_raises() -> None:
+def test_wrap_accepts_a_kek_id_other_than_the_configured_default() -> None:
+    """Phase 6 (docs/MASTER-BUILD-PROMPT-V2.md), per-org/BYOK encryption
+    keys: an org with its own dedicated key wraps under *that* key id,
+    not this adapter's configured default -- real AWS KMS's Encrypt API
+    already takes an arbitrary KeyId per call, so this adapter must not
+    second-guess a caller-supplied kek_id the way it used to."""
     kms = AwsKmsAdapter(_FakeKmsClient(), _KEY_ID)
+    org_key_id = "alias/customer-byok-key"
+    dek = b"a-32-byte-data-encryption-key!!!"
 
-    with pytest.raises(KeyError):
-        kms.wrap_key("alias/some-other-key", b"a-32-byte-data-encryption-key!!!")
+    wrapped = kms.wrap_key(org_key_id, dek)
+
+    assert kms.unwrap_key(org_key_id, wrapped) == dek
 
 
 def test_unwrap_accepts_a_kek_id_other_than_the_current_one() -> None:

@@ -110,7 +110,12 @@ direct-DB-access, operator-run step rather than an endpoint.
    `POST /contracts` + `POST /contracts/{id}/versions`. Payment rules
    (MPPR, bilateral, assistant surgeon, implant carve-out) always start
    disabled here for the same reason -- configure them via that same
-   endpoint once the customer can authenticate.
+   endpoint once the customer can authenticate. `kms_key_id` is also
+   optional (Phase 6, per-org encryption keys) -- omit it for "use the
+   platform default"; only set it when the deployment already runs a
+   real cloud KMS (`KMS_PROVIDER=aws-kms`/`azure-keyvault`), see "Per-org
+   encryption keys (BYOK)" below for why setting it any earlier breaks
+   ingestion for that org.
 
 2. Run it, with **owner-role** credentials (not `asc_app`):
    ```
@@ -481,6 +486,31 @@ a deliberate, opt-in operator choice, not a default:
   Credentials come from `DefaultAzureCredential` (managed identity in a
   real deployment), never a static secret this codebase stores. Install
   `pip install -e ".[cloud-kms]"` first.
+
+## Per-org encryption keys (BYOK)
+
+`docs/MASTER-BUILD-PROMPT-V2.md` Phase 6: an organization can have its
+own dedicated KMS key (`organizations.kms_key_id`) instead of sharing
+the platform's default KEK — set at onboarding time via
+`scripts/onboard_customer.py`'s optional `kms_key_id` config field, or
+afterward via a direct, reviewed `UPDATE organizations SET kms_key_id =
+'...' WHERE id = '...'` through the **owner** connection (there is no
+self-service API for this — an org admin accidentally pointing their
+own org at an unreadable key is exactly the kind of high-blast-radius
+mistake this deliberately keeps behind an operator, not a self-service
+endpoint). Existing data is never re-encrypted by setting this column —
+only claims ingested *after* the change use the new key; each already-
+encrypted value's own stored `kek_id` is what it always decrypts under
+(`security/encryption.py`'s `EncryptedPayload.kek_id`), regardless of
+what an org's "current" key is today.
+
+**Only meaningful once `KMS_PROVIDER` is `aws-kms` or `azure-keyvault`.**
+`EnvKMS` (the default stopgap adapter) holds exactly one static key and
+deliberately raises `KeyError` for any other `kek_id` — setting
+`kms_key_id` on an org while running on `EnvKMS` will make ingestion
+fail (loudly, not silently) for that org's claims the moment a patient
+name/member id needs encrypting. Do not set this column until the
+deployment is actually running a real cloud KMS.
 
 ## Incident response
 

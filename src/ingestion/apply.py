@@ -5,6 +5,14 @@ reconciliation) already happened in ingestion.plan (pure, fully tested
 without a live DB). This module's only job is turning that decision into
 DB writes -- so it's only meaningfully testable against a real Postgres,
 same as the rest of tests/db/, and skips the same way without one.
+
+`org_kms_key_id` (Phase 6, per-org encryption keys,
+`docs/MASTER-BUILD-PROMPT-V2.md`) is resolved once by the caller
+(`ingestion/pipeline.py`, which already resolves the claim's org for
+contract lookups) and threaded down to `encrypt_phi_field` for every
+claim in the file -- `None` means the org has no dedicated key, so
+patient PHI encrypts under the platform default
+(`EnvelopeEncryptor.encrypt`'s own fallback).
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ def _apply_claim(
     *,
     actor: str,
     encryptor: EnvelopeEncryptor,
+    org_kms_key_id: str | None,
 ) -> Sequence[Finding]:
     claim = claim_plan.claim
     if claim_plan.date_of_service is None:
@@ -79,10 +88,14 @@ def _apply_claim(
         total_paid_reported=claim.total_paid_reported.as_decimal(),
         patient_responsibility=claim.patient_responsibility.as_decimal(),
         patient_name_encrypted=encrypt_phi_field(
-            encryptor, claim.patient.name if claim.patient is not None else None
+            encryptor,
+            claim.patient.name if claim.patient is not None else None,
+            kek_id=org_kms_key_id,
         ),
         patient_member_id_encrypted=encrypt_phi_field(
-            encryptor, claim.patient.id_code if claim.patient is not None else None
+            encryptor,
+            claim.patient.id_code if claim.patient is not None else None,
+            kek_id=org_kms_key_id,
         ),
     )
     repository.write_audit_log(
@@ -172,6 +185,7 @@ def apply_ingestion_plan(
     actor: str,
     contract_version_ids: ContractVersionIds,
     encryptor: EnvelopeEncryptor,
+    org_kms_key_id: str | None = None,
 ) -> IngestionOutcome:
     if plan.quarantine_reason is not None:
         repository.update_remittance_status(
@@ -218,6 +232,7 @@ def apply_ingestion_plan(
                 contract_version_ids,
                 actor=actor,
                 encryptor=encryptor,
+                org_kms_key_id=org_kms_key_id,
             )
             findings_created += len(persisted_findings)
             dollars_detected += sum(

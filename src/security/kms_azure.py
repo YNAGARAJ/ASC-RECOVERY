@@ -16,11 +16,25 @@ picking up a rotated key means deploying with a new
 it, an explicit `EnvelopeEncryptor.rotate_kek()` pass) -- there is no
 safe way to resolve "latest version" automatically at both wrap time and
 unwrap time without risking an unwrap against the wrong version's key
-material. `wrap_key` enforces that every new DEK is wrapped only under
-the pinned current version; `unwrap_key` intentionally does not -- it
-must keep working for a DEK wrapped under an older version that is still
-enabled in the vault, which is exactly what `kek_id` being carried
-per-payload (`security.encryption.EncryptedPayload`) is for.
+material. `unwrap_key` must keep working for a DEK wrapped under an
+older version that is still enabled in the vault, which is exactly what
+`kek_id` being carried per-payload (`security.encryption.EncryptedPayload`)
+is for.
+
+**`wrap_key` accepts any `kek_id`, not just this adapter's pinned
+`current_key_id`** (Phase 6, per-org/BYOK encryption keys,
+`docs/MASTER-BUILD-PROMPT-V2.md`) -- an org with its own dedicated Key
+Vault key (its own key, or a customer-supplied one) wraps under *that*
+key's id, not this adapter's configured default. This used to be
+restricted to only the pinned current version, conflating two different
+concerns: "don't accidentally wrap under a stale rotated version" (a
+caller mistake to guard against) versus "never wrap under anything the
+caller explicitly asks for" (which blocks BYOK entirely). The rotation-
+safety property this adapter still provides is that `current_kek_id()`
+-- what a caller reaches for when it has no more specific key of its own
+-- always returns the pinned, current, non-stale version; an explicit,
+deliberate `kek_id` from the caller (an org's own key) is a different,
+intentional choice the caller made, not an accident to protect against.
 
 `crypto_client_factory` exists so tests can inject a fake Key Vault
 client instead of needing the real `azure-keyvault-keys` SDK installed
@@ -64,8 +78,6 @@ class AzureKeyVaultAdapter(KeyManagementService):
         return self._current_key_id
 
     def wrap_key(self, kek_id: str, dek: bytes) -> bytes:
-        if kek_id != self._current_key_id:
-            raise KeyError(kek_id)
         client = self._crypto_client_factory(kek_id, self._credential)
         result = client.wrap_key(_WRAP_ALGORITHM, dek)
         wrapped: bytes = result.encrypted_key

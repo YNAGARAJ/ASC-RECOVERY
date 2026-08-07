@@ -14,10 +14,16 @@ import json
 from security.encryption import EncryptedPayload, EnvelopeEncryptor
 
 
-def encrypt_phi_field(encryptor: EnvelopeEncryptor, plaintext: str | None) -> str | None:
+def encrypt_phi_field(
+    encryptor: EnvelopeEncryptor, plaintext: str | None, *, kek_id: str | None = None
+) -> str | None:
+    """`kek_id` (Phase 6, per-org encryption keys) lets a caller wrap
+    under a specific org's dedicated key instead of the platform default
+    -- passed straight through to `EnvelopeEncryptor.encrypt`, whose own
+    docstring covers the default-vs-explicit split."""
     if plaintext is None:
         return None
-    payload = encryptor.encrypt(plaintext.encode("utf-8"))
+    payload = encryptor.encrypt(plaintext.encode("utf-8"), kek_id=kek_id)
     return json.dumps(
         {
             "kek_id": payload.kek_id,
