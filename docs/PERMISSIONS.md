@@ -1,4 +1,4 @@
-# Permissions (Phase 4)
+# Permissions (`docs/MASTER-BUILD-PROMPT-V2.md` Phase 4, extended in Phase 5)
 
 Two independent mechanisms decide what a request can do, and they answer
 different questions:
@@ -92,13 +92,33 @@ role's *response*. Today's PHI fields: `patient_name`,
 in `api/repository.py`, right after decryption — not per-route, so it
 can't be forgotten on a new endpoint.
 
+## Phase 5 additions (`docs/MASTER-BUILD-PROMPT-V2.md`)
+
+Offboarding (`POST /organizations/members/{id}/revoke`), API key
+provisioning (`POST/GET /api-keys`, `POST /api-keys/{id}/revoke`), and
+per-org policy (`GET/PUT /org-policy`) all reuse the existing
+`manage_users` action from the table above — **no new `Action` was
+added**. All three are delegated-admin operations in the same sense
+`GET /organizations/members` already was: an org-resolved caller manages
+their own org's users/credentials/policy, never anyone else's, enforced
+by RLS the same way every other resolved-access write in this system is
+(`org_authoring_update` on `memberships`, `org_access` on `api_keys`/
+`org_policies`, both `alembic/versions/0007_user_lifecycle.py`).
+
+An API key resolves to its own dedicated service `User` holding an
+ordinary `role=api_service` `Membership` — the row in the matrix above
+already covers what such a credential can do; provisioning one doesn't
+grant it anything the table doesn't already say.
+
 ## Not yet built (later phases)
 
 - **Worklist assignment scoping** ("a biller sees only *their assigned*
   worklists") — no assignment data model exists yet. Row-level filtering
   for this belongs at the query layer, on top of the action-level
   `read_worklist` check documented here, once that model exists.
-- **API key provisioning, SSO/SCIM, impersonation, break-glass** — Phase
-  5 (`docs/MASTER-BUILD-PROMPT-V2.md`) builds the machinery that actually
-  issues `api_service` credentials and switches a session's active org;
-  Phase 4 only needs the role and the resolution functions to exist.
+- **SSO (OIDC/SAML per organization), SCIM provisioning/deprovisioning,
+  impersonation, and break-glass access** — named in Phase 5's prompt but
+  explicitly deferred as an independent follow-up pass (confirmed with
+  the user); see `docs/SECURITY.md`'s "Not yet built" section for why.
+  Phase 5 as built covers invitation → accept → MFA → login, offboarding,
+  delegated admin, API keys, and per-org policy only.

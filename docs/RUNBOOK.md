@@ -133,6 +133,108 @@ direct-DB-access, operator-run step rather than an endpoint.
    connection; get a real run against a provisioned database before
    trusting it for an actual pilot customer.
 
+## Managing users, API keys, and org policy
+
+`docs/MASTER-BUILD-PROMPT-V2.md`'s Phase 5 (not to be confused with this
+runbook's other "Phase" references above, which are the original
+12-phase build's numbering — see `docs/PROGRESS.md`'s own note on this
+collision). Everything below is an ordinary authenticated HTTP call, not
+a script — the operator is a logged-in `org_admin`/`platform_admin`
+(`manage_users`, `docs/PERMISSIONS.md`), never a direct DB connection.
+`$TOKEN` below is that admin's access token from `POST /auth/login`.
+
+### Inviting a user
+
+```
+curl -X POST https://<host>/invitations \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"subject": "new-hire@example.com", "role": "biller", "scope": "ALL_FACILITIES"}'
+```
+
+Returns the raw invitation token **once** — there is no email-sending
+infrastructure in this codebase, so deliver it to the invitee out of
+band (Slack, a ticket, whatever the operator already uses). The invitee
+then, unauthenticated, walks the token through:
+
+```
+GET  /invitations/{token}                 # preview: subject, role, status, expiry
+POST /invitations/{token}/accept          # sets password, returns an MFA secret + otpauth:// URI once
+POST /invitations/{token}/confirm-mfa     # verifies the TOTP code before their first real login
+```
+
+After `confirm-mfa` succeeds, `POST /auth/login` (subject + password +
+TOTP code) just works — no separate "activate" step.
+
+### Offboarding a user
+
+Find their `membership_id` (there is no by-subject lookup; list and
+match):
+
+```
+curl -H "Authorization: Bearer $TOKEN" https://<host>/organizations/members
+```
+
+Then revoke it:
+
+```
+curl -X POST https://<host>/organizations/members/{membership_id}/revoke \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Takes effect on the *very next request* the offboarded user (or any API
+key resolving through their identity) makes, on any route — role/access
+is resolved fresh from `memberships` on every request, so there is no
+session-cache or token-revocation-list propagation delay to wait out.
+Revoking an already-revoked membership, or one belonging to another org,
+returns 404 either way (`tests/api/test_offboarding.py`).
+
+### Provisioning and revoking an API key
+
+```
+curl -X POST https://<host>/api-keys \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name": "Zapier integration", "scope": "ALL_FACILITIES"}'
+```
+
+Returns the raw key **once**, prefixed `ask_` — store it in whatever
+secret manager the integration uses; it cannot be recovered afterward,
+only revoked and replaced. Use it exactly like a JWT, as a bearer token:
+`Authorization: Bearer ask_...`. It authenticates as its own narrowly
+scoped `api_service`-role service user (`docs/PERMISSIONS.md`), never as
+the admin who created it.
+
+```
+curl -H "Authorization: Bearer $TOKEN" https://<host>/api-keys        # list, masked
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  https://<host>/api-keys/{api_key_id}/revoke                         # revoke
+```
+
+A key expires automatically 365 days after creation regardless (fixed
+server-side TTL, not client-configurable); revoke it sooner the moment
+an integration is decommissioned or a key is suspected leaked.
+
+### Configuring per-org session/access policy
+
+```
+curl -H "Authorization: Bearer $TOKEN" https://<host>/org-policy
+
+curl -X PUT https://<host>/org-policy \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"session_timeout_seconds": 1800, "ip_allowlist": ["203.0.113.0/24"]}'
+```
+
+`PUT` is a full replace — always send both fields, `ip_allowlist: []`
+means "no restriction." `session_timeout_seconds` (60–86400) shortens or
+lengthens how long a login session lasts before re-authentication is
+required; it only takes effect for *new* logins, not sessions already
+issued. **`ip_allowlist` takes effect immediately, for every already-
+issued token and API key too** — setting a restrictive one from outside
+the range it names locks the operator out on their very next request, so
+double-check the value (a bare IP, or CIDR — `10.0.0.0/8`) before
+sending it, from a network that's actually in it. There is no `mfa_required`
+field to set here at all — MFA is unconditional for every org, no
+exceptions, by design.
+
 ## Scheduling remittance polling (SFTP/S3)
 
 `scripts/ingestion/poll_remittances.py` (F-18, `docs/audit/REGISTER.md`)
