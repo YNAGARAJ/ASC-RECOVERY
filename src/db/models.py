@@ -137,11 +137,22 @@ class Membership(Base):
     policy (`user_id = current_setting('app.user_id')`) -- not the
     recursive resolution function, since resolving that function's own
     org-hierarchy walk must not itself depend on a membership row already
-    being visible. Broader visibility (an org_admin listing every
-    membership within their own org, for user management) is a Phase 5
-    concern layered on as an *additional* policy, not a replacement for
-    this one -- Postgres combines multiple permissive USING policies on
-    the same table with OR."""
+    being visible. Phase 5 (`alembic/versions/0007_user_lifecycle.py`)
+    adds a second, *additive* policy granting an org-resolved caller
+    INSERT/UPDATE on someone else's membership row (delegated admin,
+    offboarding, invitation acceptance, API-key provisioning) -- Postgres
+    combines multiple permissive policies on the same table with OR, so
+    this is layered on top of the self-only policy, not a replacement.
+
+    `revoked_at` (Phase 5) is a soft revocation, not a `DELETE` -- asc_app
+    has no `DELETE` grant on this table (retention posture, same as every
+    other mutable table). Offboarding sets it via an `UPDATE`, which *is*
+    granted. RLS visibility of a revoked row is unchanged (still visible
+    for history to its own user / a resolved org admin) -- only the
+    access-resolution functions (`resolve_accessible_facility_ids`/
+    `resolve_accessible_org_ids`/`resolve_membership_role`) stop counting
+    a revoked membership toward accessible facilities/orgs/role, which is
+    what makes revocation take effect on the very next query."""
 
     __tablename__ = "memberships"
 
@@ -159,6 +170,7 @@ class Membership(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MembershipFacility(Base):
@@ -475,3 +487,136 @@ class RecoveryPacket(Base):
     # "rejected".
     decided_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Invitation(Base):
+    """Phase 5 (`docs/MASTER-BUILD-PROMPT-V2.md`) user lifecycle: an
+    org_admin (or higher) invites `subject` (an email address) to join
+    `org_id` with `role`/`scope`. `token_hash` is a SHA-256 hash of a
+    random token shown to the inviter exactly once (in the API response
+    -- there is no email-sending infrastructure in this codebase, see
+    `docs/RUNBOOK.md`); only the hash is ever persisted, matching
+    `security/passwords.py`'s never-store-the-raw-credential discipline.
+    `status` moves pending -> accepted (via `accept_invitation`, a
+    `SECURITY DEFINER` function -- see `alembic/versions/0007_user_lifecycle.py`)
+    or -> expired/revoked; never back. RLS-protected the same way
+    `contracts` is (org-scoped, via `resolve_accessible_org_ids`) for the
+    org_admin-facing list/manage surface -- the anonymous accept flow
+    reaches this table only through the `SECURITY DEFINER` function,
+    which bypasses RLS by design (token possession is the authorization,
+    the same principle as a password-reset link)."""
+
+    __tablename__ = "invitations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    invited_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'pending'")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InvitationFacility(Base):
+    """Narrows a `scope=SPECIFIC_FACILITIES` invitation to specific
+    facilities -- mirrors `MembershipFacility` exactly, and is copied
+    into a real `MembershipFacility` row by `accept_invitation` once the
+    invitation is accepted."""
+
+    __tablename__ = "invitation_facilities"
+
+    invitation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("invitations.id"), primary_key=True
+    )
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), primary_key=True
+    )
+
+
+class ApiKey(Base):
+    """Phase 5: a scoped, rotatable, expiring credential for
+    machine-to-machine access -- never interactive (no login/MFA flow).
+    Deliberately does not duplicate role/scope/facility columns:
+    `user_id` points at a service-user row (a `User` with no
+    `password_hash`/`mfa_secret_encrypted`, matching how the login route
+    already treats a NULL credential as unusable for interactive login)
+    that holds its own ordinary `role=api_service` `Membership` --
+    reusing the exact same resolution/RLS machinery a human user goes
+    through, rather than a parallel authorization system to keep in
+    sync. `org_id` is denormalized from that membership purely for RLS
+    scoping, same reasoning as `facility_id`/`org_id` on every other
+    table in this schema (see `db/models.py`'s module docstring) -- RLS
+    filters directly on it rather than joining through `user_id` ->
+    `memberships` at policy-evaluation time. `key_hash` is a SHA-256
+    hash of the raw key, shown to the creator exactly once in the API
+    response, same discipline as `Invitation.token_hash`."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OrgPolicy(Base):
+    """Phase 5 per-org security policy. One row per organization, created
+    lazily (a missing row means "use the application defaults" --
+    `ACCESS_TOKEN_TTL`/`REFRESH_TOKEN_TTL` from `security/session.py`, no
+    IP restriction).
+
+    `mfa_required` exists to satisfy the phase spec's literal request for
+    a per-org MFA policy, but -- by explicit product decision, confirmed
+    2026-08-07 -- the API never accepts `false` for it. MFA is mandatory
+    with no exceptions (CLAUDE.md rule; `security/session.py::issue_session`
+    already refuses to mint a session without it) and this column does
+    not, and must never, carve out a per-org bypass of that rule. It is
+    reserved for a possible future *stricter*-than-default policy, not a
+    weaker one."""
+
+    __tablename__ = "org_policies"
+
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), primary_key=True
+    )
+    session_timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mfa_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    ip_allowlist: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )

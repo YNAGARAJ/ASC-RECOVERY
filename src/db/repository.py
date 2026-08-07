@@ -275,7 +275,7 @@ def get_default_membership_org_id(session: Session, user_id: uuid.UUID) -> uuid.
     `resolve_membership_role`."""
     return session.execute(
         select(MembershipModel.org_id)
-        .where(MembershipModel.user_id == user_id)
+        .where(MembershipModel.user_id == user_id, MembershipModel.revoked_at.is_(None))
         .order_by(MembershipModel.created_at.asc())
         .limit(1)
     ).scalar_one_or_none()
@@ -323,7 +323,9 @@ def resolve_membership_role(
         visited.add(current_org_id)
         membership = session.execute(
             select(MembershipModel).where(
-                MembershipModel.user_id == user_id, MembershipModel.org_id == current_org_id
+                MembershipModel.user_id == user_id,
+                MembershipModel.org_id == current_org_id,
+                MembershipModel.revoked_at.is_(None),
             )
         ).scalar_one_or_none()
         if membership is not None:
