@@ -14,7 +14,7 @@ at a clean commit as of this checkpoint.
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
    underway.** Phase 4 (org/facility/membership access model) is
    **complete**. Phase 5 (user lifecycle and enterprise access) is
-   **in progress, 5 of 7 planned sub-steps done** — see below.
+   **in progress, 6 of 7 planned sub-steps done** — see below.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
@@ -60,7 +60,7 @@ since Phase 5 now builds on top of it as settled, sealed ground:
   `facility_id`/`org_id`, required. Deliberate, still true after Phase 5
   steps 1-3.
 
-## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 5/7 steps
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 6/7 steps
 
 **Scoped down to a core subset, confirmed with the user 2026-08-07**:
 invitation → accept → MFA → first login, offboarding, delegated admin,
@@ -266,15 +266,77 @@ org-resolved admin can revoke a key, an outsider's revoke attempt
 matches zero rows, double-revoke is a no-op, and `touch_api_key_last_used`
 succeeds via the owning service user's own resolved access.
 
-### Full local gate as of step 5 (`edd5655`)
+### Step 6/7 — Per-org policy (`591358b`) — DONE
 
-`ruff check .` clean, `mypy --strict .` clean (188 files, only the 2
+`GET /org-policy` / `PUT /org-policy` (`Action.MANAGE_USERS`-gated).
+**No new migration** — `org_policies` (with its `org_access` RLS policy)
+already existed from step 1's `0007_user_lifecycle.py`, unused until
+now, same situation `api_keys` was in before step 5. `PUT` is a full
+replace (no `PATCH`) since there are only two settable fields.
+
+**`mfa_required` has no field in `UpdateOrgPolicyIn` at all** — the
+guarantee that the API can never accept `false` for it (CLAUDE.md's
+"no exceptions" MFA rule, confirmed with the user back in step 1) comes
+from there being no code path that reads a client-sent value, not from
+validating a boolean and rejecting `False`. `GET /org-policy` still
+reports it (always `true`) for transparency. A missing policy row (an
+org that's never configured one) is not a 404 — it's the documented
+lazy-creation default state (`db.models.OrgPolicy`'s docstring), so
+`GET` returns it as a normal 200 with `updated_at: null`.
+
+**`session_timeout_seconds`** is an `issue_session` access-token TTL
+override, wired at the one call site that matters:
+`api/routes/auth.py`'s login route, after password+MFA verification,
+via the now-authenticated user's own resolved access to their default
+org's policy (`repository.get_org_policy(credentials.user_id,
+credentials.default_org_id)`). `security/session.py::issue_session`
+gained an optional `access_token_ttl` parameter (defaults to the
+existing `ACCESS_TOKEN_TTL` constant when `None`); `_mint_pair` now
+takes it explicitly rather than closing over the module constant.
+**Deliberately does not carry through `refresh_session`** — that
+function has no `Repository` access by design (a decision already made
+in step 3, restated in this module's own docstring), and no
+`POST /auth/refresh` HTTP route exists yet to call it from at all; a
+refreshed token always re-mints at the plain default. `tests/security/
+test_session.py` proves the override both shortens and lengthens the
+default window (decoding the raw JWT directly for the "does refresh
+correctly ignore it" case, to keep that assertion about the `exp`/`iat`
+gap rather than being timing-dependent on wall-clock luck).
+
+**`ip_allowlist`** is enforced in `api/auth.py::_resolve_auth_context`,
+*after* role resolution but shared by both the JWT and API-key auth
+branches — a stolen token used from an unexpected network is rejected
+the same way regardless of which kind of credential it is. The actual
+CIDR-aware matching (a bare IP or a CIDR range, either parses via
+`ipaddress.ip_network`; a malformed allowlist entry is skipped rather
+than raising; an unparseable or missing client IP always fails closed)
+lives in new, deliberately pure `security/ip_allowlist.py` — no
+`Request` dependency, so every branch is unit-testable without an HTTP
+request in the loop at all (`tests/security/test_ip_allowlist.py`).
+
+**A real environment limitation, disclosed rather than worked around**:
+Starlette's `TestClient` (this whole suite's HTTP-level test harness)
+always presents the literal string `"testclient"` as `request.client
+.host` — never a real IP, and no supported way to override it in the
+installed Starlette version (0.41.3). That string can never match a
+real IP/CIDR allowlist entry, so `tests/api/test_org_policy.py` can only
+prove the *rejection* path over a live HTTP request (configure a
+restrictive allowlist, confirm the very next request 403s) — the
+*matching* path (a real client IP actually inside an allowed CIDR range)
+is proven only at the pure-function level
+(`tests/security/test_ip_allowlist.py`), never through a real request in
+this environment. Named explicitly rather than silently having a gap in
+coverage no one flagged.
+
+### Full local gate as of step 6 (`591358b`)
+
+`ruff check .` clean, `mypy --strict .` clean (193 files, only the 2
 pre-existing unrelated alembic 0004 JSONB errors — present since before
-Phase 4, not this session's doing), `pytest -q` 644 passed / 59 skipped,
+Phase 4, not this session's doing), `pytest -q` 682 passed / 64 skipped,
 `domain/variance.py` 100% coverage gate, `python -m evals.run` GATE
-PASSED, `bandit -r . -x ./tests,./evals` clean. Offline SQL generation
-(`alembic upgrade head --sql` / `downgrade 0009:0008 --sql`) verified
-both directions through migration 0009.
+PASSED, `bandit -r . -x ./tests,./evals` clean. No new migration this
+step, so no new offline-SQL surface — `alembic upgrade head --sql`
+still ends at 0009, verified when step 5 added it.
 **Every RLS policy/`SECURITY DEFINER` function added across steps 1, 2,
 and 5 (including `get_api_key_by_hash`) is written and offline-verified
 only — never run against a real Postgres in this environment** (same
@@ -317,21 +379,18 @@ unclaimed, see "Traps" below).
 
 ## Next steps
 
-1. **Step 6/7 — Per-org policy.** `org_policies` CRUD route,
-   `session_timeout_seconds` as an optional TTL override at
-   `issue_session` time, `ip_allowlist` checked in `get_auth_context`.
-   Remember: `mfa_required` exists as a column but the API must never
-   accept `false` for it. `org_policies` (with its `org_access` RLS
-   policy) already exists from step 1's `0007_user_lifecycle.py`, same
-   as `api_keys` was before step 5 — likely no new migration needed,
-   verify before assuming otherwise (same check step 4 did for
-   `org_authoring_update` before concluding it needed nothing new).
-2. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key
-   operator workflows), `docs/PERMISSIONS.md` if the action set changed,
-   `docs/SECURITY.md` control-matrix entries for the new controls.
-3. **If picking this up much later**, re-verify the full local gate
-   before trusting anything — it was green as of `edd5655`, but confirm
+1. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key/
+   per-org-policy operator workflows), `docs/PERMISSIONS.md` if the
+   action set changed (check whether it did — step 6 didn't add a new
+   `Action`, `GET`/`PUT /org-policy` reuse `Action.MANAGE_USERS`),
+   `docs/SECURITY.md` control-matrix entries for the new controls
+   (session timeout override, IP allowlist enforcement point). This is
+   the last step in Phase 5 — after it, the whole phase's gate
+   ("offboarding test proves instant session death") is already
+   satisfied by step 4, so step 7 is documentation-only, not a new gate.
+2. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — it was green as of `591358b`, but confirm
    it still is.
-4. **If the F-22 Postgres password becomes available**, run Phase 4 and
-   5's live-DB suites for real before building step 6 further on top of
-   RLS/function code that's only ever been offline-verified.
+3. **If the F-22 Postgres password becomes available**, run Phase 4 and
+   5's live-DB suites for real before trusting any of steps 1-6's
+   RLS/function code beyond what's offline-verified.
