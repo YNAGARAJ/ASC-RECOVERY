@@ -16,8 +16,9 @@ Every dataclass here carries money as `str`, never `float`
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
@@ -61,11 +62,15 @@ from packets.prompt import PromptInput
 from packets.service import generate_packet_draft
 from packets.templates import PacketTemplate, select_template
 from security.encryption import EnvelopeEncryptor
-from security.phi_columns import decrypt_phi_field
+from security.mfa import generate_enrollment_secret, provisioning_uri, verify_code
+from security.passwords import hash_password
+from security.phi_columns import decrypt_phi_field, encrypt_phi_field
 from security.phi_masking import mask_patient_fields
 from security.rbac import Role
+from security.tokens import generate_token, hash_token
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
+_INVITATION_TTL = timedelta(days=7)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +209,54 @@ class OrgMemberSummary:
     scope: str
     facility_ids: tuple[uuid.UUID, ...]
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class InvitationSummary:
+    """Returned once, at creation (`POST /invitations`) -- `token` is the
+    raw, unhashed value; only its hash is ever persisted
+    (`db.models.Invitation`'s docstring). There is no way to recover it
+    after this response; a lost invitation must be re-sent (a fresh
+    invitation, not a token-recovery flow -- there is no email-sending
+    infrastructure in this codebase to "re-send" through anyway, see
+    `docs/RUNBOOK.md`)."""
+
+    id: uuid.UUID
+    token: str
+    subject: str
+    role: Role
+    scope: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class InvitationPreview:
+    """What an anonymous visitor sees at `GET /invitations/{token}` before
+    deciding to accept -- deliberately minimal (no org name/id; Phase 5's
+    core subset has no public org-directory concern to weigh against
+    exposing it, so this just doesn't)."""
+
+    subject: str
+    role: Role
+    scope: str
+    status: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedInvitation:
+    """Returned once, from `POST /invitations/{token}/accept` --
+    `mfa_secret`/`mfa_provisioning_uri` are shown here and nowhere else
+    (the secret is encrypted at rest immediately; this response is the
+    only chance to scan the QR code / seed an authenticator app). See
+    `PostgresRepository.accept_invitation`'s docstring for why
+    `confirm-mfa` (the next step) is a stateless re-verification rather
+    than a second required write."""
+
+    user_id: uuid.UUID
+    membership_id: uuid.UUID
+    mfa_secret: str
+    mfa_provisioning_uri: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +442,23 @@ class Repository(Protocol):
     def list_org_members(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
     ) -> PagedResult[OrgMemberSummary]: ...
+
+    def create_invitation(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        subject: str,
+        role: Role,
+        scope: str,
+        facility_ids: Sequence[uuid.UUID] = (),
+    ) -> InvitationSummary: ...
+
+    def get_invitation_preview(self, token: str) -> InvitationPreview | None: ...
+
+    def accept_invitation(self, token: str, *, password: str) -> AcceptedInvitation | None: ...
+
+    def verify_invitation_mfa(self, token: str, *, totp_code: str) -> bool | None: ...
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
@@ -781,6 +851,101 @@ class PostgresRepository:
                 for row in rows
             ]
         return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
+
+    def create_invitation(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        subject: str,
+        role: Role,
+        scope: str,
+        facility_ids: Sequence[uuid.UUID] = (),
+    ) -> InvitationSummary:
+        raw_token = generate_token()
+        expires_at = datetime.now(UTC) + _INVITATION_TTL
+        with access_session(self._session_factory, user_id) as session:
+            row = db_repository.create_invitation(
+                session,
+                org_id,
+                subject=subject,
+                role=role.value,
+                scope=scope,
+                invited_by=user_id,
+                token_hash=hash_token(raw_token),
+                expires_at=expires_at,
+                facility_ids=facility_ids,
+            )
+            return InvitationSummary(
+                id=row.id,
+                token=raw_token,
+                subject=row.subject,
+                role=Role(row.role),
+                scope=row.scope,
+                expires_at=row.expires_at,
+            )
+
+    def get_invitation_preview(self, token: str) -> InvitationPreview | None:
+        with self._session_factory() as session:
+            row = db_repository.get_invitation_by_token_hash(session, hash_token(token))
+        if row is None:
+            return None
+        return InvitationPreview(
+            subject=row.subject,
+            role=Role(row.role),
+            scope=row.scope,
+            status=row.status,
+            expires_at=row.expires_at,
+        )
+
+    def accept_invitation(self, token: str, *, password: str) -> AcceptedInvitation | None:
+        """Pre-checks status/expiry against the same preview read
+        `get_invitation_preview` uses before calling the `SECURITY
+        DEFINER` `accept_invitation` DB function -- that function
+        re-checks the same conditions itself (under `FOR UPDATE`), which
+        is the actual safety net against a concurrent accept racing this
+        check; this pre-check just keeps the common (non-race) path a
+        clean `None` -> 404/410 at the route layer instead of an
+        exception. MFA secret generation happens here, not in the DB
+        function -- `EnvelopeEncryptor` is an application-layer
+        dependency the migration has no access to."""
+        token_hash = hash_token(token)
+        with self._session_factory() as session, session.begin():
+            preview = db_repository.get_invitation_by_token_hash(session, token_hash)
+            if (
+                preview is None
+                or preview.status != "pending"
+                or preview.expires_at < datetime.now(UTC)
+            ):
+                return None
+            mfa_secret = generate_enrollment_secret()
+            mfa_secret_encrypted = encrypt_phi_field(self._encryptor, mfa_secret)
+            if mfa_secret_encrypted is None:
+                # encrypt_phi_field only returns None for a None input --
+                # mfa_secret is a freshly generated string, never None.
+                raise RuntimeError("encrypting a freshly generated MFA secret produced None")
+            result = db_repository.accept_invitation(
+                session,
+                token_hash,
+                password_hash=hash_password(password),
+                mfa_secret_encrypted=mfa_secret_encrypted,
+            )
+        return AcceptedInvitation(
+            user_id=result.user_id,
+            membership_id=result.membership_id,
+            mfa_secret=mfa_secret,
+            mfa_provisioning_uri=provisioning_uri(mfa_secret, preview.subject),
+        )
+
+    def verify_invitation_mfa(self, token: str, *, totp_code: str) -> bool | None:
+        with self._session_factory() as session:
+            preview = db_repository.get_invitation_by_token_hash(session, hash_token(token))
+        if preview is None or preview.status != "accepted":
+            return None
+        credentials = self.get_login_credentials(preview.subject)
+        if credentials is None or credentials.mfa_secret is None:
+            return None
+        return verify_code(credentials.mfa_secret, totp_code)
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str

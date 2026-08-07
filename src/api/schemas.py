@@ -14,16 +14,20 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from api.repository import (
+    AcceptedInvitation,
     AccessEventSummary,
     AuditLogEntry,
     ContractSummary,
     FindingDetail,
     FindingSummary,
+    InvitationPreview,
+    InvitationSummary,
     OrgMemberSummary,
     PacketGenerationFailed,
     PagedResult,
     RecoveryPacketSummary,
 )
+from security.rbac import Role
 
 
 class PageMeta(BaseModel):
@@ -220,6 +224,79 @@ class OrgMemberListOut(BaseModel):
             items=[OrgMemberOut.from_domain(item) for item in result.items],
             page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
         )
+
+
+class CreateInvitationIn(BaseModel):
+    subject: str = Field(min_length=1, max_length=255)
+    role: Role
+    scope: Literal["ALL_FACILITIES", "SPECIFIC_FACILITIES"] = "ALL_FACILITIES"
+    facility_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class InvitationCreatedOut(BaseModel):
+    id: uuid.UUID
+    token: str
+    subject: str
+    role: str
+    scope: str
+    expires_at: datetime
+
+    @classmethod
+    def from_domain(cls, row: InvitationSummary) -> InvitationCreatedOut:
+        return cls(
+            id=row.id,
+            token=row.token,
+            subject=row.subject,
+            role=row.role.value,
+            scope=row.scope,
+            expires_at=row.expires_at,
+        )
+
+
+class InvitationPreviewOut(BaseModel):
+    subject: str
+    role: str
+    scope: str
+    status: str
+    expires_at: datetime
+
+    @classmethod
+    def from_domain(cls, row: InvitationPreview) -> InvitationPreviewOut:
+        return cls(
+            subject=row.subject,
+            role=row.role.value,
+            scope=row.scope,
+            status=row.status,
+            expires_at=row.expires_at,
+        )
+
+
+class AcceptInvitationIn(BaseModel):
+    password: str = Field(min_length=8)
+
+
+class AcceptInvitationOut(BaseModel):
+    user_id: uuid.UUID
+    membership_id: uuid.UUID
+    mfa_secret: str
+    mfa_provisioning_uri: str
+
+    @classmethod
+    def from_domain(cls, row: AcceptedInvitation) -> AcceptInvitationOut:
+        return cls(
+            user_id=row.user_id,
+            membership_id=row.membership_id,
+            mfa_secret=row.mfa_secret,
+            mfa_provisioning_uri=row.mfa_provisioning_uri,
+        )
+
+
+class ConfirmInvitationMfaIn(BaseModel):
+    totp_code: str = Field(min_length=6, max_length=6)
+
+
+class ConfirmInvitationMfaOut(BaseModel):
+    verified: bool
 
 
 class CreateContractIn(BaseModel):

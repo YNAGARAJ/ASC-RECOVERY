@@ -28,7 +28,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,8 @@ from db.models import ContractVersion as ContractVersionModel
 from db.models import Facility as FacilityModel
 from db.models import FeeScheduleLine as FeeScheduleLineModel
 from db.models import Finding as FindingModel
+from db.models import Invitation as InvitationModel
+from db.models import InvitationFacility as InvitationFacilityModel
 from db.models import Membership as MembershipModel
 from db.models import MembershipFacility as MembershipFacilityModel
 from db.models import Organization as OrganizationModel
@@ -399,6 +401,107 @@ def list_org_memberships(
             OrgMember(membership=membership, subject=user.subject, facility_ids=facility_ids)
         )
     return members, total
+
+
+# --- Invitations (Phase 5 step 3) -------------------------------------------------
+
+
+def create_invitation(
+    session: Session,
+    org_id: uuid.UUID,
+    *,
+    subject: str,
+    role: str,
+    scope: str,
+    invited_by: uuid.UUID,
+    token_hash: str,
+    expires_at: datetime,
+    facility_ids: Sequence[uuid.UUID] = (),
+) -> InvitationModel:
+    """Ordinary RLS-scoped write -- must run inside `access_session` as
+    the inviting (already-authenticated) user, same as `create_membership`.
+    `token_hash` is computed by the caller (`security.tokens.hash_token`);
+    this function never sees the raw token."""
+    invitation = InvitationModel(
+        org_id=org_id,
+        subject=subject,
+        role=role,
+        scope=scope,
+        invited_by=invited_by,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    session.add(invitation)
+    session.flush()
+    for facility_id in facility_ids:
+        session.add(
+            InvitationFacilityModel(invitation_id=invitation.id, facility_id=facility_id)
+        )
+    session.flush()
+    return invitation
+
+
+@dataclass(frozen=True, slots=True)
+class InvitationPreview:
+    """What `get_invitation_by_token_hash` (the `SECURITY DEFINER`
+    function, `alembic/versions/0007_user_lifecycle.py`) returns -- an
+    anonymous, token-authorized read, so this runs on a plain session, not
+    `access_session` (there is no `user_id` yet; see that function's own
+    docstring for why it bypasses RLS by design)."""
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    subject: str
+    role: str
+    scope: str
+    status: str
+    expires_at: datetime
+
+
+def get_invitation_by_token_hash(session: Session, token_hash: str) -> InvitationPreview | None:
+    row = session.execute(
+        text(
+            "SELECT id, org_id, subject, role, scope, status, expires_at "
+            "FROM get_invitation_by_token_hash(:token_hash)"
+        ),
+        {"token_hash": token_hash},
+    ).mappings().one_or_none()
+    if row is None:
+        return None
+    return InvitationPreview(**row)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedInvitation:
+    user_id: uuid.UUID
+    membership_id: uuid.UUID
+
+
+def accept_invitation(
+    session: Session, token_hash: str, *, password_hash: str, mfa_secret_encrypted: str
+) -> AcceptedInvitation:
+    """Calls the `accept_invitation` `SECURITY DEFINER` function -- same
+    anonymous, plain-session, no-`access_session` treatment as
+    `get_invitation_by_token_hash`. The function itself raises (a Postgres
+    exception, not a Python one) if the invitation is missing, not
+    pending, or expired; callers must check those conditions via a
+    preceding `get_invitation_by_token_hash` call in the common case
+    (api/repository.py does), since letting that exception surface
+    uncaught here would fall through to api/errors.py's generic 500
+    handler -- correct only as a rare-race fallback, not the primary
+    control-flow path."""
+    row = session.execute(
+        text(
+            "SELECT user_id, membership_id FROM "
+            "accept_invitation(:token_hash, :password_hash, :mfa_secret_encrypted)"
+        ),
+        {
+            "token_hash": token_hash,
+            "password_hash": password_hash,
+            "mfa_secret_encrypted": mfa_secret_encrypted,
+        },
+    ).mappings().one()
+    return AcceptedInvitation(**row)
 
 
 # --- Users (ungated, like organizations/facilities -- see db.models.User's docstring) --

@@ -17,11 +17,13 @@ suite alone can prove).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from api.repository import (
+    AcceptedInvitation,
     AccessEventSummary,
     AuditLogEntry,
     AuditLogFilters,
@@ -30,6 +32,8 @@ from api.repository import (
     FindingDetail,
     FindingFilters,
     FindingSummary,
+    InvitationPreview,
+    InvitationSummary,
     LoginCredentials,
     OrgMemberSummary,
     Page,
@@ -44,11 +48,14 @@ from domain.variance import RootCause
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome
 from ingestion.virus_scan import VirusScanner
+from security.mfa import generate_enrollment_secret, provisioning_uri, verify_code
 from security.passwords import hash_password
 from security.phi_masking import mask_patient_fields
 from security.rbac import Role
+from security.tokens import generate_token, hash_token
 
 _DEFAULT_TIMELY_FILING_DAYS = 90
+_INVITATION_TTL = timedelta(days=7)
 
 
 def now() -> datetime:
@@ -66,6 +73,19 @@ class _Membership:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _Invitation:
+    id: uuid.UUID
+    org_id: uuid.UUID
+    subject: str
+    role: str
+    scope: str
+    facility_ids: frozenset[uuid.UUID]
+    token_hash: str
+    status: str
+    expires_at: datetime
+
+
 @dataclass
 class FakeRepository:
     users: dict[str, UserRecord] = field(default_factory=dict)
@@ -75,6 +95,7 @@ class FakeRepository:
     # facility_id -> org_id
     facilities: dict[uuid.UUID, uuid.UUID] = field(default_factory=dict)
     memberships: list[_Membership] = field(default_factory=list)
+    invitations: dict[uuid.UUID, _Invitation] = field(default_factory=dict)
     findings: dict[uuid.UUID, tuple[uuid.UUID, FindingDetail]] = field(default_factory=dict)
     contracts: dict[uuid.UUID, tuple[uuid.UUID, ContractSummary]] = field(default_factory=dict)
     audit_entries: dict[uuid.UUID, tuple[uuid.UUID, AuditLogEntry]] = field(default_factory=dict)
@@ -361,6 +382,94 @@ class FakeRepository:
         total = len(items)
         page_items = items[page.offset : page.offset + page.limit]
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
+
+    def create_invitation(
+        self,
+        user_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        subject: str,
+        role: Role,
+        scope: str,
+        facility_ids: Sequence[uuid.UUID] = (),
+    ) -> InvitationSummary:
+        raw_token = generate_token()
+        invitation_id = uuid.uuid4()
+        expires_at = now() + _INVITATION_TTL
+        self.invitations[invitation_id] = _Invitation(
+            id=invitation_id,
+            org_id=org_id,
+            subject=subject,
+            role=role.value,
+            scope=scope,
+            facility_ids=frozenset(facility_ids),
+            token_hash=hash_token(raw_token),
+            status="pending",
+            expires_at=expires_at,
+        )
+        return InvitationSummary(
+            id=invitation_id,
+            token=raw_token,
+            subject=subject,
+            role=role,
+            scope=scope,
+            expires_at=expires_at,
+        )
+
+    def _find_invitation_by_token(self, token: str) -> _Invitation | None:
+        token_hash = hash_token(token)
+        return next(
+            (inv for inv in self.invitations.values() if inv.token_hash == token_hash), None
+        )
+
+    def get_invitation_preview(self, token: str) -> InvitationPreview | None:
+        invitation = self._find_invitation_by_token(token)
+        if invitation is None:
+            return None
+        return InvitationPreview(
+            subject=invitation.subject,
+            role=Role(invitation.role),
+            scope=invitation.scope,
+            status=invitation.status,
+            expires_at=invitation.expires_at,
+        )
+
+    def accept_invitation(self, token: str, *, password: str) -> AcceptedInvitation | None:
+        invitation = self._find_invitation_by_token(token)
+        if invitation is None or invitation.status != "pending" or invitation.expires_at < now():
+            return None
+        user = self.users.get(invitation.subject)
+        user_id = user.id if user is not None else self.seed_user(invitation.subject)
+        membership_id = self.seed_membership(
+            user_id,
+            invitation.org_id,
+            role=invitation.role,
+            scope=invitation.scope,
+            facility_ids=invitation.facility_ids,
+        )
+        mfa_secret = generate_enrollment_secret()
+        # Membership must exist before this call -- seed_login_credentials
+        # computes default_org_id from it once and caches it, matching how
+        # PostgresRepository.get_login_credentials resolves it fresh from
+        # `memberships` on every call (a fake-only ordering quirk, not a
+        # real behavioral difference).
+        self.seed_login_credentials(invitation.subject, password=password, mfa_secret=mfa_secret)
+        self.invitations[invitation.id] = replace(invitation, status="accepted")
+        return AcceptedInvitation(
+            user_id=user_id,
+            membership_id=membership_id,
+            mfa_secret=mfa_secret,
+            mfa_provisioning_uri=provisioning_uri(mfa_secret, invitation.subject),
+        )
+
+    def verify_invitation_mfa(self, token: str, *, totp_code: str) -> bool | None:
+        invitation = self._find_invitation_by_token(token)
+        if invitation is None or invitation.status != "accepted":
+            return None
+        credentials = self.login_credentials.get(invitation.subject)
+        if credentials is None or credentials.mfa_secret is None:
+            return None
+        return verify_code(credentials.mfa_secret, totp_code)
 
     def create_contract(
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, payer_id: str, name: str
