@@ -4,6 +4,17 @@ evidence chain), GET /findings/export.csv (worklist export).
 Filters are UUIDs/enums/dates/dollar thresholds only -- never a patient
 identifier -- and they're query parameters, so keeping PHI out of them
 matters: query strings land in access logs (CLAUDE.md rule 6).
+
+`export.csv` is gated by `require_permission_with_recent_auth`, not
+plain `require_permission` (`MASTER-BUILD-PROMPT-V2.md` Phase 6's
+"forced re-auth for PHI export" -- `api/auth.py`'s own docstring has the
+full mechanism). Applied here as the one route in this API actually
+shaped like a bulk export, even though today's CSV columns happen to
+carry no patient-identifying fields (see `api.repository.FindingSummary`)
+-- the control guards the export *pattern* (a bulk pull that's easy to
+exfiltrate from an already-compromised-but-unexpired token), not today's
+specific column list, which could grow to include patient identifiers
+later without anyone remembering to add this check retroactively.
 """
 
 from __future__ import annotations
@@ -18,7 +29,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from api.alerting import record_not_found
-from api.auth import AuthContext, get_repository, require_facility, require_permission
+from api.auth import (
+    AuthContext,
+    get_repository,
+    require_facility,
+    require_permission,
+    require_permission_with_recent_auth,
+)
 from api.rate_limit import enforce_rate_limit
 from api.repository import FindingFilters, Page, RecordOutcomeInput, Repository
 from api.schemas import FindingDetailOut, FindingListOut, FindingSummaryOut, RecordOutcomeIn
@@ -70,7 +87,7 @@ def list_findings(
 @router.get("/findings/export.csv")
 def export_findings_csv(
     filters: FindingFilters = Depends(_filters),
-    ctx: AuthContext = require_permission(Action.EXPORT_WORKLIST),
+    ctx: AuthContext = require_permission_with_recent_auth(Action.EXPORT_WORKLIST),
     repository: Repository = Depends(get_repository),
 ) -> StreamingResponse:
     result = repository.list_findings(

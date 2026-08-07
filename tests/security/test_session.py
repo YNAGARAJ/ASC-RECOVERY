@@ -212,11 +212,11 @@ def test_refresh_session_ignores_the_original_sessions_ttl_override() -> None:
 def test_require_recent_auth_true_when_freshly_authenticated() -> None:
     tokens = issue_session(_SECRET, "user-1", _ORG_ID, mfa_verified=True)
     claims = validate_access_token(_SECRET, tokens.access_token)
-    assert require_recent_auth(claims) is True
+    assert require_recent_auth(claims.authenticated_at) is True
 
 
 def test_require_recent_auth_false_when_stale() -> None:
     old_time = datetime.now(UTC) - timedelta(minutes=10)
     tokens = issue_session(_SECRET, "user-1", _ORG_ID, mfa_verified=True, now=old_time)
     claims = validate_access_token(_SECRET, tokens.access_token)
-    assert require_recent_auth(claims) is False
+    assert require_recent_auth(claims.authenticated_at) is False

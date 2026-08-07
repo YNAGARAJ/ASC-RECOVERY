@@ -160,12 +160,18 @@ def refresh_session(
     )
 
 
-def require_recent_auth(claims: AccessTokenClaims, *, now: datetime | None = None) -> bool:
+def require_recent_auth(authenticated_at: datetime, *, now: datetime | None = None) -> bool:
     """Callers guarding a sensitive action (e.g. a PHI export) should call
     this and force a fresh login if it returns False, even when the access
-    token itself is still validly signed and unexpired."""
+    token itself is still validly signed and unexpired. Takes a bare
+    `datetime` rather than an `AccessTokenClaims` -- `api/auth.py` calls
+    this for both the JWT branch (`claims.authenticated_at`) and the
+    API-key branch (presenting a raw secret each time is itself a fresh
+    authentication, so that branch always passes `datetime.now(UTC)`),
+    and an API key has no `AccessTokenClaims` at all to construct one
+    from."""
     current = now or datetime.now(UTC)
-    return (current - claims.authenticated_at) <= REAUTH_MAX_AGE
+    return (current - authenticated_at) <= REAUTH_MAX_AGE
 
 
 def _mint_pair(

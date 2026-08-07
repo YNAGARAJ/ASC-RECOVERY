@@ -121,6 +121,7 @@ extend-immutable-calls = [
     "fastapi.File",
     "fastapi.Form",
     "api.auth.require_permission",
+    "api.auth.require_permission_with_recent_auth",
 ]
 
 [tool.coverage.run]
