@@ -32,7 +32,7 @@ Every control below is written to that bar.
 | Audit controls | §164.312(b) | `audit_log` table (Phase 3), append-only via `REVOKE UPDATE, DELETE` from the app role; ingestion writes `claim`/`finding`-resource entries (`ingestion/apply.py`), not just a batch-level `remittance_ingested` row, as of Phase 10 | Schema + revoke implemented (Phase 3); claim/finding-level coverage closed as a Phase 10 adversarial-review HIGH finding (`GET /claims/{id}/access-history` previously couldn't show a claim's own ingestion). DB-level append-only enforcement now runs for real on every push via `.github/workflows/ci.yml`'s Postgres service container, not just pending-verification |
 | PHI access logging, minimum-necessary reporting | §164.514(d), §164.312(b) | `phi_access_log` table (Phase 3) | Same status as audit_log above |
 | No PHI in logs, traces, or error messages | §164.312(b), general minimum-necessary principle | `src/security/redaction.py` — `PHIRedactionFilter` | Implemented, tested. Structured `extra=` fields are reliably redacted; free-text regex scrubbing (SSN/MBI shapes) is defense in depth, not a substitute — see the module docstring for the honest limitation |
-| Rate limiting | §164.308(a)(5)(ii)(C) (protection from malicious software / brute force, by extension) | `src/security/rate_limit.py` — `InMemoryTokenBucketRateLimiter`; `src/api/rate_limit.py::enforce_rate_limit`, applied as a router-level `dependencies=[...]` on every authenticated router (`findings`, `contracts`, `packets`, `remittances`, `audit`, `organizations`, `invitations`, `api_keys`, `org_policy`) | **Corrected from an earlier, now-stale claim in this row**: register finding F-06 (`docs/audit/REGISTER.md`) — "complete, tested, and wired to zero routes" — was fixed in Wave 3 remediation (`5f8d462`) and every router built since (Phase 5) has followed the same wired-by-default convention. Keyed per `(org_id, user_id)` — each user gets their own bucket, so this throttles a single noisy caller but has **no aggregate per-org ceiling**; a large customer's combined user traffic faces no shared cap. Named, scoped, and explicitly deferred (not this session's chosen Phase 6 scope — see `docs/PROGRESS.md`). Also still single-process only; a Redis-backed adapter is needed once the app runs as more than one instance |
+| Rate limiting, per user and per org | §164.308(a)(5)(ii)(C) (protection from malicious software / brute force, by extension) | `src/security/rate_limit.py` — `InMemoryTokenBucketRateLimiter`; `src/api/rate_limit.py::enforce_rate_limit`, applied as a router-level `dependencies=[...]` on every authenticated router (`findings`, `contracts`, `packets`, `remittances`, `audit`, `organizations`, `invitations`, `api_keys`, `org_policy`) | Register finding F-06 (`docs/audit/REGISTER.md`) — "complete, tested, and wired to zero routes" — was fixed in Wave 3 remediation (`5f8d462`) and every router built since (Phase 5) has followed the same wired-by-default convention. Two independent limiters, both must allow a request: one keyed per `(org_id, user_id)` (throttles a single noisy caller, capacity 60/refill 1 per second by default) and one keyed per `org_id` alone (`docs/MASTER-BUILD-PROMPT-V2.md` Phase 6's "rate limiting per org" — bounds the *combined* traffic of every user/API key at one org, capacity 600/refill 10 per second by default, deliberately well above any single user's own budget so it isn't a redundant copy of the per-user check). Tested (`tests/api/test_rate_limit.py`). Still single-process/in-memory only; a Redis-backed adapter is needed once the app runs as more than one instance |
 | Account lockout after failed logins | §164.308(a)(5)(ii)(C) | `src/security/rate_limit.py::AccountLockoutTracker`, wired into `POST /auth/login` (`api/routes/auth.py`) | **Corrected from an earlier, now-stale claim**: fixed alongside rate limiting above (F-06, `5f8d462`) — login has real lockout after repeated failures, tested (`tests/api/test_login.py`, `tests/api/test_rate_limit.py`) |
 | Secret management, nothing committed | §164.308(a)(3) (workforce security, by extension), general security hygiene | `src/security/secrets.py` — `SecretStore` port, `EnvSecretStore` dev adapter | Port + dev adapter implemented. Real Vault/cloud secret-store adapters are Phase 9/11 scope |
 | Static application security testing | §164.308(a)(8) (evaluation) | `bandit` (`make security`) | Runs clean (`bandit -r . -x ./tests,./evals` — the Makefile's original `-x tests,evals` exclude syntax didn't actually exclude anything on this platform; fixed to `-x ./tests,./evals`) |
@@ -47,20 +47,20 @@ Every control below is written to that bar.
   *after* a successful login (MFA-gated token issuance, refresh, and
   validation); the actual OIDC handshake needs a real IdP, same gap as
   the SSO bullet below — see there for the current disposition.
-- **Per-org encryption keys (BYOK-ready), per-org rate-limiting ceiling,
-  and per-org data residency.** `docs/MASTER-BUILD-PROMPT-V2.md`'s Phase
-  6 prompt names all three. Investigated and explicitly scoped out of
-  this session by the user (via a scoping question, same pattern as
-  Phase 5's SSO/SCIM deferral) in favor of forced re-auth for PHI export
-  above — not started, not partially built. Per-org encryption keys need
-  real schema + design work (an org-level KEK reference threaded through
+- **Per-org encryption keys (BYOK-ready) and per-org data residency.**
+  `docs/MASTER-BUILD-PROMPT-V2.md`'s Phase 6 prompt names both, alongside
+  a per-org rate-limiting ceiling (now built — see the rate limiting row
+  above) and forced re-auth for PHI export (now built — see that row
+  above). These two remain not started; scoped out of the session that
+  built the other two, via the same `AskUserQuestion` scoping pattern
+  Phase 5's SSO/SCIM deferral used. Per-org encryption keys need real
+  schema + design work (an org-level KEK reference threaded through
   `EnvelopeEncryptor`'s call sites, currently one global KEK for every
-  org). The rate-limiting ceiling is a smaller addition, noted inline in
-  the rate limiting row above. Data residency, given this build is one
-  shared Postgres instance in one region today, would realistically mean
-  a stored, honest preference/contractual flag rather than physical
-  multi-region enforcement — worth confirming that framing before
-  building it, not assuming.
+  org). Data residency, given this build is one shared Postgres instance
+  in one region today, would realistically mean a stored, honest
+  preference/contractual flag rather than physical multi-region
+  enforcement — worth confirming that framing before building it, not
+  assuming.
 - **GCP KMS / Vault adapters** — still named, deferred; AWS KMS and Azure
   Key Vault adapters exist now (F-20, `docs/audit/REGISTER.md`, opt-in via
   `KMS_PROVIDER`) but only those two clouds. `security/kms_env.py`'s

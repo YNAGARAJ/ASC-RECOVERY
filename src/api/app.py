@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from api.errors import register_exception_handlers
-from api.rate_limit import default_rate_limiter
+from api.rate_limit import default_org_rate_limiter, default_rate_limiter
 from api.repository import Repository
 from api.request_context import RequestIDMiddleware
 from api.routes import (
@@ -44,6 +44,7 @@ def create_app(
     repository: Repository,
     jwt_secret_key: str,
     rate_limiter: RateLimiter | None = None,
+    org_rate_limiter: RateLimiter | None = None,
     lockout_tracker: AccountLockoutTracker | None = None,
     notifier: NotificationPort | None = None,
     not_found_tracker: RollingWindowCounter | None = None,
@@ -59,6 +60,9 @@ def create_app(
     # dozens of real requests, or a fake NotificationPort to assert on
     # dispatched alerts.
     app.state.rate_limiter = rate_limiter if rate_limiter is not None else default_rate_limiter()
+    app.state.org_rate_limiter = (
+        org_rate_limiter if org_rate_limiter is not None else default_org_rate_limiter()
+    )
     app.state.lockout_tracker = (
         lockout_tracker if lockout_tracker is not None else AccountLockoutTracker()
     )
