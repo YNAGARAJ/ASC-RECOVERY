@@ -14,7 +14,7 @@ at a clean commit as of this checkpoint.
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
    underway.** Phase 4 (org/facility/membership access model) is
    **complete**. Phase 5 (user lifecycle and enterprise access) is
-   **in progress, 3 of 7 planned sub-steps done** — see below.
+   **in progress, 4 of 7 planned sub-steps done** — see below.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
@@ -60,7 +60,7 @@ since Phase 5 now builds on top of it as settled, sealed ground:
   `facility_id`/`org_id`, required. Deliberate, still true after Phase 5
   steps 1-3.
 
-## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 3/7 steps
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 4/7 steps
 
 **Scoped down to a core subset, confirmed with the user 2026-08-07**:
 invitation → accept → MFA → first login, offboarding, delegated admin,
@@ -148,19 +148,67 @@ race — deliberately not wrapped in its own exception handler, since that
 race is vanishingly rare and the existing generic 500 handler is already
 a safe (if inelegant) fallback for it.
 
-### Full local gate as of step 3 (`2b553e6`)
+### Step 4/7 — Offboarding (`964ec35`) — DONE
 
-`ruff check .` clean, `mypy --strict .` clean (182 files, only the 2
+`POST /organizations/members/{membership_id}/revoke`
+(`Action.MANAGE_USERS`-gated, 204) soft-revokes via
+`memberships.revoked_at` — an `UPDATE`, the only write `asc_app` is ever
+granted on a mutable table, same convention as everywhere else. No new
+migration needed: RLS's `org_authoring_update` policy from step 1
+(`0007_user_lifecycle.py`) already covers "an org-resolved caller
+updates someone else's membership row," so this is purely an
+application-layer route + repository addition on top of sealed schema.
+
+This is the phase's actual stated gate — **"offboarding test proves
+instant session death"** — and it's proven directly, not inferred:
+`tests/api/test_offboarding.py::test_revoking_membership_kills_the_next_request_immediately`
+issues a token, confirms it works, revokes the membership through a
+separate admin call, then re-uses the *same, still-unexpired* token on
+the *same* route and asserts 401 — no re-login, no token-revocation
+list, because role/access is resolved fresh from `memberships` on every
+request (`api/auth.py::get_auth_context`) and revocation just makes that
+resolution come back empty. Also covered: the full role×action matrix
+for this one endpoint, double-revoke → 404, unknown id → 404, and the
+cross-org IDOR case (a real `membership_id` belonging to another org
+404s identically to a nonexistent one, and is untouched — that org's own
+admin can still revoke it). `tests/db/test_offboarding.py` proves the
+same guarantee one layer down, through `asc_app` with real RLS: an
+org-resolved caller can revoke, an outsider's `UPDATE` matches zero rows
+(RLS narrows the `WHERE`, no raised error), and revoking twice is a
+no-op. Both test files are DB/API-fake pairs, following the exact
+pure/DB-split discipline every phase since Phase 5 (original numbering)
+established.
+
+**Deliberately no dedicated `audit_log` entry for a revocation** —
+confirmed with the user. Every existing `write_audit_log` call in this
+codebase is for a write to a PHI-bearing table (CLAUDE.md rule 5's
+literal scope); `memberships` isn't one, and `audit_log.facility_id` is
+`NOT NULL` with no clean single-facility target for an
+`ALL_FACILITIES`-scoped membership anyway. The gate's own proof is the
+instant-session-death test, not an audit row.
+
+**`FakeRepository` (`tests/api/fakes.py`) revocation-awareness**: every
+access-resolution helper (`_accessible_org_ids`, `_accessible_facility_ids`,
+`_default_membership_org_id`, `resolve_membership_role`,
+`list_org_members`) now skips `revoked_at is not None` memberships —
+mirrors the real `resolve_membership_role`'s `AND m.revoked_at IS NULL`,
+and is what makes offboarding take effect on the fake repository's very
+next call, not just in the real DB path.
+
+### Full local gate as of step 4 (`964ec35`)
+
+`ruff check .` clean, `mypy --strict .` clean (184 files, only the 2
 pre-existing unrelated alembic 0004 JSONB errors — present since before
-Phase 4, not this session's doing), `pytest -q` 616 passed / 51 skipped,
+Phase 4, not this session's doing), `pytest -q` 627 passed / 54 skipped,
 `domain/variance.py` 100% coverage gate, `python -m evals.run` GATE
 PASSED, `bandit -r . -x ./tests,./evals` clean. Offline SQL generation
 (`alembic upgrade head --sql` / `downgrade 0008:0007 --sql`) verified
-both directions through migration 0008. **The two `SECURITY DEFINER`
-functions and every RLS policy added in steps 1-2 are written and
-offline-verified only — never run against a real Postgres in this
-environment** (same disclosed gap as Phase 4's RLS work; F-22's local
-Postgres is still unclaimed, see "Traps" below).
+both directions through migration 0008 — step 4 added no new migration.
+**The two `SECURITY DEFINER` functions and every RLS policy added in
+steps 1-2, plus step 4's reliance on the `org_authoring_update` policy,
+are written and offline-verified only — never run against a real
+Postgres in this environment** (same disclosed gap as Phase 4's RLS
+work; F-22's local Postgres is still unclaimed, see "Traps" below).
 
 ## Traps for someone resuming cold
 
@@ -198,34 +246,21 @@ Postgres is still unclaimed, see "Traps" below).
 
 ## Next steps
 
-1. **Step 4/7 — Offboarding (the phase's actual stated gate: "offboarding
-   test proves instant session death").** An endpoint that sets
-   `memberships.revoked_at`, writes an audit entry, and a dedicated test
-   proving the very next authenticated request (any route) fails
-   immediately — at the route/API level this time, matching what Phase
-   4's `test_revoking_membership_revokes_access_immediately` already
-   proved at the DB layer via a hard `DELETE` through the owner
-   connection. Likely needs a small new migration (`0009`) if any RLS
-   gap surfaces the way step 2 needed one for step 1's gap — check
-   whether the existing `org_authoring_update` policy from step 1
-   already covers "an org-resolved caller sets `revoked_at` on someone
-   else's membership row" (it should, since `UPDATE` was already granted
-   broadly, but verify before assuming).
-2. **Step 5/7 — API keys.** Create (returns the raw key once, reusing
+1. **Step 5/7 — API keys.** Create (returns the raw key once, reusing
    `security/tokens.py`), revoke, list (masked), and a new bearer-token
    branch in `api/auth.py` distinguishing an API key from a JWT by a
    fixed prefix before attempting either kind of validation.
-3. **Step 6/7 — Per-org policy.** `org_policies` CRUD route,
+2. **Step 6/7 — Per-org policy.** `org_policies` CRUD route,
    `session_timeout_seconds` as an optional TTL override at
    `issue_session` time, `ip_allowlist` checked in `get_auth_context`.
    Remember: `mfa_required` exists as a column but the API must never
    accept `false` for it.
-4. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key
+3. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key
    operator workflows), `docs/PERMISSIONS.md` if the action set changed,
    `docs/SECURITY.md` control-matrix entries for the new controls.
-5. **If picking this up much later**, re-verify the full local gate
-   before trusting anything — it was green as of `2b553e6`, but confirm
+4. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — it was green as of `964ec35`, but confirm
    it still is.
-6. **If the F-22 Postgres password becomes available**, run Phase 4 and
-   5's live-DB suites for real before building steps 4-6 further on top
+5. **If the F-22 Postgres password becomes available**, run Phase 4 and
+   5's live-DB suites for real before building steps 5-6 further on top
    of RLS/function code that's only ever been offline-verified.
