@@ -14,8 +14,10 @@ at a clean commit as of this checkpoint.
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
    underway.** Phase 4 (org/facility/membership access model) and Phase 5
    (user lifecycle and enterprise access) are both **complete**. Phase 6
-   (security and PHI controls) has not been started — see "Next steps"
-   below before picking it up.
+   (security and PHI controls) is **in progress** — most of its own
+   prompt turned out to already be built by Wave 3/Phases 4-5 (see
+   below); one genuinely new item (forced re-auth for PHI export) is
+   done, three more are scoped but not started.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
@@ -399,6 +401,99 @@ Postgres**, same standard the original 12-phase build held itself to
 before Phase 10's CI run retroactively confirmed its own equivalent
 gaps (`docs/PHASES.md`).
 
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 6 (security and PHI controls) — IN PROGRESS
+
+**Audited the actual prompt against the actual code before assuming
+anything was still open** (`2983cbf`) — most of Phase 6's checklist
+turned out to already be true, built across Wave 3 remediation and
+Phases 4-5, not this phase:
+
+- AES-256 at rest, envelope encryption + KEK rotation, KMS port with
+  real AWS/Azure adapters — Phase 4 + Wave 3's F-20.
+- MFA mandatory, no bypass, with a real `POST /auth/login` endpoint —
+  Phase 4 + Phase 5 step 3.
+- Short-lived tokens + rotating refresh — Phase 4.
+- PHI redaction installed **structurally** on the root logger at
+  startup (`observability/logging_config.py::configure_logging()`,
+  called from `main.py`) — already satisfies the audit amendment's
+  literal ask ("installed structurally, once ... not attached one
+  logger at a time"), just never previously credited as closing it.
+- Rate limiting **and** account lockout wired into real routes —
+  register finding F-06, `FIXED` in Wave 3 (`5f8d462`); every router
+  built since (Phase 5) followed the same wired-by-default convention.
+  `docs/SECURITY.md` still claimed "wired to zero routes" (a stale,
+  Phase-10-era snapshot) until this phase corrected it.
+- Secrets behind an external-store interface — Phase 4.
+- TLS 1.2+ enforced — AWS's `aws_lb_listener.https` already sets
+  `ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"` plus an HTTP→HTTPS
+  redirect listener (Phase 9 Terraform, never previously credited in
+  `docs/SECURITY.md`, which still said "not yet built"). Azure relies on
+  Container Apps' platform-default HTTPS-only ingress rather than an
+  explicit pinned minimum — a real, if minor, asymmetry, documented
+  rather than silently left unequal.
+
+**Genuinely unbuilt**, confirmed via `AskUserQuestion` (same pattern as
+Phase 5's SSO/SCIM scoping): per-org encryption keys (BYOK-ready), a
+per-org rate-limiting ceiling, per-org data residency, and forced re-auth
+for PHI export. **User chose to build only the last one this session** —
+the other three are named, scoped, and explicitly deferred in
+`docs/SECURITY.md`'s "Not yet built" section, not started.
+
+### Forced re-auth for PHI export (`2983cbf`) — DONE
+
+`security/session.py::require_recent_auth` previously had **zero call
+sites anywhere in the app** — exactly the "built but unwired" pattern
+this project's own audit named as a repeating failure mode, caught here
+before it needed a seventh unplanned-audit discovery. Closed by:
+
+- Changed `require_recent_auth`'s signature from `(claims:
+  AccessTokenClaims)` to `(authenticated_at: datetime)` — it only ever
+  read one field off `claims`, and the new second caller (API keys, see
+  below) has no `AccessTokenClaims` at all to construct.
+- `api.auth.AuthContext` gained `authenticated_at: datetime`. For a JWT,
+  this is the token's `auth_time` claim (unaffected by `refresh_session`
+  — a refresh carries the *original* auth time forward, per
+  `security/session.py`'s own long-standing design). For an API key,
+  it's `datetime.now(UTC)` at the moment of authentication — presenting
+  a raw secret each time is itself a fresh authentication, with no
+  "session age" concept the way a JWT has one.
+- New `api.auth.require_permission_with_recent_auth(action)` — same RBAC
+  check as `require_permission`, plus `require_recent_auth`. Needed a
+  `pyproject.toml` addition (`extend-immutable-calls`) alongside
+  `require_permission`, or ruff's B008 flags it as a mutable-default
+  call in a route signature.
+- Wired onto exactly one route: `GET /findings/export.csv` — the only
+  endpoint in this whole API actually shaped like a bulk export.
+  **Today's CSV columns carry no patient-identifying fields at all**
+  (`FindingSummary` has no `patient_name`/`patient_member_id`) — the
+  control guards the export *pattern* (a bulk pull, easy to exfiltrate
+  from an already-compromised-but-unexpired token) against the risk that
+  patient identifiers get added to it later without anyone remembering
+  to add this check retroactively, not today's specific column list.
+- No new step-up endpoint: the caller's remediation on a 401 is simply
+  calling `POST /auth/login` again, which already mints a fresh
+  `auth_time` by succeeding. Deliberately not building a second,
+  narrower "just re-verify TOTP" endpoint for this — the existing login
+  route already does the whole job.
+
+`tests/api/test_csv_export.py` proves: a session authenticated more than
+`REAUTH_MAX_AGE` (5 min) ago is rejected (401, the exact message);
+one authenticated just inside the window still succeeds; and — the
+scope-boundary proof — a stale session can still call plain `GET
+/findings`, since this control only guards the one route it's actually
+wired to, not the whole API. `tests/security/test_session.py`'s two
+pre-existing `require_recent_auth` tests updated for the new signature
+(`claims.authenticated_at` instead of bare `claims`), no behavior change.
+
+### Full local gate as of this commit (`2983cbf`)
+
+`ruff check .` clean (after the `pyproject.toml` B008 allowlist
+addition), `mypy --strict .` clean (193 files, only the 2 pre-existing
+unrelated alembic 0004 JSONB errors), `pytest -q` 685 passed / 64
+skipped, `domain/variance.py` 100% coverage gate, `python -m evals.run`
+GATE PASSED, `bandit -r . -x ./tests,./evals` clean. No schema change
+this commit, so no new migration/offline-SQL surface.
+
 ## Traps for someone resuming cold
 
 - **Everything Phase 4's checkpoint already flagged still applies**: the
@@ -442,32 +537,36 @@ gaps (`docs/PHASES.md`).
 
 ## Next steps
 
-Phase 5 is complete. Per `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 —
-GAP REGISTER", **V2 Phase 6 (security and PHI controls) is next** —
-AES-256 at rest (largely already true from Wave 3's F-20 KMS work, but
-re-check against Phase 6's actual prompt text before assuming full
-overlap, especially **per-org encryption keys (BYOK-ready)**, which
-nothing built so far provides), TLS 1.2+, KEK rotation without
-re-encryption (already built, Phase 4), MFA mandatory (already built,
-Phase 5), PHI redaction *installed structurally at the logging bootstrap*
-(check whether the existing `PHIRedactionFilter` wiring already meets
-this bar or is still the one-`addFilter`-call gap `docs/SECURITY.md`'s
-"Not yet built" section may still describe), rate limiting *wired* (per
-org — `docs/SECURITY.md`'s control matrix already flags rate limiting
-and account lockout as built-but-unwired MEDIUM findings from the
-original build; confirm current status before assuming either way), and
-data residency configurable per organization (nothing built for this
-yet). **Do not start Phase 6 without first reading its full prompt in
-`docs/MASTER-BUILD-PROMPT-V2.md` and re-verifying what Wave 3/Phase 4
-already closed** — this phase overlaps significantly with prior work in
-a way Phase 5 didn't, so the real remaining scope needs to be scoped
-freshly, not assumed from this summary.
+Phase 6 is in progress, scope already resolved (see its section above --
+don't re-litigate what's already built vs. deferred, it was just
+audited item by item against the actual code). Three items remain,
+already scoped, not started:
 
-1. **If picking this up much later**, re-verify the full local gate
-   before trusting anything — it was green as of `e892c52`, but confirm
+1. **Per-org rate-limiting ceiling.** Smallest of the three. Add an
+   aggregate per-org token bucket in `api/rate_limit.py::enforce_rate_limit`
+   alongside the existing per-`(org_id, user_id)` one — today a large
+   customer's users collectively face no shared cap, only individual
+   ones. `security/rate_limit.py::InMemoryTokenBucketRateLimiter` is
+   already generic enough to reuse for a second, org-keyed bucket
+   without new abstraction.
+2. **Per-org encryption keys (BYOK-ready).** Medium-sized, real design
+   work — an org-level KEK reference (likely a new nullable column on
+   `organizations`, or a new `org_encryption_keys` table if more than
+   one field ends up needed), threaded through `EnvelopeEncryptor`'s
+   call sites (`ingestion/apply.py` write path, `api/repository.py` read
+   path) instead of the one global KEK `main.py` wires today. Touches
+   more surface than the other two — plan-mode this one before writing
+   code, the way every schema-shaped phase in this project has.
+3. **Per-org data residency flag.** Small to build, but confirm the
+   "stored preference, not physical enforcement" framing
+   (`docs/SECURITY.md`'s "Not yet built" section already states it) is
+   still acceptable before writing it — this build is one shared
+   Postgres in one region, so anything claiming more would be fiction.
+4. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — it was green as of `2983cbf`, but confirm
    it still is.
-2. **If the F-22 Postgres password becomes available**, run Phase 4 and
-   5's live-DB suites for real before trusting any of Phase 5's
-   RLS/function code beyond what's offline-verified — this is
-   independent of and should happen before Phase 6, since Phase 6 may
-   itself add more RLS-adjacent work worth verifying together.
+5. **If the F-22 Postgres password becomes available**, run Phase 4 and
+   5's live-DB suites for real before trusting any of their RLS/function
+   code beyond what's offline-verified — independent of Phase 6, and
+   worth doing before Phase 6 adds more RLS-adjacent work (the per-org
+   BYOK item above will, if built).
