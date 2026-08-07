@@ -615,7 +615,21 @@ class OrgPolicy(Base):
     already refuses to mint a session without it) and this column does
     not, and must never, carve out a per-org bypass of that rule. It is
     reserved for a possible future *stricter*-than-default policy, not a
-    weaker one."""
+    weaker one.
+
+    `data_residency_region` (Phase 6, `docs/MASTER-BUILD-PROMPT-V2.md`)
+    is a **stored declaration, not a technical control** -- this system
+    runs one shared Postgres instance in one region today, so there is
+    no per-org routing, replication, or physical placement this column
+    could actually drive even if it wanted to. It exists so the answer
+    to "what region is this org's data in" is a real, queryable fact
+    instead of tribal knowledge or a sales contract nobody can look up
+    -- and so a customer-facing security questionnaire has something
+    honest to point at. See `docs/RUNBOOK.md`'s "Per-org data
+    residency" section for the operational meaning, and do not read
+    "stored" as "enforced": if this platform ever does add real
+    multi-region deployment, this column becomes the source of truth to
+    build routing against, not a promise already kept."""
 
     __tablename__ = "org_policies"
 
@@ -627,6 +641,7 @@ class OrgPolicy(Base):
         Boolean, nullable=False, server_default=text("true")
     )
     ip_allowlist: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    data_residency_region: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

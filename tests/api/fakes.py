@@ -97,6 +97,7 @@ class _OrgPolicy:
     session_timeout_seconds: int | None
     mfa_required: bool
     ip_allowlist: tuple[str, ...]
+    data_residency_region: str | None
     updated_at: datetime
 
 
@@ -644,6 +645,7 @@ class FakeRepository:
             session_timeout_seconds=policy.session_timeout_seconds,
             mfa_required=policy.mfa_required,
             ip_allowlist=policy.ip_allowlist,
+            data_residency_region=policy.data_residency_region,
             updated_at=policy.updated_at,
         )
 
@@ -654,11 +656,13 @@ class FakeRepository:
         *,
         session_timeout_seconds: int | None,
         ip_allowlist: Sequence[str] | None,
+        data_residency_region: str | None = None,
     ) -> OrgPolicySummary:
         policy = _OrgPolicy(
             session_timeout_seconds=session_timeout_seconds,
             mfa_required=True,
             ip_allowlist=tuple(ip_allowlist) if ip_allowlist else (),
+            data_residency_region=data_residency_region,
             updated_at=now(),
         )
         self.org_policies[org_id] = policy
@@ -666,6 +670,7 @@ class FakeRepository:
             session_timeout_seconds=policy.session_timeout_seconds,
             mfa_required=policy.mfa_required,
             ip_allowlist=policy.ip_allowlist,
+            data_residency_region=policy.data_residency_region,
             updated_at=policy.updated_at,
         )
 

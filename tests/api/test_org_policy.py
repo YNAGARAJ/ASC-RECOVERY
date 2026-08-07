@@ -57,6 +57,7 @@ def test_get_org_policy_returns_application_defaults_when_unconfigured(
         "session_timeout_seconds": None,
         "mfa_required": True,
         "ip_allowlist": [],
+        "data_residency_region": None,
         "updated_at": None,
     }
 
@@ -70,7 +71,11 @@ def test_set_org_policy_round_trips(client: TestClient) -> None:
     headers = auth_headers(Role.ORG_ADMIN, "a")
     put_response = client.put(
         "/org-policy",
-        json={"session_timeout_seconds": 1800, "ip_allowlist": []},
+        json={
+            "session_timeout_seconds": 1800,
+            "ip_allowlist": [],
+            "data_residency_region": "us-east-1",
+        },
         headers=headers,
     )
     assert put_response.status_code == 200
@@ -78,11 +83,38 @@ def test_set_org_policy_round_trips(client: TestClient) -> None:
     assert body["session_timeout_seconds"] == 1800
     assert body["ip_allowlist"] == []
     assert body["mfa_required"] is True
+    assert body["data_residency_region"] == "us-east-1"
     assert body["updated_at"] is not None
 
     get_response = client.get("/org-policy", headers=headers)
     assert get_response.status_code == 200
     assert get_response.json() == body
+
+
+def test_set_org_policy_rejects_a_data_residency_region_over_the_length_limit(
+    client: TestClient,
+) -> None:
+    response = client.put(
+        "/org-policy",
+        json={
+            "session_timeout_seconds": None,
+            "ip_allowlist": [],
+            "data_residency_region": "x" * 101,
+        },
+        headers=auth_headers(Role.ORG_ADMIN, "a"),
+    )
+    assert response.status_code == 422
+
+
+def test_data_residency_region_is_not_declared_by_default(client: TestClient) -> None:
+    headers = auth_headers(Role.ORG_ADMIN, "a")
+    response = client.put(
+        "/org-policy",
+        json={"session_timeout_seconds": None, "ip_allowlist": []},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["data_residency_region"] is None
 
 
 def test_set_org_policy_ignores_any_client_supplied_mfa_required(client: TestClient) -> None:

@@ -705,13 +705,17 @@ def upsert_org_policy(
     *,
     session_timeout_seconds: int | None,
     ip_allowlist: Sequence[str] | None,
+    data_residency_region: str | None = None,
 ) -> OrgPolicyModel:
     """`mfa_required` is deliberately never a parameter here -- by explicit
     product decision (`db.models.OrgPolicy`'s docstring) there is no code
     path anywhere that can set it to anything but its `true` default; a
     freshly created row gets it set explicitly (rather than left for the
     server default) so the returned object is correct without a second
-    round trip to refresh it."""
+    round trip to refresh it. `data_residency_region` is a stored
+    declaration only (same docstring) -- accepted and returned like any
+    other field here, never validated against real infrastructure since
+    none of the multi-region kind exists to validate against."""
     policy = session.get(OrgPolicyModel, org_id)
     if policy is None:
         policy = OrgPolicyModel(
@@ -719,11 +723,13 @@ def upsert_org_policy(
             session_timeout_seconds=session_timeout_seconds,
             mfa_required=True,
             ip_allowlist=list(ip_allowlist) if ip_allowlist else None,
+            data_residency_region=data_residency_region,
         )
         session.add(policy)
     else:
         policy.session_timeout_seconds = session_timeout_seconds
         policy.ip_allowlist = list(ip_allowlist) if ip_allowlist else None
+        policy.data_residency_region = data_residency_region
         policy.updated_at = datetime.now(UTC)
     session.flush()
     return policy

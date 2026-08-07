@@ -512,6 +512,32 @@ fail (loudly, not silently) for that org's claims the moment a patient
 name/member id needs encrypting. Do not set this column until the
 deployment is actually running a real cloud KMS.
 
+## Per-org data residency
+
+`docs/MASTER-BUILD-PROMPT-V2.md` Phase 6's last item —
+`org_policies.data_residency_region`, set via `PUT /org-policy` like
+any other per-org setting (`org_admin`/`platform_admin`, `docs/PERMISSIONS.md`):
+
+```
+curl -X PUT https://<host>/org-policy \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"session_timeout_seconds": null, "ip_allowlist": [], "data_residency_region": "us-east-1"}'
+```
+
+**This is a stored declaration, not a technical control.** This
+platform runs one shared Postgres instance in one region today — there
+is no per-org routing, replication, or physical placement this field
+actually drives. It exists so "what region is this org's data in" has a
+real, queryable answer (useful for a customer-facing security
+questionnaire, `docs/compliance/SECURITY-QUESTIONNAIRE-ANSWERS.md`) —
+setting it does not move any data or change where anything is deployed.
+Unlike per-org encryption keys above, there is no misconfiguration risk
+that locks anyone out of anything, so this one *is* a normal, self-
+service `PUT`, not an operator-only DB write. If this platform ever
+adds real multi-region deployment, this column becomes the source of
+truth to build routing against, not a promise already kept — don't
+represent it as enforced before that work exists.
+
 ## Incident response
 
 1. **Identify**: alert fires (`observability.alerts`, Phase 8) or

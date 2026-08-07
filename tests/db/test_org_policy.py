@@ -73,6 +73,34 @@ def test_setting_the_policy_a_second_time_updates_rather_than_duplicates(
     assert fetched.ip_allowlist is None
 
 
+def test_data_residency_region_round_trips_and_defaults_to_none(
+    app_session_factory: sessionmaker[Session], owner_engine: Engine
+) -> None:
+    admin_id, org_id, _ = seed_org_facility_user(owner_engine, "Org policy data residency test")
+    with access_session(app_session_factory, admin_id) as session:
+        created = repository.upsert_org_policy(
+            session,
+            org_id,
+            session_timeout_seconds=None,
+            ip_allowlist=None,
+            data_residency_region="eu-west-1",
+        )
+    assert created.data_residency_region == "eu-west-1"
+
+    with access_session(app_session_factory, admin_id) as session:
+        fetched = repository.get_org_policy(session, org_id)
+    assert fetched is not None
+    assert fetched.data_residency_region == "eu-west-1"
+
+    # Omitting it on a later write clears it, same full-replace semantics
+    # as session_timeout_seconds/ip_allowlist.
+    with access_session(app_session_factory, admin_id) as session:
+        updated = repository.upsert_org_policy(
+            session, org_id, session_timeout_seconds=None, ip_allowlist=None
+        )
+    assert updated.data_residency_region is None
+
+
 def test_caller_outside_the_org_reads_nothing(
     app_session_factory: sessionmaker[Session], owner_engine: Engine
 ) -> None:

@@ -366,12 +366,19 @@ class UpdateOrgPolicyIn(BaseModel):
     # (multi-week) rather than a considered security boundary either way.
     session_timeout_seconds: int | None = Field(default=None, ge=60, le=86_400)
     ip_allowlist: list[str] = Field(default_factory=list)
+    # A stored declaration, not a technical control -- db.models.OrgPolicy
+    # .data_residency_region's docstring. Free text, not an enum: this
+    # platform has no real multi-region infrastructure to validate
+    # against, so constraining the value would imply a precision that
+    # doesn't exist.
+    data_residency_region: str | None = Field(default=None, max_length=100)
 
 
 class OrgPolicyOut(BaseModel):
     session_timeout_seconds: int | None
     mfa_required: bool
     ip_allowlist: list[str]
+    data_residency_region: str | None
     updated_at: datetime | None
 
     @classmethod
@@ -380,6 +387,7 @@ class OrgPolicyOut(BaseModel):
             session_timeout_seconds=row.session_timeout_seconds,
             mfa_required=row.mfa_required,
             ip_allowlist=list(row.ip_allowlist),
+            data_residency_region=row.data_residency_region,
             updated_at=row.updated_at,
         )
 

@@ -312,6 +312,9 @@ class OrgPolicySummary:
     session_timeout_seconds: int | None
     mfa_required: bool
     ip_allowlist: tuple[str, ...]
+    # A stored declaration, not a technical control -- db.models.OrgPolicy's
+    # docstring. None means "not declared."
+    data_residency_region: str | None
     # None only when no policy row exists yet for this org -- the
     # lazy-creation default (`db.models.OrgPolicy`'s docstring); every
     # other field above is still meaningful in that state (the
@@ -452,6 +455,7 @@ def _org_policy_summary(row: Any) -> OrgPolicySummary:
         session_timeout_seconds=row.session_timeout_seconds,
         mfa_required=row.mfa_required,
         ip_allowlist=tuple(row.ip_allowlist or ()),
+        data_residency_region=row.data_residency_region,
         updated_at=row.updated_at,
     )
 
@@ -564,6 +568,7 @@ class Repository(Protocol):
         *,
         session_timeout_seconds: int | None,
         ip_allowlist: Sequence[str] | None,
+        data_residency_region: str | None = None,
     ) -> OrgPolicySummary: ...
 
     def create_contract(
@@ -1160,6 +1165,7 @@ class PostgresRepository:
         *,
         session_timeout_seconds: int | None,
         ip_allowlist: Sequence[str] | None,
+        data_residency_region: str | None = None,
     ) -> OrgPolicySummary:
         with access_session(self._session_factory, user_id) as session:
             row = db_repository.upsert_org_policy(
@@ -1167,6 +1173,7 @@ class PostgresRepository:
                 org_id,
                 session_timeout_seconds=session_timeout_seconds,
                 ip_allowlist=ip_allowlist,
+                data_residency_region=data_residency_region,
             )
         return _org_policy_summary(row)
 
