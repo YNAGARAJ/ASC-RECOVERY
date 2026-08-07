@@ -134,3 +134,74 @@ resource "azurerm_container_app" "app" {
 
   depends_on = [azurerm_key_vault_access_policy.app]
 }
+
+# Phase 7's job-queue worker -- same image as `app`, `command` overridden
+# to run the polling loop (src/worker.py) instead of uvicorn. No `ingress`
+# block at all (not "external_enabled = false" -- omitted entirely): this
+# process never accepts inbound traffic, only claims rows from the `jobs`
+# table, so it needs no target port. Reuses the same user-assigned
+# identity/Key Vault access policy as `app` -- its actual permission needs
+# (read three Key Vault secrets) are a subset, so a separate identity
+# isn't worth the duplication yet, same choice this file's AWS counterpart
+# makes reusing aws_iam_role.task for its worker task definition.
+resource "azurerm_container_app" "worker" {
+  name                         = "${local.name_prefix}-worker"
+  resource_group_name          = azurerm_resource_group.main.name
+  container_app_environment_id = azurerm_container_app_environment.main.id
+  revision_mode                = "Single"
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.app.id]
+  }
+
+  secret {
+    name                = "database-url"
+    key_vault_secret_id = azurerm_key_vault_secret.app_database_url.id
+    identity            = azurerm_user_assigned_identity.app.id
+  }
+
+  # BYPASSRLS role, worker-only -- see secrets_and_kms.tf's own comment on
+  # why this is never wired into the `app` container app above.
+  secret {
+    name                = "queue-database-url"
+    key_vault_secret_id = azurerm_key_vault_secret.queue_database_url.id
+    identity            = azurerm_user_assigned_identity.app.id
+  }
+
+  secret {
+    name                = "phi-encryption-key"
+    key_vault_secret_id = azurerm_key_vault_secret.phi_encryption_key.id
+    identity            = azurerm_user_assigned_identity.app.id
+  }
+
+  template {
+    min_replicas = var.worker_min_replicas
+    max_replicas = var.worker_max_replicas
+
+    container {
+      name    = "worker"
+      image   = var.container_image
+      cpu     = var.container_cpu
+      memory  = var.container_memory
+      command = ["python", "-m", "worker"]
+
+      env {
+        name        = "DATABASE_URL"
+        secret_name = "database-url"
+      }
+      env {
+        name        = "QUEUE_DATABASE_URL"
+        secret_name = "queue-database-url"
+      }
+      env {
+        name        = "PHI_ENCRYPTION_KEY"
+        secret_name = "phi-encryption-key"
+      }
+    }
+  }
+
+  tags = var.tags
+
+  depends_on = [azurerm_key_vault_access_policy.app]
+}

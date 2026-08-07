@@ -11,9 +11,20 @@ metric instruments around data that doesn't exist would just be
 scaffolding around nothing; this is a named, deliberate gap, not an
 oversight -- revisit once Phase 12 adds outcome tracking.
 
-`queue_depth` is defined for forward compatibility but always reports 0:
-ingestion in this codebase is synchronous, so there is no queue to have a
-depth.
+`queue_depth` (Phase 7, `docs/MASTER-BUILD-PROMPT-V2.md`) now reflects
+the real async job queue: `+1` on enqueue
+(`api.repository.PostgresRepository.enqueue_remittance_ingestion`),
+`-1` the moment a worker claims a job (`jobs.runner.claim_and_run_once`)
+-- an `UpDownCounter`'s API is a running delta, not a settable gauge, so
+this is the correct way to represent "how many jobs are currently
+sitting unclaimed," not a periodic poll-and-set (which the API doesn't
+even offer). Deliberately does not track every later transition (a
+retried job re-entering the claimable pool, a queued-but-not-yet-claimed
+job being cancelled) -- same "approximate, non-authoritative telemetry
+signal" scope this module's own docstring already claims for money
+metrics, not a promise of perfect real-time accuracy. `SELECT count(*)
+FROM jobs WHERE status IN ('queued','failed')` against the database
+remains the authoritative depth if an operator needs an exact number.
 
 Dollar amounts cross into `float` only here, at the telemetry boundary --
 OTel's instrument API has no `Decimal` support, and a metrics backend
@@ -75,10 +86,7 @@ def _build_instruments(meter: Meter) -> Instruments:
         queue_depth=meter.create_up_down_counter(
             "queue_depth",
             unit="1",
-            description=(
-                "Always 0 today -- ingestion is synchronous, no async queue "
-                "exists yet. Defined for forward compatibility."
-            ),
+            description="Jobs enqueued but not yet claimed by a worker (Phase 7)",
         ),
     )
 

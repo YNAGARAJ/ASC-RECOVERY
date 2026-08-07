@@ -64,6 +64,17 @@ variable "max_replicas" {
   default = 4
 }
 
+variable "worker_min_replicas" {
+  description = "Minimum running Phase 7 job-queue worker replicas. Scale this, not min_replicas/max_replicas, to drain the jobs table faster -- see docs/RUNBOOK.md."
+  type        = number
+  default     = 1
+}
+
+variable "worker_max_replicas" {
+  type    = number
+  default = 3
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

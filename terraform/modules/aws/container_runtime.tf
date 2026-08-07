@@ -51,6 +51,7 @@ resource "aws_iam_role_policy" "task_execution_secrets" {
       Resource = [
         aws_secretsmanager_secret.app.arn,
         aws_secretsmanager_secret.app_database_url.arn,
+        aws_secretsmanager_secret.queue_database_url.arn,
       ]
     }]
   })
@@ -155,6 +156,59 @@ resource "aws_ecs_task_definition" "app" {
           "awslogs-group"         = aws_cloudwatch_log_group.app.name
           "awslogs-region"        = var.region
           "awslogs-stream-prefix" = "app"
+        }
+      }
+    }
+  ])
+
+  tags = var.tags
+}
+
+# Phase 7's job-queue worker -- same image as `app`, `entryPoint`
+# overridden to run the polling loop (src/worker.py) instead of uvicorn.
+# No portMappings/load balancer below: this process never accepts inbound
+# traffic, only claims rows from the `jobs` table. Reuses aws_iam_role.task
+# and aws_security_group.app as-is (see network.tf's app_to_database rule
+# and this file's alb-facing app SG comment) -- the worker's actual
+# permission needs (S3 + KMS) are a subset of the app's, so a separate,
+# narrower role isn't worth the duplication yet.
+resource "aws_ecs_task_definition" "worker" {
+  family                   = "${local.name_prefix}-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = tostring(var.container_cpu)
+  memory                   = tostring(var.container_memory)
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([
+    {
+      name       = "worker"
+      image      = var.container_image
+      essential  = true
+      entryPoint = ["python", "-m", "worker"]
+      secrets = [
+        {
+          name      = "DATABASE_URL"
+          valueFrom = aws_secretsmanager_secret_version.app_database_url.arn
+        },
+        {
+          # BYPASSRLS role, worker-only -- see secrets_and_kms.tf's own
+          # comment on why this is never injected into the `app` task.
+          name      = "QUEUE_DATABASE_URL"
+          valueFrom = aws_secretsmanager_secret_version.queue_database_url.arn
+        },
+        {
+          name      = "PHI_ENCRYPTION_KEY"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:PHI_ENCRYPTION_KEY::"
+        }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.app.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "worker"
         }
       }
     }
@@ -284,6 +338,24 @@ resource "aws_ecs_service" "app" {
   }
 
   depends_on = [aws_lb_target_group.app]
+
+  tags = var.tags
+}
+
+# No load_balancer block -- unlike aws_ecs_service.app above, the worker
+# has no target group to register with; it is never a request destination.
+resource "aws_ecs_service" "worker" {
+  name            = "${local.name_prefix}-worker"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.worker.arn
+  desired_count   = var.worker_desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = aws_subnet.private[*].id
+    security_groups  = [aws_security_group.app.id]
+    assign_public_ip = false
+  }
 
   tags = var.tags
 }

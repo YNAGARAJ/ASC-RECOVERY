@@ -8,6 +8,11 @@ output "database_secret_id" {
   value       = aws_secretsmanager_secret.app_database_url.id
 }
 
+output "queue_database_secret_id" {
+  description = "Secrets Manager secret holding the asc_owner QUEUE_DATABASE_URL -- Phase 7 job-queue worker only."
+  value       = aws_secretsmanager_secret.queue_database_url.id
+}
+
 output "object_storage_bucket_name" {
   description = "S3 bucket for inbound 835 files."
   value       = aws_s3_bucket.remittances.bucket

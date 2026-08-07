@@ -13,12 +13,30 @@ contract lookups) and threaded down to `encrypt_phi_field` for every
 claim in the file -- `None` means the org has no dedicated key, so
 patient PHI encrypts under the platform default
 (`EnvelopeEncryptor.encrypt`'s own fallback).
+
+`on_progress`/`should_cancel` (Phase 7, async job infrastructure,
+`docs/MASTER-BUILD-PROMPT-V2.md`) are optional callbacks checked every
+`_CALLBACK_INTERVAL` claims, not every single one -- `should_cancel` is
+expected to be a DB read (`db.repository.is_cancel_requested` via
+`src/jobs/runner.py`), so checking it on every claim would add a
+round-trip per claim for no real responsiveness benefit. Both default to
+`None`/no-op, so every existing caller (`scripts/ingestion/
+poll_remittances.py`, every test in `tests/ingestion/`) is unaffected.
+`should_cancel` returning `True` raises `JobCancelledError` -- this function
+does no transaction management of its own (module docstring above), so
+the exception propagates to whatever `access_session` block the caller
+opened, which rolls back everything this job wrote so far; the worker
+only records the terminal `cancelled` status afterward, on a separate
+connection, once the rollback has already happened. A cancelled job
+therefore leaves no partial claims/findings behind, same "clean slate"
+property idempotent re-processing already relies on elsewhere in this
+module.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -33,6 +51,14 @@ from security.encryption import EnvelopeEncryptor
 from security.phi_columns import encrypt_phi_field
 
 ContractVersionIds = Mapping[tuple[str, date], uuid.UUID]
+
+_CALLBACK_INTERVAL = 25
+
+
+class JobCancelledError(Exception):
+    """Raised by `apply_ingestion_plan` when `should_cancel()` returns
+    `True` mid-file -- `src/jobs/runner.py` catches this to record the
+    job as `cancelled` rather than `failed`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +212,8 @@ def apply_ingestion_plan(
     contract_version_ids: ContractVersionIds,
     encryptor: EnvelopeEncryptor,
     org_kms_key_id: str | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> IngestionOutcome:
     if plan.quarantine_reason is not None:
         repository.update_remittance_status(
@@ -217,6 +245,12 @@ def apply_ingestion_plan(
     findings_created = 0
     reconciliation_mismatches = 0
     dollars_detected = Decimal("0")
+    total_claims = sum(
+        1
+        for transaction_plan in plan.transactions
+        for claim_plan in transaction_plan.claims
+        if claim_plan.skip_reason is None
+    )
 
     for transaction_plan in plan.transactions:
         if not transaction_plan.reconciliation.matches:
@@ -224,6 +258,14 @@ def apply_ingestion_plan(
         for claim_plan in transaction_plan.claims:
             if claim_plan.skip_reason is not None:
                 continue
+            if (
+                should_cancel is not None
+                and claims_created % _CALLBACK_INTERVAL == 0
+                and should_cancel()
+            ):
+                raise JobCancelledError(
+                    f"cancellation requested after {claims_created}/{total_claims} claims"
+                )
             persisted_findings = _apply_claim(
                 session,
                 facility_id,
@@ -239,6 +281,11 @@ def apply_ingestion_plan(
                 (f.shortfall.as_decimal() for f in persisted_findings), Decimal("0")
             )
             claims_created += 1
+            if on_progress is not None and claims_created % _CALLBACK_INTERVAL == 0:
+                on_progress(claims_created, total_claims)
+
+    if on_progress is not None:
+        on_progress(claims_created, total_claims)
 
     repository.update_remittance_status(session, facility_id, remittance_id, status="ingested")
     repository.write_audit_log(

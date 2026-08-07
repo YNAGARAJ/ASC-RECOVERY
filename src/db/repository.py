@@ -24,7 +24,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -44,6 +44,7 @@ from db.models import FeeScheduleLine as FeeScheduleLineModel
 from db.models import Finding as FindingModel
 from db.models import Invitation as InvitationModel
 from db.models import InvitationFacility as InvitationFacilityModel
+from db.models import Job as JobModel
 from db.models import Membership as MembershipModel
 from db.models import MembershipFacility as MembershipFacilityModel
 from db.models import Organization as OrganizationModel
@@ -1519,3 +1520,269 @@ def get_claim_access_history(
         for row in phi_rows
     ]
     return merge_access_history(audit_events, phi_events)
+
+
+# --- Jobs (Phase 7, `docs/MASTER-BUILD-PROMPT-V2.md`) ---------------------------
+#
+# Two different connection privileges are needed here, same distinction
+# `scripts/onboard_customer.py`'s own docstring draws for system-level
+# bootstrap work versus ordinary resolved-access operations:
+#
+# - `enqueue_job`, `get_job`, `list_jobs`, `cancel_job` are API-facing --
+#   called from an already-authenticated request via the ordinary
+#   `access_session(session_factory, ctx.user_id)`, RLS-scoped `asc_app`
+#   connection every other repository function in this module uses. A
+#   user only ever sees/cancels jobs within their own resolved facilities
+#   -- RLS gives this for free, no extra filtering needed.
+# - `claim_next_job`, `update_job_progress`, `is_cancel_requested`,
+#   `complete_job`, `fail_job` are worker-facing -- a worker claims and
+#   drives the queue *across every facility in the system*, which is not
+#   any single user's resolved-access set (the same reason
+#   `scripts/onboard_customer.py` needs `asc_owner`/`BYPASSRLS`: "no
+#   membership yet to resolve access through"). `src/jobs/runner.py`
+#   calls these through a separate, owner-privileged session/engine, not
+#   the app's `access_session`.
+#
+# The job's actual *business-logic execution* (`src/jobs/runner.py`
+# calling `ingestion.pipeline.ingest_file`) is neither of the above -- it
+# runs through `access_session(session_factory, job.user_id)`, an
+# ordinary RLS-scoped connection re-establishing the *original
+# submitter's* resolved access at execution time. This is what makes
+# "jobs carry the access context so a worker cannot read outside its
+# facility scope" true: the worker process itself can see the whole
+# queue (via the owner session above), but the data it's allowed to
+# read/write for one specific job is still exactly what `job.user_id`
+# could reach, re-checked fresh (so a revoked membership takes effect on
+# a not-yet-run job exactly like it already does everywhere else in this
+# codebase).
+
+
+def enqueue_job(
+    session: Session,
+    facility_id: uuid.UUID,
+    *,
+    job_type: str,
+    dedup_key: str | None,
+    payload_encrypted: str | None,
+    user_id: uuid.UUID,
+    actor: str,
+    max_attempts: int = 5,
+) -> tuple[JobModel, bool]:
+    """Returns `(row, is_new)`. Same `ON CONFLICT DO NOTHING RETURNING id`
+    idiom as `record_remittance_if_new` -- `is_new is False` means a job
+    with this exact `(facility_id, job_type, dedup_key)` already exists
+    (an ingestion job's `dedup_key` is the file's content hash, so
+    re-uploading the same file returns the existing job, never a
+    duplicate). `dedup_key=None` never conflicts with anything (Postgres
+    treats NULL as distinct from every other NULL in a unique
+    constraint), so a job type with no natural dedup key always inserts."""
+    stmt = (
+        pg_insert(JobModel)
+        .values(
+            facility_id=facility_id,
+            job_type=job_type,
+            dedup_key=dedup_key,
+            payload_encrypted=payload_encrypted,
+            user_id=user_id,
+            actor=actor,
+            max_attempts=max_attempts,
+        )
+        .on_conflict_do_nothing(index_elements=["facility_id", "job_type", "dedup_key"])
+        .returning(JobModel.id)
+    )
+    inserted_id = session.execute(stmt).scalar_one_or_none()
+    if inserted_id is not None:
+        row = session.get(JobModel, inserted_id)
+        if row is None:
+            raise RuntimeError(
+                f"job {inserted_id} was just inserted but cannot be re-read "
+                "in the same transaction -- this should never happen"
+            )
+        return row, True
+
+    existing = session.execute(
+        select(JobModel).where(
+            JobModel.facility_id == facility_id,
+            JobModel.job_type == job_type,
+            JobModel.dedup_key == dedup_key,
+        )
+    ).scalar_one()
+    return existing, False
+
+
+def get_job(session: Session, facility_id: uuid.UUID, job_id: uuid.UUID) -> JobModel | None:
+    return session.execute(
+        select(JobModel).where(JobModel.facility_id == facility_id, JobModel.id == job_id)
+    ).scalar_one_or_none()
+
+
+def list_jobs(
+    session: Session, facility_id: uuid.UUID, *, limit: int = 20, offset: int = 0
+) -> tuple[list[JobModel], int]:
+    total = session.execute(
+        select(func.count()).select_from(JobModel).where(JobModel.facility_id == facility_id)
+    ).scalar_one()
+    rows = (
+        session.execute(
+            select(JobModel)
+            .where(JobModel.facility_id == facility_id)
+            .order_by(JobModel.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows), total
+
+
+def cancel_job(session: Session, facility_id: uuid.UUID, job_id: uuid.UUID) -> bool:
+    """Cooperative -- sets `cancel_requested`; the worker's own execution
+    loop (`src/jobs/runner.py`) is what actually checks it and stops.
+    Only meaningful for a job that hasn't already reached a terminal
+    state. Returns `False` (no rows matched) for an unknown job, one in a
+    facility this caller can't reach (RLS), or one already terminal --
+    all three collapse to the same result, same "doesn't exist" vs "not
+    accessible" indistinguishability every other resolved-access write in
+    this codebase already has."""
+    result = session.execute(
+        update(JobModel)
+        .where(
+            JobModel.facility_id == facility_id,
+            JobModel.id == job_id,
+            JobModel.status.in_(("queued", "running", "failed")),
+        )
+        .values(cancel_requested=True)
+    )
+    return result.rowcount > 0
+
+
+def claim_next_job(
+    session: Session,
+    *,
+    worker_id: str,
+    stale_lock_after: timedelta,
+    per_org_limit: int,
+) -> JobModel | None:
+    """Worker-facing -- must run on an owner-privileged (`BYPASSRLS`)
+    session, never `access_session` (see this section's module-level
+    docstring for why: a worker claims across every facility in the
+    system, not one user's resolved-access set).
+
+    The concurrency limit is *per org*, not per facility, per the phase's
+    own wording ("per-org concurrency limits so one large customer cannot
+    starve others") -- an org can own several facilities, so the count is
+    grouped by `facilities.org_id`, joined from `jobs.facility_id`, not
+    counted per facility directly. A stale lock (`locked_at` older than
+    `stale_lock_after`, from a worker that died mid-job) is treated as
+    reclaimable, same as an unclaimed `queued`/`failed`-and-due row --
+    there is no separate sweep process, the claim query itself is the
+    reclaim mechanism."""
+    facility = FacilityModel
+    org_limit_subquery = (
+        select(facility.org_id)
+        .select_from(JobModel)
+        .join(facility, facility.id == JobModel.facility_id)
+        .where(JobModel.status == "running")
+        .group_by(facility.org_id)
+        .having(func.count() >= per_org_limit)
+    )
+    now = datetime.now(UTC)
+    candidate = session.execute(
+        select(JobModel)
+        .join(facility, facility.id == JobModel.facility_id)
+        .where(
+            JobModel.status.in_(("queued", "failed")),
+            JobModel.next_run_at <= now,
+            (JobModel.locked_at.is_(None)) | (JobModel.locked_at < now - stale_lock_after),
+            facility.org_id.not_in(org_limit_subquery),
+        )
+        .order_by(JobModel.next_run_at)
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    ).scalar_one_or_none()
+    if candidate is None:
+        return None
+
+    candidate.status = "running"
+    candidate.locked_by = worker_id
+    candidate.locked_at = now
+    if candidate.started_at is None:
+        candidate.started_at = now
+    candidate.attempts += 1
+    session.flush()
+    return candidate
+
+
+def update_job_progress(
+    session: Session, job_id: uuid.UUID, *, percent: int, message: str | None
+) -> None:
+    """Worker-facing, owner-privileged session (module-level docstring)."""
+    session.execute(
+        update(JobModel)
+        .where(JobModel.id == job_id)
+        .values(progress_percent=percent, progress_message=message)
+    )
+
+
+def is_cancel_requested(session: Session, job_id: uuid.UUID) -> bool:
+    """Worker-facing, owner-privileged session (module-level docstring)."""
+    return bool(
+        session.execute(
+            select(JobModel.cancel_requested).where(JobModel.id == job_id)
+        ).scalar_one()
+    )
+
+
+def complete_job(session: Session, job_id: uuid.UUID, *, result: dict[str, object]) -> None:
+    """Worker-facing, owner-privileged session (module-level docstring).
+    `result` must never hold PHI -- a small outcome summary only (claim/
+    finding counts), same shape `IngestionOutcome` already has."""
+    session.execute(
+        update(JobModel)
+        .where(JobModel.id == job_id)
+        .values(
+            status="succeeded",
+            result=result,
+            progress_percent=100,
+            completed_at=datetime.now(UTC),
+        )
+    )
+
+
+def fail_job(
+    session: Session, job_id: uuid.UUID, *, error: str, backoff_seconds: float
+) -> JobModel:
+    """Worker-facing, owner-privileged session (module-level docstring).
+    `error` must already be redacted by the caller (`security/redaction.py`)
+    before reaching here -- never store a raw exception message that might
+    echo PHI. Transitions to `dead_letter` once `attempts >= max_attempts`;
+    otherwise reschedules via `next_run_at` (the caller computes the
+    exponential backoff duration, this function just applies it) and
+    leaves `status='failed'` so `claim_next_job` can pick it back up once
+    due. Returns the updated row so the caller can dispatch a dead-letter
+    alert exactly on the transition, not on every failure."""
+    job = session.execute(select(JobModel).where(JobModel.id == job_id)).scalar_one()
+    job.error = error
+    if job.attempts >= job.max_attempts:
+        job.status = "dead_letter"
+        job.completed_at = datetime.now(UTC)
+    else:
+        job.status = "failed"
+        job.next_run_at = datetime.now(UTC) + timedelta(seconds=backoff_seconds)
+    session.flush()
+    return job
+
+
+def cancel_job_as_cancelled(session: Session, job_id: uuid.UUID) -> None:
+    """Worker-facing, owner-privileged session -- called when the worker
+    observes `cancel_requested` mid-run and stops cleanly, distinct from
+    `cancel_job` (API-facing, only ever sets the *request* flag; only the
+    worker itself ever transitions a job to the terminal `cancelled`
+    status, since only it knows the point in its own execution where
+    stopping is actually safe)."""
+    session.execute(
+        update(JobModel)
+        .where(JobModel.id == job_id)
+        .values(status="cancelled", completed_at=datetime.now(UTC))
+    )

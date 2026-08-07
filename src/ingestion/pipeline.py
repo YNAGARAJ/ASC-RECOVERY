@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -69,6 +70,8 @@ def ingest_file(
     encryptor: EnvelopeEncryptor,
     tracer: Tracer | None = None,
     instruments: Instruments | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> IngestionOutcome | DuplicateOutcome:
     """Thin tracing/metrics wrapper around `_ingest_file_impl` -- callers
     that don't pass `tracer`/`instruments` (every test written before
@@ -77,7 +80,9 @@ def ingest_file(
     is NOT optional/no-op-able the same way: there is no safe "no-op"
     encryptor, so every caller must supply a real one (see
     tests/ingestion/conftest.py's `make_test_encryptor` for the test-side
-    default)."""
+    default). `on_progress`/`should_cancel` (Phase 7, `src/jobs/runner.py`)
+    are passed straight through to `ingestion.apply.apply_ingestion_plan`,
+    whose own docstring covers them -- both default to `None`/no-op."""
     resolved_tracer = tracer if tracer is not None else NoOpTracer()
     resolved_instruments = instruments if instruments is not None else noop_instruments()
     started = time.perf_counter()
@@ -94,6 +99,8 @@ def ingest_file(
             uploaded_by=uploaded_by,
             scanner=scanner,
             encryptor=encryptor,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
         )
         latency_ms = (time.perf_counter() - started) * 1000
         if isinstance(outcome, IngestionOutcome):
@@ -121,6 +128,8 @@ def _ingest_file_impl(
     uploaded_by: str,
     scanner: VirusScanner,
     encryptor: EnvelopeEncryptor,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> IngestionOutcome | DuplicateOutcome:
     file_hash = hashlib.sha256(content).hexdigest()
 
@@ -206,6 +215,8 @@ def _ingest_file_impl(
         contract_version_ids=contract_version_ids_typed,
         encryptor=encryptor,
         org_kms_key_id=org_kms_key_id,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
     )
 
 

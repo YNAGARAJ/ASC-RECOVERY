@@ -102,6 +102,24 @@ def evaluate_unusual_phi_access_alert(
     )
 
 
+def evaluate_job_dead_lettered_alert(
+    *, job_id: str, job_type: str, facility_id: str, attempts: int
+) -> Alert:
+    """Phase 7 (`docs/MASTER-BUILD-PROMPT-V2.md`) "dead letter queue with
+    alerting." Unlike every evaluator above, this has no threshold and no
+    `None` case -- a job that exhausted every retry always warrants a
+    human looking at it; there's no meaningful *rate* to compare against
+    the way an ingestion-failure or PHI-access-volume rate has one."""
+    return Alert(
+        severity="critical",
+        name="job_dead_lettered",
+        message=(
+            f"job {job_id} (type={job_type!r}, facility={facility_id}) "
+            f"exhausted all {attempts} attempts and was dead-lettered"
+        ),
+    )
+
+
 def evaluate_cross_tenant_probe_alert(
     *, actor: str, not_found_count: int, window_description: str, threshold: int = 10
 ) -> Alert | None:

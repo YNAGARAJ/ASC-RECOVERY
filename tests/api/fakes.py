@@ -16,11 +16,11 @@ suite alone can prove).
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
 from api.repository import (
     AcceptedInvitation,
@@ -37,6 +37,7 @@ from api.repository import (
     FindingSummary,
     InvitationPreview,
     InvitationSummary,
+    JobSummary,
     LoginCredentials,
     OrgMemberSummary,
     OrgPolicySummary,
@@ -49,9 +50,6 @@ from api.repository import (
 from domain.deadlines import calculate_appeal_deadline
 from domain.outcomes import Outcome, validate_outcome_recording
 from domain.variance import RootCause
-from ingestion.apply import IngestionOutcome
-from ingestion.pipeline import DuplicateOutcome
-from ingestion.virus_scan import VirusScanner
 from security.mfa import generate_enrollment_secret, provisioning_uri, verify_code
 from security.passwords import hash_password
 from security.phi_masking import mask_patient_fields
@@ -65,6 +63,23 @@ _API_KEY_TTL = timedelta(days=365)
 
 def now() -> datetime:
     return datetime.now(UTC)
+
+
+def _job_summary(job: _Job) -> JobSummary:
+    return JobSummary(
+        id=job.id,
+        job_type=job.job_type,
+        status=job.status,
+        progress_percent=job.progress_percent,
+        progress_message=job.progress_message,
+        result=job.result,
+        error=job.error,
+        attempts=job.attempts,
+        max_attempts=job.max_attempts,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +117,24 @@ class _OrgPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class _Job:
+    id: uuid.UUID
+    facility_id: uuid.UUID
+    job_type: str
+    dedup_key: str | None
+    status: str
+    created_at: datetime
+    progress_percent: int | None = None
+    progress_message: str | None = None
+    result: dict[str, object] | None = None
+    error: str | None = None
+    attempts: int = 0
+    max_attempts: int = 5
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _Invitation:
     id: uuid.UUID
     org_id: uuid.UUID
@@ -132,7 +165,7 @@ class FakeRepository:
     packets: dict[uuid.UUID, tuple[uuid.UUID, RecoveryPacketSummary]] = field(default_factory=dict)
     access_events: list[tuple[uuid.UUID, AccessEventSummary]] = field(default_factory=list)
     ingest_calls: list[tuple[uuid.UUID, bytes, str, str]] = field(default_factory=list)
-    next_ingest_outcome: IngestionOutcome | DuplicateOutcome | None = None
+    jobs: dict[uuid.UUID, _Job] = field(default_factory=dict)
     healthy: bool = True
 
     # --- seeding helpers, test-only -------------------------------------
@@ -312,7 +345,7 @@ class FakeRepository:
     def get_login_credentials(self, subject: str) -> LoginCredentials | None:
         return self.login_credentials.get(subject)
 
-    def ingest_remittance(
+    def enqueue_remittance_ingestion(
         self,
         user_id: uuid.UUID,
         facility_id: uuid.UUID,
@@ -320,29 +353,86 @@ class FakeRepository:
         content: bytes,
         source: str,
         uploaded_by: str,
-        scanner: VirusScanner,
-    ) -> IngestionOutcome | DuplicateOutcome:
+    ) -> JobSummary:
+        """Deliberately never actually ingests anything -- there is no
+        fake worker, so a job enqueued here stays `queued` forever unless
+        a test explicitly mutates `self.jobs` afterward (mirroring how
+        `seed_*` helpers elsewhere in this class let a test set up
+        whatever state it needs directly). `ingest_calls` still records
+        every call for tenant-isolation assertions
+        (`tests/api/test_authz_matrix.py`), same as before this method
+        was enqueue-only rather than synchronous."""
         self.ingest_calls.append((facility_id, content, source, uploaded_by))
-        scan_result = scanner.scan(content)
-        if not scan_result.clean:
-            return IngestionOutcome(
-                remittance_id=uuid.uuid4(),
-                status="quarantined",
-                claims_created=0,
-                findings_created=0,
-                reconciliation_mismatches=0,
-                dollars_detected=Decimal("0"),
-            )
-        if self.next_ingest_outcome is not None:
-            return self.next_ingest_outcome
-        return IngestionOutcome(
-            remittance_id=uuid.uuid4(),
-            status="ingested",
-            claims_created=1,
-            findings_created=1,
-            reconciliation_mismatches=0,
-            dollars_detected=Decimal("50.00"),
+        dedup_key = hashlib.sha256(content).hexdigest()
+        existing = next(
+            (
+                job
+                for job in self.jobs.values()
+                if job.facility_id == facility_id
+                and job.job_type == "ingest_remittance"
+                and job.dedup_key == dedup_key
+            ),
+            None,
         )
+        if existing is not None:
+            return _job_summary(existing)
+        job_id = uuid.uuid4()
+        job = _Job(
+            id=job_id,
+            facility_id=facility_id,
+            job_type="ingest_remittance",
+            dedup_key=dedup_key,
+            status="queued",
+            created_at=now(),
+        )
+        self.jobs[job_id] = job
+        return _job_summary(job)
+
+    def get_job(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, job_id: uuid.UUID
+    ) -> JobSummary | None:
+        if facility_id not in self._accessible_facility_ids(user_id):
+            return None
+        job = self.jobs.get(job_id)
+        if job is None or job.facility_id != facility_id:
+            return None
+        return _job_summary(job)
+
+    def list_jobs(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[JobSummary]:
+        accessible = self._accessible_facility_ids(user_id)
+        items = []
+        if facility_id in accessible:
+            matching = sorted(
+                (job for job in self.jobs.values() if job.facility_id == facility_id),
+                key=lambda job: job.created_at,
+                reverse=True,
+            )
+            items = [_job_summary(job) for job in matching]
+        total = len(items)
+        page_items = items[page.offset : page.offset + page.limit]
+        return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
+
+    def cancel_job(self, user_id: uuid.UUID, facility_id: uuid.UUID, job_id: uuid.UUID) -> bool:
+        """Simplified relative to the real, cooperative
+        `cancel_requested`-then-later-`cancelled` two-step
+        (`db.repository.cancel_job`/`cancel_job_as_cancelled`) -- there is
+        no fake worker here to cooperate with, so this transitions
+        straight to the terminal `cancelled` status. The real two-step
+        behavior is proven where it matters, against real RLS
+        (`tests/db/test_jobs.py`), not re-modeled here."""
+        if facility_id not in self._accessible_facility_ids(user_id):
+            return False
+        job = self.jobs.get(job_id)
+        if job is None or job.facility_id != facility_id or job.status not in (
+            "queued",
+            "running",
+            "failed",
+        ):
+            return False
+        self.jobs[job_id] = replace(job, status="cancelled", completed_at=now())
+        return True
 
     def list_findings(
         self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: FindingFilters, page: Page

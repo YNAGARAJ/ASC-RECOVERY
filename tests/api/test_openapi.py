@@ -17,6 +17,9 @@ def test_openapi_covers_every_expected_path(app: FastAPI) -> None:
     paths = set(schema["paths"])
     expected = {
         "/remittances",
+        "/jobs",
+        "/jobs/{job_id}",
+        "/jobs/{job_id}/cancel",
         "/findings",
         "/findings/export.csv",
         "/findings/{finding_id}",

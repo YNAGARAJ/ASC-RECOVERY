@@ -15,6 +15,7 @@ Every dataclass here carries money as `str`, never `float`
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -50,11 +51,9 @@ from domain.outcomes import (
     validate_outcome_recording,
 )
 from domain.variance import RootCause
-from ingestion.apply import IngestionOutcome
-from ingestion.pipeline import DuplicateOutcome, ingest_file
-from ingestion.virus_scan import VirusScanner
-from observability.alert_state import IngestionOutcomeTracker, RollingWindowCounter
-from observability.alerts import evaluate_ingestion_failure_alert, evaluate_unusual_phi_access_alert
+from jobs.payload import build_ingestion_payload
+from observability.alert_state import RollingWindowCounter
+from observability.alerts import evaluate_unusual_phi_access_alert
 from observability.metrics import Instruments
 from observability.notifications import NotificationPort
 from packets.drafter import PacketDrafter
@@ -323,6 +322,28 @@ class OrgPolicySummary:
 
 
 @dataclass(frozen=True, slots=True)
+class JobSummary:
+    """Phase 7 (`docs/MASTER-BUILD-PROMPT-V2.md`) async jobs --
+    deliberately **no `payload_encrypted` field**: a job's payload may
+    hold real PHI (an ingestion job's raw file content), so this is what
+    `GET /jobs`/`GET /jobs/{id}` return, and it's structurally incapable
+    of leaking the payload since the field doesn't exist here at all."""
+
+    id: uuid.UUID
+    job_type: str
+    status: str
+    progress_percent: int | None
+    progress_message: str | None
+    result: dict[str, object] | None
+    error: str | None
+    attempts: int
+    max_attempts: int
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class AuditLogEntry:
     id: uuid.UUID
     actor: str
@@ -460,6 +481,26 @@ def _org_policy_summary(row: Any) -> OrgPolicySummary:
     )
 
 
+def _job_summary(row: Any) -> JobSummary:
+    """`row` is a `db.models.Job` instance; typed `Any` for the same
+    reason `_org_policy_summary` is -- never exposes `payload_encrypted`,
+    which isn't even a field on `JobSummary` to begin with."""
+    return JobSummary(
+        id=row.id,
+        job_type=row.job_type,
+        status=row.status,
+        progress_percent=row.progress_percent,
+        progress_message=row.progress_message,
+        result=row.result,
+        error=row.error,
+        attempts=row.attempts,
+        max_attempts=row.max_attempts,
+        created_at=row.created_at,
+        started_at=row.started_at,
+        completed_at=row.completed_at,
+    )
+
+
 class Repository(Protocol):
     """`user_id` (first positional param on every access-scoped method) is
     who this call runs as -- it's what `access_session` sets `app.user_id`
@@ -487,7 +528,7 @@ class Repository(Protocol):
         self, user_id: uuid.UUID, org_id: uuid.UUID
     ) -> uuid.UUID | None: ...
 
-    def ingest_remittance(
+    def enqueue_remittance_ingestion(
         self,
         user_id: uuid.UUID,
         facility_id: uuid.UUID,
@@ -495,8 +536,19 @@ class Repository(Protocol):
         content: bytes,
         source: str,
         uploaded_by: str,
-        scanner: VirusScanner,
-    ) -> IngestionOutcome | DuplicateOutcome: ...
+    ) -> JobSummary: ...
+
+    def get_job(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, job_id: uuid.UUID
+    ) -> JobSummary | None: ...
+
+    def list_jobs(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[JobSummary]: ...
+
+    def cancel_job(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, job_id: uuid.UUID
+    ) -> bool: ...
 
     def list_findings(
         self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: FindingFilters, page: Page
@@ -725,14 +777,16 @@ class PostgresRepository:
         # F-11 (docs/audit/REGISTER.md): `notifier` is None by default,
         # same "additive, never required" contract `tracer`/`instruments`
         # already have -- every test written before this fix keeps
-        # constructing a PostgresRepository without it. The two trackers
-        # below are always built (cheap, in-memory, no live effect until
+        # constructing a PostgresRepository without it. The tracker below
+        # is always built (cheap, in-memory, no live effect until
         # something actually calls .record()), not also optional --
         # nothing needs to substitute a different one, only whether
-        # alerts get *dispatched* anywhere depends on `notifier`.
+        # alerts get *dispatched* anywhere depends on `notifier`. The
+        # matching ingestion-outcome tracker moved to
+        # `src/jobs/runner.py` (Phase 7) -- this class no longer learns
+        # an ingestion outcome directly, only the worker does.
         self._notifier = notifier
         self._phi_access_tracker = RollingWindowCounter(window_seconds=300)
-        self._ingestion_alert_tracker = IngestionOutcomeTracker()
 
     def _record_phi_access(self, actor: str) -> None:
         """Call right after every `db_repository.write_phi_access_log` --
@@ -796,7 +850,7 @@ class PostgresRepository:
         with access_session(self._session_factory, user_id) as session:
             return db_repository.get_default_facility_id_for_org(session, user_id, org_id)
 
-    def ingest_remittance(
+    def enqueue_remittance_ingestion(
         self,
         user_id: uuid.UUID,
         facility_id: uuid.UUID,
@@ -804,35 +858,63 @@ class PostgresRepository:
         content: bytes,
         source: str,
         uploaded_by: str,
-        scanner: VirusScanner,
-    ) -> IngestionOutcome | DuplicateOutcome:
+    ) -> JobSummary:
+        """Phase 7 (`docs/MASTER-BUILD-PROMPT-V2.md`): enqueues instead of
+        ingesting synchronously -- the actual work happens in
+        `src/jobs/runner.py`, out of this (or any) HTTP request. The
+        content hash doubles as the job's `dedup_key`, same idempotency
+        property `ingestion.pipeline.ingest_file`'s own
+        `record_remittance_if_new` used to give the old synchronous path:
+        uploading the same file twice returns the same job, never a
+        second one. The ingestion-failure-rate alert this method used to
+        dispatch right after `ingest_file` returned now lives in
+        `src/jobs/runner.py::run_ingestion_job`, the only place that
+        still learns the outcome."""
+        dedup_key = hashlib.sha256(content).hexdigest()
         with access_session(self._session_factory, user_id) as session:
-            outcome = ingest_file(
+            org_id = db_repository.get_org_id_for_facility(session, facility_id)
+            org_kms_key_id = (
+                db_repository.get_organization_kms_key_id(session, org_id)
+                if org_id is not None
+                else None
+            )
+            payload = build_ingestion_payload(content, source=source)
+            payload_encrypted = encrypt_phi_field(self._encryptor, payload, kek_id=org_kms_key_id)
+            row, is_new = db_repository.enqueue_job(
                 session,
                 facility_id,
-                content=content,
-                source=source,
-                uploaded_by=uploaded_by,
-                scanner=scanner,
-                encryptor=self._encryptor,
-                tracer=self._tracer,
-                instruments=self._instruments,
+                job_type="ingest_remittance",
+                dedup_key=dedup_key,
+                payload_encrypted=payload_encrypted,
+                user_id=user_id,
+                actor=uploaded_by,
             )
-        # F-11 (docs/audit/REGISTER.md): outside the transaction -- this
-        # is pure in-memory bookkeeping, not a DB write, so there's no
-        # reason to hold the transaction open for it. DuplicateOutcome is
-        # excluded, matching record_ingestion_outcome's own metrics call
-        # a few lines up the stack in ingestion.pipeline.ingest_file.
-        if isinstance(outcome, IngestionOutcome) and self._notifier is not None:
-            quarantined_count, total_count = self._ingestion_alert_tracker.record(
-                str(facility_id), quarantined=(outcome.status == "quarantined")
+        # Only a genuinely new row -- returning an existing job for a
+        # duplicate upload must not double-count it in the queue depth.
+        if is_new and self._instruments is not None:
+            self._instruments.queue_depth.add(1)
+        return _job_summary(row)
+
+    def get_job(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, job_id: uuid.UUID
+    ) -> JobSummary | None:
+        with access_session(self._session_factory, user_id) as session:
+            row = db_repository.get_job(session, facility_id, job_id)
+        return None if row is None else _job_summary(row)
+
+    def list_jobs(
+        self, user_id: uuid.UUID, facility_id: uuid.UUID, *, page: Page
+    ) -> PagedResult[JobSummary]:
+        with access_session(self._session_factory, user_id) as session:
+            rows, total = db_repository.list_jobs(
+                session, facility_id, limit=page.limit, offset=page.offset
             )
-            alert = evaluate_ingestion_failure_alert(
-                quarantined_count=quarantined_count, total_count=total_count
-            )
-            if alert is not None:
-                self._notifier.notify(alert)
-        return outcome
+            items = [_job_summary(row) for row in rows]
+        return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
+
+    def cancel_job(self, user_id: uuid.UUID, facility_id: uuid.UUID, job_id: uuid.UUID) -> bool:
+        with access_session(self._session_factory, user_id) as session:
+            return db_repository.cancel_job(session, facility_id, job_id)
 
     def list_findings(
         self, user_id: uuid.UUID, facility_id: uuid.UUID, *, filters: FindingFilters, page: Page

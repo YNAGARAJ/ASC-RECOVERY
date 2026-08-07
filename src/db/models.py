@@ -648,3 +648,80 @@ class OrgPolicy(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
+
+
+class Job(Base):
+    """Phase 7 (`docs/MASTER-BUILD-PROMPT-V2.md`) async job queue --
+    Postgres-backed (`SELECT ... FOR UPDATE SKIP LOCKED`, `src/jobs/`),
+    not Redis+Celery/arq: this build has no Redis anywhere, and a
+    Postgres-backed queue reuses infrastructure already provisioned and
+    already verified via CI's real Postgres container.
+
+    Facility-scoped like every other PHI-adjacent table (this module's own
+    docstring) -- `org_id` is derived by joining through `facility_id` the
+    same way every other facility-scoped table does, never denormalized.
+    `payload_encrypted` holds job-type-specific data that may be real PHI
+    (an ingestion job's raw 835 file content) -- encrypted with the exact
+    same `security.phi_columns.encrypt_phi_field`/`EnvelopeEncryptor`
+    machinery `claims.patient_name_encrypted` already uses, including
+    per-org BYOK key resolution (Phase 6). `result`/`error` must never
+    hold PHI -- `result` is a small outcome summary (claim/finding counts),
+    `error` is redacted (`security/redaction.py`) before being stored, and
+    neither is ever the right place for anything from the payload itself.
+
+    `dedup_key` + the unique constraint below is what makes enqueueing
+    idempotent -- same `ON CONFLICT DO NOTHING RETURNING id` pattern
+    `remittances.file_hash`'s uniqueness already established; an ingestion
+    job's `dedup_key` is the file's content hash, so uploading the same
+    file twice enqueues (or returns) the same job row, never a duplicate.
+
+    `locked_by`/`locked_at` support stale-lock reclaim (a killed worker's
+    claimed job becomes claimable again after a timeout, checked in the
+    claim query itself -- no separate sweep process). `cancel_requested`
+    is cooperative: a running job's own code must check it periodically,
+    the same way `progress_percent`/`progress_message` are periodically
+    written, not something this table can force from outside a worker's
+    control flow."""
+
+    __tablename__ = "jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "facility_id", "job_type", "dedup_key", name="uq_job_facility_type_dedup_key"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
+    )
+    job_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'queued'")
+    )
+    dedup_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    actor: Mapped[str] = mapped_column(String(200), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5"))
+    next_run_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    progress_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    result: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

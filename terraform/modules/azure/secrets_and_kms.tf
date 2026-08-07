@@ -77,6 +77,24 @@ resource "azurerm_key_vault_secret" "app_database_url" {
   depends_on = [azurerm_key_vault_access_policy.deployer]
 }
 
+# QUEUE_DATABASE_URL -- Phase 7's job-queue worker (src/worker.py,
+# src/jobs/runner.py) opens a *second*, asc_owner-role connection
+# alongside the ordinary asc_app database-url secret above, for the
+# queue's own system-wide bookkeeping (claim/progress/cancel-check/
+# complete/fail -- spans every facility, not any one user's resolved
+# access; see db/repository.py's "Jobs" section docstring). Unlike AWS
+# (whose asc_owner password is RDS-managed), this module already
+# Terraform-generates the flexible server's admin password
+# (random_password.admin, database.tf) -- reused here directly, not
+# re-derived. Read only by the worker container app below, never `app`.
+resource "azurerm_key_vault_secret" "queue_database_url" {
+  name         = "queue-database-url"
+  key_vault_id = azurerm_key_vault.main.id
+  value        = "postgresql+psycopg://asc_owner:${random_password.admin.result}@${azurerm_postgresql_flexible_server.main.fqdn}:5432/asc_recovery"
+
+  depends_on = [azurerm_key_vault_access_policy.deployer]
+}
+
 resource "azurerm_key_vault_secret" "jwt_secret_key" {
   name         = "jwt-secret-key"
   key_vault_id = azurerm_key_vault.main.id

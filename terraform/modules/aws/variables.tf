@@ -60,6 +60,12 @@ variable "desired_count" {
   default     = 2
 }
 
+variable "worker_desired_count" {
+  description = "Number of running Fargate job-queue worker tasks (Phase 7). Scale this, not desired_count, to drain the jobs table faster -- see docs/RUNBOOK.md."
+  type        = number
+  default     = 1
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

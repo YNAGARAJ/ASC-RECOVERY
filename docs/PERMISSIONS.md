@@ -110,6 +110,29 @@ ordinary `role=api_service` `Membership` — the row in the matrix above
 already covers what such a credential can do; provisioning one doesn't
 grant it anything the table doesn't already say.
 
+## Phase 7 additions (`docs/MASTER-BUILD-PROMPT-V2.md`)
+
+`GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel` (the async
+job-queue history/cancellation surface) reuse the existing
+`upload_remittance` action from the table above — **no new `Action` was
+added**: whoever can enqueue an ingestion job (`POST /remittances`,
+already gated by `upload_remittance`) is exactly who should be able to
+see and cancel their own facility's jobs, and RLS on the new `jobs` table
+(`alembic/versions/0012_jobs.py`, same `facility_access` policy shape
+every other facility-scoped table has since 0001) is what actually
+narrows "their own facility's" the same way it does everywhere else in
+this system — the action-level check only answers "can this role touch
+jobs at all," never "which jobs."
+
+The worker process itself (`src/worker.py`, `src/jobs/runner.py`) is not
+a `role` in this table at all — it authenticates to Postgres as
+`asc_owner` (`BYPASSRLS`) for queue bookkeeping (claim/progress/cancel-
+check/complete/fail, system-wide across every facility, not any one
+user's resolved access), and separately re-establishes the *job's own
+submitter's* resolved access via `access_session(session_factory,
+job.user_id)` to actually execute that job's business logic. See
+`db/repository.py`'s "Jobs" section docstring for the full reasoning.
+
 ## Not yet built (later phases)
 
 - **Worklist assignment scoping** ("a biller sees only *their assigned*

@@ -104,7 +104,7 @@ def test_upload_remittance_matrix(client: TestClient, repo: FakeRepository, role
         assert response.status_code == 403
         assert len(repo.ingest_calls) == 0
         return
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert len(repo.ingest_calls) == 1
     called_tenant_id = repo.ingest_calls[0][0]
     assert called_tenant_id == TENANT_A  # never manipulable to TENANT_B

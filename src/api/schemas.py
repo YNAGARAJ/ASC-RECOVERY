@@ -24,6 +24,7 @@ from api.repository import (
     FindingSummary,
     InvitationPreview,
     InvitationSummary,
+    JobSummary,
     OrgMemberSummary,
     OrgPolicySummary,
     PacketGenerationFailed,
@@ -164,12 +165,51 @@ class RecordOutcomeIn(BaseModel):
     amount_recovered: str | None = None
 
 
-class IngestionOutcomeOut(BaseModel):
-    remittance_id: uuid.UUID
+class JobOut(BaseModel):
+    """Phase 7 (`docs/MASTER-BUILD-PROMPT-V2.md`) -- deliberately no
+    payload field; see `api.repository.JobSummary`'s docstring for why."""
+
+    id: uuid.UUID
+    job_type: str
     status: str
-    claims_created: int
-    findings_created: int
-    reconciliation_mismatches: int
+    progress_percent: int | None
+    progress_message: str | None
+    result: dict[str, object] | None
+    error: str | None
+    attempts: int
+    max_attempts: int
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, row: JobSummary) -> JobOut:
+        return cls(
+            id=row.id,
+            job_type=row.job_type,
+            status=row.status,
+            progress_percent=row.progress_percent,
+            progress_message=row.progress_message,
+            result=row.result,
+            error=row.error,
+            attempts=row.attempts,
+            max_attempts=row.max_attempts,
+            created_at=row.created_at,
+            started_at=row.started_at,
+            completed_at=row.completed_at,
+        )
+
+
+class JobListOut(BaseModel):
+    items: list[JobOut]
+    page: PageMeta
+
+    @classmethod
+    def from_domain(cls, result: PagedResult[JobSummary]) -> JobListOut:
+        return cls(
+            items=[JobOut.from_domain(item) for item in result.items],
+            page=PageMeta(total=result.total, limit=result.limit, offset=result.offset),
+        )
 
 
 class ContractSummaryOut(BaseModel):

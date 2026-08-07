@@ -1,9 +1,15 @@
 """DB-backed proof of F-11's PostgresRepository-side alert wiring
-(docs/audit/REGISTER.md): unusual PHI access volume and ingestion failure
-rate. Both live inside PostgresRepository itself (not the HTTP layer),
-so they're exercised directly against the repository here rather than
-through a TestClient -- same style test_pipeline_observability_live_db.py
-already uses for the tracer/instruments wiring.
+(docs/audit/REGISTER.md): unusual PHI access volume. Lives inside
+PostgresRepository itself (not the HTTP layer), so it's exercised
+directly against the repository here rather than through a TestClient --
+same style test_pipeline_observability_live_db.py already uses for the
+tracer/instruments wiring.
+
+The ingestion-failure-rate alert this file used to also cover here moved
+to `src/jobs/runner.py::run_ingestion_job` in Phase 7 (`docs/MASTER-
+BUILD-PROMPT-V2.md`) -- ingestion no longer runs inside
+`PostgresRepository` at all, so that alert's wiring proof moved with it
+to `tests/jobs/test_runner_live_db.py`.
 
 Skips cleanly without `TEST_DATABASE_URL`, same pattern as every other
 DB-backed test file in this repo. Written here, never executed in this
@@ -31,7 +37,7 @@ from observability.alerts import Alert
 from packets.drafter import ScriptedPacketDrafter
 from security.rbac import Role
 from tests.db.conftest import seed_org_facility_user
-from tests.domain.fixtures_x835 import malformed_missing_isa, minimal_valid_835
+from tests.domain.fixtures_x835 import minimal_valid_835
 from tests.ingestion.conftest import make_test_encryptor
 from tests.ingestion.fixtures import TEST_PAYER, make_contract_version
 
@@ -130,42 +136,3 @@ def test_repeated_phi_access_fires_an_unusual_access_alert(
 
     phi_alerts = [a for a in notifier.alerts if a.name == "unusual_phi_access_volume"]
     assert len(phi_alerts) == 1
-
-
-def test_high_quarantine_rate_fires_an_ingestion_failure_alert(
-    owner_engine: Engine, app_session_factory: sessionmaker[Session]
-) -> None:
-    user_id, facility_id = _seed_tenant(
-        owner_engine, app_session_factory, "ingestion-failure-alert"
-    )
-    notifier = _FakeNotificationPort()
-    repository = _make_repository(app_session_factory, notifier)
-
-    # One clean ingestion, then two quarantined ones (distinct content each
-    # time -- identical content would dedupe as DuplicateOutcome, which
-    # this alert deliberately excludes, same as record_ingestion_outcome's
-    # own metrics). 2/3 quarantined is well above the 10% default rate.
-    good = repository.ingest_remittance(
-        user_id,
-        facility_id,
-        content=minimal_valid_835().encode("utf-8"),
-        source="upload",
-        uploaded_by="ingestion-failure-alert-tester",
-        scanner=EicarAwareScanner(),
-    )
-    assert good.status == "ingested"  # type: ignore[union-attr]
-
-    for i in range(2):
-        content = f"{malformed_missing_isa()} seq={i}".encode()
-        outcome = repository.ingest_remittance(
-            user_id,
-            facility_id,
-            content=content,
-            source="upload",
-            uploaded_by="ingestion-failure-alert-tester",
-            scanner=EicarAwareScanner(),
-        )
-        assert outcome.status == "quarantined"  # type: ignore[union-attr]
-
-    failure_alerts = [a for a in notifier.alerts if a.name == "ingestion_failure_rate"]
-    assert len(failure_alerts) >= 1

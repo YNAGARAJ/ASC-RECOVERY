@@ -50,5 +50,24 @@ services:
       postgres:
         condition: service_healthy
 
+  # Phase 7: the async job worker, same image as `app`, different
+  # entrypoint (overriding the Dockerfile's ENTRYPOINT entirely --
+  # `entrypoint:`, not `command:`, since `command:` alone would only
+  # append to `uvicorn ...`, not replace it). No ports exposed -- this
+  # process never accepts inbound HTTP. QUEUE_DATABASE_URL connects as
+  # `asc_owner` (BYPASSRLS), never `asc_app` -- see src/worker.py's own
+  # docstring for why the queue's own bookkeeping needs a different role
+  # than the per-job business-logic execution does.
+  worker:
+    build: .
+    entrypoint: ["python", "-m", "worker"]
+    environment:
+      DATABASE_URL: "postgresql+psycopg://asc_app:asc_app_dev_password@postgres:5432/asc_recovery?sslmode=disable"
+      QUEUE_DATABASE_URL: "postgresql+psycopg://asc_owner:asc_owner_dev_password@postgres:5432/asc_recovery?sslmode=disable"
+      PHI_ENCRYPTION_KEY: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   asc_pg_data:

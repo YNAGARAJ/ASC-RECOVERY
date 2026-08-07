@@ -245,10 +245,12 @@ exceptions, by design.
 `scripts/ingestion/poll_remittances.py` (F-18, `docs/audit/REGISTER.md`)
 polls one facility's configured SFTP directory or S3 prefix once,
 ingesting whatever's new, then exits. It is a script, not a service this
-codebase runs continuously -- there is no job queue or scheduler anywhere
-in this build (that's tracked as a larger, separate gap; see
-`docs/MASTER-BUILD-PROMPT-V2.md`'s Phase 7). A real deployment schedules
-it with whatever it already has: a Kubernetes `CronJob`, a cloud
+codebase runs continuously, and it stays that way deliberately -- it
+already satisfies "not inside an HTTP request" via external scheduling,
+so Phase 7's job queue (below) never routes through it; the phase's own
+gate is specifically about the `POST /remittances` upload path. A real
+deployment schedules it with whatever it already has: a Kubernetes
+`CronJob`, a cloud
 provider's scheduled task (ECS Scheduled Task, Azure Container Apps Jobs,
 etc.), or plain cron on a long-lived host. Direct upload
 (`POST /remittances`) needs none of this and keeps working regardless --
@@ -301,6 +303,69 @@ script (`_ParamikoSFTPClient`, `_Boto3S3Client`) are verified only via
 `SFTPPollSource`/`S3PollSource`/`poll_and_ingest` underneath them (see
 `tests/ingestion/test_sources.py`, `test_poller.py`); get a real run
 against a real mailbox before trusting this for a live payer feed.
+
+## Operating the job queue (Phase 7)
+
+`POST /remittances` no longer runs ingestion in-request -- it enqueues a
+row in the `jobs` table and returns `202` with a `job_id`. One or more
+worker processes (`python -m worker`, `src/worker.py`; the `worker`
+service in `docker-compose.yml`, the second ECS service/Container App
+Terraform provisions alongside `app`) poll that table and run jobs to
+completion. `GET /jobs/{job_id}` reports status/progress/result;
+`POST /jobs/{job_id}/cancel` requests cooperative cancellation.
+
+**Scaling worker throughput.** The API and worker scale independently --
+`desired_count`/`min_replicas` (API, request-serving) vs.
+`worker_desired_count`/`worker_min_replicas`+`worker_max_replicas`
+(worker, queue-draining) are separate Terraform variables in
+`terraform/modules/{aws,azure}/variables.tf`. Concurrency is also capped
+*per org*, not per worker count: `claim_next_job`'s claim query
+(`db/repository.py`) refuses to hand out a job to a org that already has
+`per_org_limit` (default 3) jobs `running`, regardless of how many idle
+workers exist -- adding workers speeds up draining the queue *across*
+orgs, not a single large customer's own backlog past that ceiling.
+
+**Inspecting the queue.** Query `jobs` directly (as `asc_owner` --
+`status` isn't PHI, but this bypasses RLS, so treat the connection itself
+the same as any other owner-role access):
+
+```sql
+-- what's queued or running right now, oldest first
+SELECT id, facility_id, job_type, status, attempts, next_run_at, locked_by
+FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at;
+
+-- stuck: claimed by a worker that's gone quiet (stale_lock_after is 10
+-- minutes by default, db/repository.py's claim query already reclaims
+-- these automatically -- this query is for confirming *why* one hasn't
+-- moved yet, not for manually intervening)
+SELECT id, job_type, locked_by, locked_at FROM jobs
+WHERE status = 'running' AND locked_at < now() - interval '10 minutes';
+
+-- dead-lettered: exhausted max_attempts (default 5), needs a human
+SELECT id, facility_id, job_type, attempts, error, completed_at
+FROM jobs WHERE status = 'dead_letter' ORDER BY completed_at DESC;
+```
+
+A dead-lettered job already fired a `job_dead_lettered` alert
+(`observability/alerts.py::evaluate_job_dead_lettered_alert`, via the
+same `NotificationPort` every other alert in this codebase uses) and
+wrote a `job_dead_lettered` audit-log entry at the moment it happened --
+there is no separate polling step to catch these after the fact, only to
+investigate `error` (already redacted via `security/redaction.py` before
+storage, so it's safe to read directly) and decide whether to re-enqueue
+(a fresh `POST /remittances`, not a status flip -- there is no "retry a
+dead-lettered row in place" primitive) once the underlying cause is
+fixed.
+
+**Cancellation.** `POST /jobs/{id}/cancel` sets `cancel_requested`; it is
+cooperative, not instant -- the worker checks it roughly every 25 claims
+processed (`ingestion/apply.py::_CALLBACK_INTERVAL`) inside the ingestion
+loop, so a job already deep into a large file can take a moment to
+actually stop. When it does, the whole job's DB work rolls back (the
+`JobCancelledError` propagates out of the `access_session` transaction
+uncaught) -- a cancelled job never leaves partial claims/findings behind,
+it is as if it never ran, and `GET /jobs/{id}` reports `status:
+"cancelled"` once the rollback has happened.
 
 ## Rollback
 

@@ -74,3 +74,30 @@ resource "aws_secretsmanager_secret_version" "app_database_url" {
   # server-side, this makes sure the app never even offers one.
   secret_string = "postgresql+psycopg://asc_app:${random_password.app_db.result}@${aws_db_instance.main.address}:5432/asc_recovery?sslmode=require"
 }
+
+# QUEUE_DATABASE_URL -- Phase 7's job-queue worker (src/worker.py,
+# src/jobs/runner.py) opens a *second*, `asc_owner`-role connection
+# alongside the ordinary asc_app DATABASE_URL above, for the queue's own
+# system-wide bookkeeping (claim/progress/cancel-check/complete/fail --
+# spans every facility, not any one user's resolved access; see
+# db/repository.py's "Jobs" section docstring). asc_owner's password is
+# never Terraform-generated the way asc_app's is (random_password.app_db)
+# -- it's the RDS-managed master password already read back above as
+# data.aws_secretsmanager_secret_version.db_master. Injected only into
+# the worker ECS task (container_runtime.tf), never the app task -- the
+# app process has no business holding a BYPASSRLS-capable connection
+# string.
+resource "aws_secretsmanager_secret" "queue_database_url" {
+  name        = "${local.name_prefix}-queue-database-url"
+  description = "Full QUEUE_DATABASE_URL for the asc_owner role -- Phase 7 job-queue worker only"
+  kms_key_id  = aws_kms_key.main.arn
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-queue-database-url"
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "queue_database_url" {
+  secret_id = aws_secretsmanager_secret.queue_database_url.id
+  secret_string = "postgresql+psycopg://asc_owner:${jsondecode(data.aws_secretsmanager_secret_version.db_master.secret_string)["password"]}@${aws_db_instance.main.address}:5432/asc_recovery?sslmode=require"
+}

@@ -6,6 +6,7 @@ from observability.alerts import (
     evaluate_cross_tenant_probe_alert,
     evaluate_eval_regression_alert,
     evaluate_ingestion_failure_alert,
+    evaluate_job_dead_lettered_alert,
     evaluate_unusual_phi_access_alert,
 )
 
@@ -76,6 +77,18 @@ def test_cross_tenant_probe_alert_fires_at_threshold() -> None:
     )
     assert alert is not None
     assert alert.name == "cross_tenant_probe"
+
+
+def test_job_dead_lettered_alert_always_fires_no_threshold() -> None:
+    alert = evaluate_job_dead_lettered_alert(
+        job_id="11111111-1111-1111-1111-111111111111",
+        job_type="ingest_remittance",
+        facility_id="22222222-2222-2222-2222-222222222222",
+        attempts=5,
+    )
+    assert alert.name == "job_dead_lettered"
+    assert alert.severity == "critical"
+    assert "5 attempts" in alert.message
 
 
 def test_cross_tenant_probe_alert_silent_below_threshold() -> None:

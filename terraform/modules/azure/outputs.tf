@@ -8,6 +8,11 @@ output "database_secret_id" {
   value       = azurerm_key_vault_secret.app_database_url.id
 }
 
+output "queue_database_secret_id" {
+  description = "Key Vault secret holding the asc_owner QUEUE_DATABASE_URL -- Phase 7 job-queue worker only."
+  value       = azurerm_key_vault_secret.queue_database_url.id
+}
+
 output "object_storage_bucket_name" {
   description = "Blob Storage container for inbound 835 files."
   value       = azurerm_storage_container.remittances.name
