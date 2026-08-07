@@ -12,12 +12,14 @@ at a clean commit as of this checkpoint.
    documented reason (F-17, F-21, F-22 — see the register).
 2. Build the unbuilt product-completeness gaps from
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
-   underway.** Phase 4 (org/facility/membership access model) and Phase 5
-   (user lifecycle and enterprise access) are both **complete**. Phase 6
-   (security and PHI controls) is **in progress** — most of its own
-   prompt turned out to already be built by Wave 3/Phases 4-5 (see
-   below); one genuinely new item (forced re-auth for PHI export) is
-   done, three more are scoped but not started.
+   underway.** Phases 4 (org/facility/membership access model), 5 (user
+   lifecycle and enterprise access), and 6 (security and PHI controls)
+   are all **complete**. Most of Phase 6's own prompt turned out to
+   already be built by Wave 3/Phases 4-5 (see below); its four
+   genuinely-new items (forced re-auth for PHI export, per-org
+   rate-limiting ceiling, per-org encryption keys/BYOK, per-org data
+   residency) are now all done too. **Phase 7 (async job infrastructure)
+   has not been started** — see "Next steps" below.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
@@ -401,7 +403,7 @@ Postgres**, same standard the original 12-phase build held itself to
 before Phase 10's CI run retroactively confirmed its own equivalent
 gaps (`docs/PHASES.md`).
 
-## Phase: MASTER-BUILD-PROMPT-V2.md Phase 6 (security and PHI controls) — IN PROGRESS
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 6 (security and PHI controls) — COMPLETE
 
 **Audited the actual prompt against the actual code before assuming
 anything was still open** (`2983cbf`) — most of Phase 6's checklist
@@ -741,26 +743,43 @@ added are offline-verified/skip-without-a-database only.
 
 ## Next steps
 
-Phase 6 is in progress, scope already resolved (see its section above --
-don't re-litigate what's already built vs. deferred, it was just
-audited item by item against the actual code). Forced re-auth for PHI
-export, the per-org rate-limiting ceiling, and per-org encryption keys
-(BYOK-ready) are all done. One item remains, already scoped, not
-started:
+Phase 6 is complete. Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order,
+**Phase 7 (async job infrastructure) is next** — genuinely new ground,
+unlike Phase 6 (v1 never had any job queue/worker layer at all, so there
+is no "already built by an earlier phase" overlap to audit away this
+time; don't assume otherwise without checking). The prompt's own
+summary: nothing heavy may run inside an HTTP request. A job queue and
+workers (Celery/arq + Redis, or Postgres-backed — must stay
+cloud-portable per CLAUDE.md rule 7); job types covering ingestion,
+variance recomputation, report generation, notification dispatch,
+reprocessing, export; idempotent jobs; retry with exponential backoff;
+a dead-letter queue with alerting; **per-org concurrency limits** (a
+different mechanism from Phase 6's per-org *rate-limiting* ceiling —
+that bounds HTTP request rate, this bounds concurrent job execution, and
+they'll likely want to share the "don't let one large customer starve
+everyone else" design language but are not the same control); progress
+reporting; cancellation; job history with actor and outcome; and
+**jobs carry the access context** so a worker can't read outside its
+facility scope (this needs real thought — a job dispatched from an
+HTTP request has `AuthContext`, but a job's *execution* happens outside
+any request, so whatever carries facility/org scope into the job needs
+its own serialization and RLS-session-setup story, not just reusing
+`AuthContext` directly). **Gate**: a 5,000-claim 835 processes end to
+end via a job, with progress visible, and a killed worker resumes
+without duplicating findings. This is a substantially bigger phase than
+Phase 5 or 6 — plan-mode it, and don't assume it fits in one sitting the
+way the per-org rate-limit/data-residency additions did.
 
-1. **Per-org data residency flag.** Small to build, but confirm the
-   "stored preference, not physical enforcement" framing
-   (`docs/SECURITY.md`'s "Not yet built" section already states it) is
-   still acceptable before writing it — this build is one shared
-   Postgres in one region, so anything claiming more would be fiction.
-   Once this lands, Phase 6 is fully complete.
-2. **If picking this up much later**, re-verify the full local gate
+1. **If picking this up much later**, re-verify the full local gate
    before trusting anything — confirm the current commit's status
    before trusting it.
-3. **If the F-22 Postgres password becomes available**, run Phase 4, 5,
-   and 6's live-DB suites for real before trusting any of their
+2. **If the F-22 Postgres password becomes available**, run Phases 4,
+   5, and 6's live-DB suites for real before trusting any of their
    RLS/function code beyond what's offline-verified — this now includes
-   migration 0010 and the BYOK-specific DB tests
+   migrations 0010/0011 and every BYOK/data-residency DB test
    (`tests/db/test_organization_kms_key.py`,
-   `tests/ingestion/test_apply_org_kms_key.py`), never run against a
-   real Postgres in this environment.
+   `tests/ingestion/test_apply_org_kms_key.py`,
+   `tests/db/test_org_policy.py`'s new data-residency tests), never run
+   against a real Postgres in this environment. Doing this before
+   starting Phase 7's own DB-backed work (job history, most likely)
+   would mean verifying one large batch together instead of two.
