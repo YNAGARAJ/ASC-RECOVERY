@@ -71,6 +71,7 @@ class _Membership:
     scope: str
     facility_ids: frozenset[uuid.UUID]
     created_at: datetime
+    revoked_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,14 +193,14 @@ class FakeRepository:
     def _accessible_org_ids(self, user_id: uuid.UUID) -> set[uuid.UUID]:
         result: set[uuid.UUID] = set()
         for m in self.memberships:
-            if m.user_id == user_id:
+            if m.user_id == user_id and m.revoked_at is None:
                 result |= self._descendant_org_ids(m.org_id)
         return result
 
     def _accessible_facility_ids(self, user_id: uuid.UUID) -> set[uuid.UUID]:
         result: set[uuid.UUID] = set()
         for m in self.memberships:
-            if m.user_id != user_id:
+            if m.user_id != user_id or m.revoked_at is not None:
                 continue
             if m.scope == "SPECIFIC_FACILITIES":
                 result |= m.facility_ids
@@ -214,13 +215,17 @@ class FakeRepository:
 
     def _default_membership_org_id(self, user_id: uuid.UUID) -> uuid.UUID | None:
         for m in self.memberships:
-            if m.user_id == user_id:
+            if m.user_id == user_id and m.revoked_at is None:
                 return m.org_id
         return None
 
     def resolve_membership_role(self, user_id: uuid.UUID, org_id: uuid.UUID) -> Role | None:
         """Walks from `org_id` up through `organizations` looking for the
-        nearest membership -- mirrors db.repository.resolve_membership_role."""
+        nearest membership -- mirrors db.repository.resolve_membership_role.
+        A revoked membership is skipped, same as the real function's `AND
+        m.revoked_at IS NULL` -- this is what makes offboarding
+        (`FakeRepository.revoke_membership`) take effect on the very next
+        call, exercised by `tests/api/test_offboarding.py`."""
         current: uuid.UUID | None = org_id
         visited: set[uuid.UUID] = set()
         for _ in range(20):
@@ -228,7 +233,7 @@ class FakeRepository:
                 return None
             visited.add(current)
             for m in self.memberships:
-                if m.user_id == user_id and m.org_id == current:
+                if m.user_id == user_id and m.org_id == current and m.revoked_at is None:
                     return Role(m.role)
             current = self.organizations.get(current)
         return None
@@ -364,7 +369,7 @@ class FakeRepository:
         items = []
         if org_id in accessible:
             for m in self.memberships:
-                if m.org_id != org_id:
+                if m.org_id != org_id or m.revoked_at is not None:
                     continue
                 member_user = next((u for u in self.users.values() if u.id == m.user_id), None)
                 subject = member_user.subject if member_user is not None else ""
@@ -382,6 +387,21 @@ class FakeRepository:
         total = len(items)
         page_items = items[page.offset : page.offset + page.limit]
         return PagedResult(items=page_items, total=total, limit=page.limit, offset=page.offset)
+
+    def revoke_membership(self, user_id: uuid.UUID, membership_id: uuid.UUID) -> bool:
+        """Mirrors the real `org_authoring_update` RLS policy: the caller
+        must have resolved access to the target membership's org, and the
+        membership must exist and not already be revoked -- both
+        indistinguishable as a `False`/404, same as the real path."""
+        accessible = self._accessible_org_ids(user_id)
+        for index, m in enumerate(self.memberships):
+            if m.id != membership_id:
+                continue
+            if m.revoked_at is not None or m.org_id not in accessible:
+                return False
+            self.memberships[index] = replace(m, revoked_at=now())
+            return True
+        return False
 
     def create_invitation(
         self,

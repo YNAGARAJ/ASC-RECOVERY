@@ -443,6 +443,8 @@ class Repository(Protocol):
         self, user_id: uuid.UUID, org_id: uuid.UUID, *, page: Page
     ) -> PagedResult[OrgMemberSummary]: ...
 
+    def revoke_membership(self, user_id: uuid.UUID, membership_id: uuid.UUID) -> bool: ...
+
     def create_invitation(
         self,
         user_id: uuid.UUID,
@@ -851,6 +853,10 @@ class PostgresRepository:
                 for row in rows
             ]
         return PagedResult(items=items, total=total, limit=page.limit, offset=page.offset)
+
+    def revoke_membership(self, user_id: uuid.UUID, membership_id: uuid.UUID) -> bool:
+        with access_session(self._session_factory, user_id) as session:
+            return db_repository.revoke_membership(session, membership_id)
 
     def create_invitation(
         self,

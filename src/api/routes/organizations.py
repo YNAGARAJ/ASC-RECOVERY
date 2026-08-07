@@ -14,14 +14,41 @@ who wants a different org's members switches their active org first
 (org-switching itself is a known, not-yet-built gap, same as facility
 switching -- `AuthContext.facility_id`'s docstring).
 
-Membership creation/revocation (invite, offboard, API-key provisioning)
-are separate, later steps -- this is read-only.
+`POST /organizations/members/{membership_id}/revoke` (Phase 5 step 4) is
+offboarding -- the phase's actual stated gate ("offboarding test proves
+instant session death"). It soft-revokes (`memberships.revoked_at`, not a
+`DELETE` -- `asc_app` has no `DELETE` grant on any mutable table); the
+next request against *any* route, using an already-issued, unexpired
+token, fails immediately -- there is no token-revocation list, because
+role/access is resolved fresh from `memberships` on every request
+(`api/auth.py::get_auth_context`). `membership_id` is a specific resource
+id, like `finding_id`/`packet_id` elsewhere -- not a bare scoping id like
+`org_id`/`facility_id` (see this module's own note above on why those
+never appear as client-supplied params); RLS's `org_authoring_update`
+policy (`alembic/versions/0007_user_lifecycle.py`) is what actually
+restricts *which* membership rows a given caller can revoke, so a
+cross-org `membership_id` 404s exactly like a nonexistent one would, same
+IDOR-shaped guarantee every other direct-id-lookup route in this API
+gives.
+
+No dedicated `audit_log` entry for a revocation -- confirmed with the
+user: every existing `write_audit_log` call in this codebase is for a
+write to a PHI-bearing table (CLAUDE.md rule 5's literal scope);
+`memberships` isn't one, and `audit_log.facility_id` is `NOT NULL` with
+no clean single-facility target for an `ALL_FACILITIES`-scoped
+membership anyway. The gate's actual proof is the instant-session-death
+test, not an audit row.
+
+Invitation/API-key provisioning are separate, later steps.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from uuid import UUID
 
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+
+from api.alerting import record_not_found
 from api.auth import AuthContext, get_repository, require_permission
 from api.rate_limit import enforce_rate_limit
 from api.repository import Page, Repository
@@ -45,3 +72,16 @@ def list_org_members(
 ) -> OrgMemberListOut:
     result = repository.list_org_members(ctx.user_id, ctx.org_id, page=page)
     return OrgMemberListOut.from_domain(result)
+
+
+@router.post("/organizations/members/{membership_id}/revoke", status_code=204, response_model=None)
+def revoke_membership(
+    membership_id: UUID,
+    request: Request,
+    ctx: AuthContext = require_permission(Action.MANAGE_USERS),
+    repository: Repository = Depends(get_repository),
+) -> None:
+    revoked = repository.revoke_membership(ctx.user_id, membership_id)
+    if not revoked:
+        record_not_found(request, ctx.subject)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="membership not found")

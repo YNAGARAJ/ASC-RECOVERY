@@ -28,7 +28,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -265,6 +265,26 @@ def create_membership(
         )
     session.flush()
     return membership
+
+
+def revoke_membership(session: Session, membership_id: uuid.UUID) -> bool:
+    """Offboarding (Phase 5 step 4): soft-revokes a membership -- sets
+    `revoked_at`, an `UPDATE` (the only write `asc_app` is ever granted on
+    a mutable table). No `org_id`/`user_id` filter here beyond
+    `membership_id` and "not already revoked" -- same convention as every
+    other function in this module: RLS (the `org_authoring_update` policy,
+    `alembic/versions/0007_user_lifecycle.py`) is the actual boundary on
+    *which* membership rows a given caller can reach, not app-level
+    filtering. Returns `False` for a membership that doesn't exist, isn't
+    visible/writable to this caller, or is already revoked -- callers
+    (api/repository.py) treat all three identically, a 404, since RLS
+    deliberately makes "doesn't exist" and "not accessible" indistinguishable."""
+    result = session.execute(
+        update(MembershipModel)
+        .where(MembershipModel.id == membership_id, MembershipModel.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    return result.rowcount > 0
 
 
 def get_default_membership_org_id(session: Session, user_id: uuid.UUID) -> uuid.UUID | None:
