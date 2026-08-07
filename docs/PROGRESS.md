@@ -494,6 +494,42 @@ skipped, `domain/variance.py` 100% coverage gate, `python -m evals.run`
 GATE PASSED, `bandit -r . -x ./tests,./evals` clean. No schema change
 this commit, so no new migration/offline-SQL surface.
 
+### Per-org rate-limiting ceiling — DONE
+
+Second of the three deferred Phase 6 items, built this session (user
+asked to continue after forced re-auth landed). `api/rate_limit.py`
+already had a per-`(org_id, user_id)` `InMemoryTokenBucketRateLimiter`
+(F-06, wired since Wave 3) — this was never a per-*org* limit despite
+`docs/SECURITY.md` describing it loosely enough to be misread that way:
+N users at one org each got their own full budget, independent of each
+other, so nothing actually bounded that org's *combined* traffic.
+
+Added a second, independent limiter instance (`app.state.org_rate_limiter`,
+alongside the existing `app.state.rate_limiter`), keyed by `org_id`
+alone. `enforce_rate_limit` now requires *both* to allow a request —
+per-user check first (unchanged order/behavior for every existing
+caller), org-wide check second. Default capacity/refill for the org
+bucket (600 / 10 per second) is deliberately well above one user's own
+budget (60 / 1 per second) — set it any lower and this would just be a
+confusing, redundant copy of the per-user check rather than an actual
+aggregate-traffic protection against one large customer starving shared
+capacity. `create_app` gained a matching `org_rate_limiter` override
+param, same test-injection convention as the existing `rate_limiter`
+param (`tests/api/test_rate_limit.py`'s `_client_with_capacity`, now
+joined by `_client_with_org_capacity`).
+
+Two new tests prove the org ceiling is genuinely aggregate, not a
+relabeled per-user check: two *different* users at the same org share
+one budget (the org-level analog of, and structurally the inverse of,
+the pre-existing `test_different_users_have_independent_budgets`, which
+is about the per-user limiter); and the ceiling doesn't leak across
+orgs (tenant B's request still succeeds while tenant A's is exhausted).
+
+No schema change, no new migration. `docs/SECURITY.md`'s rate-limiting
+row updated to describe both limiters; the "Not yet built" bullet
+narrowed to the two items still actually outstanding (per-org
+encryption keys, per-org data residency).
+
 ## Traps for someone resuming cold
 
 - **Everything Phase 4's checkpoint already flagged still applies**: the
@@ -539,17 +575,11 @@ this commit, so no new migration/offline-SQL surface.
 
 Phase 6 is in progress, scope already resolved (see its section above --
 don't re-litigate what's already built vs. deferred, it was just
-audited item by item against the actual code). Three items remain,
-already scoped, not started:
+audited item by item against the actual code). Forced re-auth for PHI
+export and the per-org rate-limiting ceiling are both done. Two items
+remain, already scoped, not started:
 
-1. **Per-org rate-limiting ceiling.** Smallest of the three. Add an
-   aggregate per-org token bucket in `api/rate_limit.py::enforce_rate_limit`
-   alongside the existing per-`(org_id, user_id)` one — today a large
-   customer's users collectively face no shared cap, only individual
-   ones. `security/rate_limit.py::InMemoryTokenBucketRateLimiter` is
-   already generic enough to reuse for a second, org-keyed bucket
-   without new abstraction.
-2. **Per-org encryption keys (BYOK-ready).** Medium-sized, real design
+1. **Per-org encryption keys (BYOK-ready).** Medium-sized, real design
    work — an org-level KEK reference (likely a new nullable column on
    `organizations`, or a new `org_encryption_keys` table if more than
    one field ends up needed), threaded through `EnvelopeEncryptor`'s
@@ -557,15 +587,15 @@ already scoped, not started:
    path) instead of the one global KEK `main.py` wires today. Touches
    more surface than the other two — plan-mode this one before writing
    code, the way every schema-shaped phase in this project has.
-3. **Per-org data residency flag.** Small to build, but confirm the
+2. **Per-org data residency flag.** Small to build, but confirm the
    "stored preference, not physical enforcement" framing
    (`docs/SECURITY.md`'s "Not yet built" section already states it) is
    still acceptable before writing it — this build is one shared
    Postgres in one region, so anything claiming more would be fiction.
-4. **If picking this up much later**, re-verify the full local gate
-   before trusting anything — it was green as of `2983cbf`, but confirm
-   it still is.
-5. **If the F-22 Postgres password becomes available**, run Phase 4 and
+3. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — confirm the current commit's status
+   before trusting it.
+4. **If the F-22 Postgres password becomes available**, run Phase 4 and
    5's live-DB suites for real before trusting any of their RLS/function
    code beyond what's offline-verified — independent of Phase 6, and
    worth doing before Phase 6 adds more RLS-adjacent work (the per-org
