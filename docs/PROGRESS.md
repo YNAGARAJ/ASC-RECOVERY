@@ -893,6 +893,157 @@ local-Postgres handoff, still unclaimed) — every DB-backed test this
 phase added is offline-verified/skip-without-a-database only, including
 the actual Phase 7 gate test itself.
 
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 8 (contract modeling depth) — COMPLETE (gate scope)
+
+The prompt's own framing: "v1's contract model produces false positives
+on correctly paid claims. Fix it properly," explicitly plan-moded first.
+Before writing any code, three parallel research agents audited the
+actual pricing engine (`domain/contract.py`) against the phase's full
+checklist. Findings: MPPR (multi-procedure reduction, fully configurable
+per contract), bilateral modifiers (both conventions — `TWO_LINE_SPLIT`
+fixed as F-16), assistant surgeon, implant carve-out (invoice-cost
+pass-through only), and case-rate allocation all already existed, real
+and tested. **Lesser-of and stop-loss/outlier pricing — the two items
+the phase's own gate literally requires — did not exist at all.** Neither
+did co-surgeon/discontinued-procedure modifiers, per-diem/RVU pricing,
+annual escalators, payer-type rules, prompt-pay interest, or statute of
+limitations.
+
+Given the size of the full checklist, the user was asked to scope the
+session via `AskUserQuestion` and chose **gate items only**: lesser-of +
+stop-loss/outlier pricing, with the golden-set false-positive proof the
+gate literally requires, plus re-verifying the F-16/F-17 audit amendment.
+Everything else — including global periods/NCCI edits, which needs real
+CMS reference data this project has no access to — is named and deferred
+to a follow-up session, not silently dropped.
+
+### What was built
+
+- **Lesser-of billed charges vs. fee schedule** — the literal
+  false-positive fix. `domain/contract.py::_apply_lesser_of` caps a
+  fee-schedule amount at the billed charge whenever
+  `ContractVersion.lesser_of_charge_enabled` and `charge < amount`;
+  wired into both places `_base_price` returns a fee-schedule amount.
+  Deliberately not applied to percent-of-charge amounts (already ≤
+  charge whenever the rate is ≤ 100%, so this is specifically a
+  fee-schedule-vs-charge concept). Stored per contract version, not
+  hardcoded — defaults `true` at both the DB column and API-schema level
+  (most real ASC contracts pay lesser-of), `false` at every pre-existing
+  test/eval fixture (see "Blast radius" below).
+- **Stop-loss/outlier pricing** — new `StopLossRule` (enabled, threshold,
+  outlier_rate, first_dollar) and `PricingMethodUsed.STOP_LOSS_OUTLIER`.
+  A new **step 0** in `price_claim`, before base pricing: when total
+  claim charges exceed `threshold`, every non-implant line prices at
+  `line.charge.times(outlier_rate)` — first-dollar, the percentage
+  applies to each line's own full charge (summing to `outlier_rate` of
+  the whole claim), not just the excess above threshold. Implants still
+  carve out separately at invoice cost — same "implants are
+  special-cased out of every other rule" precedent bilateral/assistant/
+  MPPR already establish, now extended to stop-loss, along with
+  explicitly excluding stop-loss-triggered lines from bilateral/
+  assistant/case-rate so a triggered line can't get re-priced on top of
+  its own stop-loss amount. New `RootCause.STOP_LOSS_NOT_APPLIED` in
+  `domain/variance.py`'s root-cause chain. A marginal/excess-only stop-
+  loss variant (as opposed to first-dollar) is out of scope, named not
+  silently unsupported.
+- **F-16 re-verification found a real, second gap**: `BilateralConvention
+  .TWO_LINE_SPLIT`'s domain-layer pricing branch was fixed, but
+  `api/schemas.py::BilateralRuleIn` had no `convention` field at all, and
+  `api/repository.py` hardcoded `SINGLE_LINE_150_PCT` unconditionally —
+  the only production entry point could never actually select
+  `TWO_LINE_SPLIT`. Closed this phase: `convention` added to
+  `BilateralRuleIn`, threaded through `RuleInput`/`ContractVersionInput`,
+  proven end to end against a live Postgres
+  (`tests/api/test_contracts_live_db.py`) — a contract created via the
+  real `POST /contracts/{id}/versions` with `convention: "two_line_split"`
+  now actually prices a two-line bilateral claim with the 100%/remainder
+  split. `docs/audit/REGISTER.md`'s F-16 row updated with the full
+  re-verification note. **F-17 (implant invoice-cost sourcing) is
+  untouched** — stays open, per the prior recorded user decision; nothing
+  in this phase's scope touches it.
+- **Migration `0013_contract_stop_loss_lesser_of.py`** — the first real
+  `ALTER TABLE contract_versions` since the table's creation (every prior
+  schema change to this table came from 0001's `create_all()`). Adds
+  `lesser_of_charge_enabled BOOLEAN NOT NULL DEFAULT true` and
+  `stop_loss_rule JSONB NOT NULL DEFAULT '{"enabled": false, ...}'`,
+  guarded/offline pattern copied from 0004's precedent on `contracts`. No
+  RLS/grant changes needed — adding columns to an already-protected table
+  doesn't touch policy.
+- **Blast radius**: `ContractVersion` gained two new fields with **no
+  dataclass default** (matching the existing convention — every field on
+  this dataclass is explicit), so every construction site needed
+  updating: `tests/domain/conftest.py`, `tests/ingestion/fixtures.py`,
+  `tests/db/test_effective_dated_pricing.py`, `evals/generator.py`'s
+  `_make_contract`, `db/repository.py`'s `_contract_version_to_domain`/
+  `create_contract_version`, `api/repository.py`'s
+  `_rule_input_to_contract_version`, and — caught only by a final
+  whole-repo `mypy --strict .` sweep, not by the earlier targeted
+  sweeps — `scripts/onboard_customer.py`. Every pre-existing site got
+  `lesser_of_charge_enabled=False` and an inert, disabled `stop_loss_rule`
+  — zero risk of silently perturbing an existing test's or golden case's
+  expected values; verified by regenerating the eval golden set and
+  confirming its 8 pre-existing categories' recall/precision/dollar-
+  accuracy were unchanged.
+- **Evals**: two new golden-set categories mirroring the generator's
+  existing `_build_<category>_cases` pattern — `_build_stop_loss_cases`
+  (new `DefectType.STOP_LOSS_NOT_APPLIED`, an underpayment where the
+  payer paid the flat fee schedule instead of the outlier percentage) and
+  new lesser-of/stop-loss patterns added to the existing
+  `_build_correct_cases`/`DefectType.CORRECT_PAYMENT` builder — the
+  gate's own explicit requirement: "cases that are correctly paid under
+  the new rule and must not be flagged." Regenerated
+  `evals/golden/cases.py` (504 → 560 cases). Gate: recall 100%
+  (unchanged), precision 100% (unchanged, ≥ 98% required), dollar
+  accuracy 100%, lesser-of and stop-loss correct-payment cases score
+  `CORRECT_NO_VARIANCE` with zero false positives — the phase's own
+  literal requirement.
+- **Tests**: worked-example unit tests in `tests/domain/test_contract.py`
+  (lesser-of enabled/disabled, above/below fee schedule; stop-loss below/
+  above threshold, first-dollar whole-claim-basis summation, implant
+  carve-out still applying over a triggered stop-loss, MPPR/bilateral/
+  assistant/case-rate all correctly skipped for stop-loss-triggered
+  lines); new `STOP_LOSS_NOT_APPLIED` root-cause test in
+  `tests/domain/test_variance.py`; three real-ingestion-path tests added
+  to `tests/ingestion/test_plan.py` (835 parse → plan, not just
+  `price_claim` called directly) for lesser-of, stop-loss, and — closing
+  the gap the audit-amendment re-verification found — bilateral
+  `TWO_LINE_SPLIT`, satisfying Phase 8's own audit-amendment mandate that
+  every domain rule have at least one case through the real parsing/
+  ingestion path; a DB round-trip test in
+  `tests/db/test_effective_dated_pricing.py`; a new
+  `tests/api/test_contracts_live_db.py` (no dedicated API-level test of
+  `POST /contracts/{id}/versions` existed before this phase at all).
+
+### Deliberately deferred, named not silently dropped
+
+Everything in Phase 8's checklist beyond lesser-of/stop-loss: co-surgeon/
+discontinued-procedure modifiers, richer implant carve-out methodologies
+(percent-of-billed, flat-rate — today's `ImplantCarveoutRule` only
+identifies which lines are implants, no markup/methodology fields at
+all), per-diem/RVU pricing with conversion factors, annual escalators,
+payer-type-specific rules (Medicare/Medicaid/commercial/workers' comp/
+auto), prompt-pay interest (configurable per state), recovery statute of
+limitations per state, and global periods/NCCI edits (needs real CMS
+reference data this project has no access to — out of scope regardless
+of any future scope decision, not just this session's).
+
+### Full local gate as of this commit — Phase 8 complete (gate scope)
+
+`ruff check .` clean, `mypy --strict .` clean except 4 pre-existing-
+category errors (212 files checked) — all four are the same known
+SQLAlchemy-stub gap ("Call to untyped function JSONB in typed context")
+migration 0004 already had two of; migration 0013 uses the identical
+`JSONB()` idiom and adds two more instances of the same harmless,
+already-documented class, not a new one. `pytest -q` 708 passed / 87
+skipped, `domain/variance.py` 100% coverage gate, `python -m evals.run`
+GATE PASSED (560 cases, recall 100%, precision 100%, dollar accuracy
+100%), `bandit -r . -x ./tests,./evals` clean. Offline SQL generation
+verified both directions through migration 0013. **Not independently
+re-verified against a live Postgres** — same disclosed ceiling as every
+phase since 4 (F-22's local-Postgres handoff, still unclaimed) — every
+DB-backed test this phase added is offline-verified/skip-without-a-
+database only.
+
 ## Traps for someone resuming cold
 
 - **Everything Phase 4's checkpoint already flagged still applies**: the
@@ -975,58 +1126,84 @@ the actual Phase 7 gate test itself.
   `parse_ingestion_payload`, `run_ingestion_job`'s own decrypt-then-call-
   `ingest_file` shape) and shouldn't be assumed to generalize without
   checking.
+- **`domain.contract.ContractVersion` has no dataclass defaults on any
+  field, including the two Phase 8 added** — every construction site
+  must supply `lesser_of_charge_enabled`/`stop_loss_rule` explicitly.
+  Before adding a third new field, grep for `ContractVersion(` across
+  `tests/`, `evals/`, and `src/` first (`scripts/onboard_customer.py` was
+  missed by every targeted search this phase and only caught by a final
+  whole-repo `mypy --strict .` sweep) — the full list as of this phase:
+  `tests/domain/conftest.py`, `tests/ingestion/fixtures.py`,
+  `tests/db/test_effective_dated_pricing.py`,
+  `evals/generator.py::_make_contract`, `db/repository.py`'s
+  `_contract_version_to_domain`/`create_contract_version`,
+  `api/repository.py::_rule_input_to_contract_version`,
+  `scripts/onboard_customer.py::_build_contract_version`.
+- **`evals/golden/cases.py` is generated, never hand-edit it** — a change
+  to `evals/generator.py` (a new `DefectType`, a new `_build_*_cases`
+  builder, a new field on `_make_contract`) needs `python -m
+  evals.generator` rerun to actually take effect, and the generated
+  file's own hardcoded `from domain.contract import (...)` header (in
+  `write_golden_dataset`) needs updating by hand alongside any new type
+  the generator's `_render()` needs to import — `_render()` itself is
+  fully generic (dataclass-field reflection), so a new frozen dataclass
+  like `StopLossRule` needed zero changes there, only the import list.
+- **`price_claim`'s stop-loss step (step 0) runs before every other
+  step, including implant detection (step 2)`** — it has to check
+  `_is_implant` directly rather than reading the `is_implant_line` array,
+  since that array isn't populated yet at step 0. Any future step added
+  *before* step 2 needs the same direct-check treatment; any step added
+  *after* step 2 can trust `is_implant_line`.
+- **`contract_versions` had never been ALTERed before migration 0013** —
+  every earlier schema change to that table came from 0001's
+  `create_all()` reflecting `db/models.py` at migration-write time, not a
+  real `ALTER`. 0013 is the first real precedent specifically for this
+  table (`contracts` already had one, from migration 0004) — copy 0013's
+  guarded/offline pattern for the next one, not 0004's (same shape, but
+  0013 is the more recent, directly-analogous example).
 
 ## Next steps
 
-Phase 7 is complete. Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order,
-**Phase 8 (contract modeling depth) is next** — the prompt's own framing:
-"v1's contract model produces false positives on correctly paid claims.
-Fix it properly," and it explicitly says to plan-mode it first, same as
-Phase 7. All terms are data in versioned tables, effective-dated, never
-code: lesser-of-billed-vs-fee-schedule logic (**implement first** — the
-prompt is explicit that without it, any claim billed below the fee
-schedule is misreported as underpaid), stop-loss/outlier with
-first-dollar-language support, configurable-per-payer multiple-procedure
-reduction percentages, bilateral/assistant-surgeon/co-surgeon/
-discontinued-procedure modifiers, implant carve-outs (invoice-cost-plus-
-markup, percent-of-billed, flat-rate), case rates/per-diems/percent-of-
-charge/RVU-based pricing, annual escalators, global periods and NCCI
-edits, payer-type-specific rules (Medicare/Medicaid/commercial/workers'
-comp/auto), prompt-pay interest (configurable per state), and recovery
-statute-of-limitations per state (a finding outside the window must be
-marked non-actionable, never silently listed). **Gate**: precision on
-the extended golden set ≥ 98%, with lesser-of and stop-loss cases
-producing zero false positives. **Audit amendment (register F-16, F-17)**
-— v1 shipped two silent pricing defects the domain-layer tests never
-caught because they exercised the pricing function directly with
-hand-built inputs, never through the real ingestion path: an enum value
-(`BilateralConvention.TWO_LINE_SPLIT`) with no pricing branch
-implemented, and implant carve-out logic that was correct in isolation
-but never fired because the ingestion layer hardcoded the invoice-cost
-field to empty. **Every enum value this phase introduces must have an
-implementation before it can be stored on a contract, and every domain
-rule's test must include at least one case through the real parsing/
-ingestion path end to end, not only the pure pricing function called
-directly** — don't repeat v1's mistake.
-
-Before assuming any of this is unbuilt, audit the actual code against
-the actual prompt first — Phase 6 turned out to have most of its
-checklist already true from earlier phases/Wave 3 remediation, and
-Phase 8 may have partial overlap with whatever `domain/contract.py`
-already does (worth checking before planning as if starting from zero).
+Phase 8 is complete (gate scope: lesser-of + stop-loss/outlier pricing).
+Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order, **Phase 9 (ingestion
+pipeline) is next**. Read that phase's prompt before assuming it's
+unbuilt — it's very likely another Phase-6-shaped situation: "sources
+behind a port: upload, SFTP poll, S3-compatible drop, clearinghouse API;
+idempotency by content hash; quarantine invalid files with a readable
+diagnostic; partial-batch tolerance; virus scan; BPR-to-claims
+reconciliation including PLB; reversal and takeback netting; full audit
+per file; runs as a Phase 7 job" describes almost exactly what already
+exists in `src/ingestion/` (`sources.py`, `plan.py`, `apply.py`,
+`pipeline.py`) and `src/jobs/` (Phase 7, this session's own earlier
+work) — audit the actual code against the actual prompt line by line
+before planning as if starting from zero, the same discipline that
+saved most of Phase 6's session. The one item that reads as genuinely
+new: **"Also ingest 837 claim files where available — the 835 alone
+lacks diagnosis codes, units and rendering provider, all of which the
+appeal packet needs."** No 837 parser exists anywhere in this codebase
+(`domain/x835.py` is 835-only) — that's very likely real, unbuilt scope.
+**Audit amendment (register F-01, the audit's one CRITICAL)**: re-verify
+whether the existing reversal-netting test already covers a reversal
+claim reporting *fewer* lines than the original it reverses (asserting
+`sum(shortfall) == 0` afterward) — F-01 is marked FIXED in
+`docs/audit/REGISTER.md`, but confirm what "fixed" actually covers
+before trusting it covers this specific case, same as Phase 8 found a
+real, second gap hiding behind F-16's "FIXED" marker.
 
 1. **If picking this up much later**, re-verify the full local gate
    before trusting anything — confirm the current commit's status
    before trusting it.
-2. **If the F-22 Postgres password becomes available**, run Phases 4-7's
+2. **If the F-22 Postgres password becomes available**, run Phases 4-8's
    live-DB suites for real before trusting any of their
    RLS/function code beyond what's offline-verified — this now includes
-   migrations 0010-0012 and every BYOK/data-residency/job-queue DB test
-   (`tests/db/test_organization_kms_key.py`,
+   migrations 0010-0013 and every BYOK/data-residency/job-queue/contract-
+   pricing DB test (`tests/db/test_organization_kms_key.py`,
    `tests/ingestion/test_apply_org_kms_key.py`,
    `tests/db/test_org_policy.py`'s data-residency tests,
    `tests/db/test_jobs_queue.py`, `tests/jobs/test_runner_live_db.py`,
-   `tests/ingestion/test_apply_progress_cancel.py`), never run against a
-   real Postgres in this environment. Doing this before starting Phase
-   8's own DB-backed work would mean verifying one large batch together
-   instead of several small ones.
+   `tests/ingestion/test_apply_progress_cancel.py`,
+   `tests/db/test_effective_dated_pricing.py`'s new lesser-of/stop-loss
+   round-trip test, `tests/api/test_contracts_live_db.py`), never run
+   against a real Postgres in this environment. Doing this before
+   starting Phase 9's own DB-backed work would mean verifying one large
+   batch together instead of several small ones.
