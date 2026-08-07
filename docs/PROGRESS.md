@@ -12,9 +12,10 @@ at a clean commit as of this checkpoint.
    documented reason (F-17, F-21, F-22 — see the register).
 2. Build the unbuilt product-completeness gaps from
    `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 — GAP REGISTER" — **now
-   underway.** Phase 4 (org/facility/membership access model) is
-   **complete**. Phase 5 (user lifecycle and enterprise access) is
-   **in progress, 6 of 7 planned sub-steps done** — see below.
+   underway.** Phase 4 (org/facility/membership access model) and Phase 5
+   (user lifecycle and enterprise access) are both **complete**. Phase 6
+   (security and PHI controls) has not been started — see "Next steps"
+   below before picking it up.
 
 **A phase-numbering collision to not get confused by**: `docs/PHASES.md`
 tracks the *original* 12-phase build's checklist (already complete,
@@ -60,7 +61,7 @@ since Phase 5 now builds on top of it as settled, sealed ground:
   `facility_id`/`org_id`, required. Deliberate, still true after Phase 5
   steps 1-3.
 
-## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — IN PROGRESS, 6/7 steps
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 5 (user lifecycle and enterprise access) — COMPLETE, 7/7 steps
 
 **Scoped down to a core subset, confirmed with the user 2026-08-07**:
 invitation → accept → MFA → first login, offboarding, delegated admin,
@@ -328,20 +329,75 @@ is proven only at the pure-function level
 this environment. Named explicitly rather than silently having a gap in
 coverage no one flagged.
 
-### Full local gate as of step 6 (`591358b`)
+### Step 7/7 — Docs (`e892c52`) — DONE, PHASE 5 COMPLETE
 
-`ruff check .` clean, `mypy --strict .` clean (193 files, only the 2
-pre-existing unrelated alembic 0004 JSONB errors — present since before
-Phase 4, not this session's doing), `pytest -q` 682 passed / 64 skipped,
-`domain/variance.py` 100% coverage gate, `python -m evals.run` GATE
-PASSED, `bandit -r . -x ./tests,./evals` clean. No new migration this
-step, so no new offline-SQL surface — `alembic upgrade head --sql`
+Documentation only — no code, no new tests, no new gate. The phase's
+actual stated gate ("offboarding test proves instant session death") was
+already satisfied by step 4; this step documents what steps 1-6 built,
+nothing more.
+
+- **`docs/RUNBOOK.md`**: a new "Managing users, API keys, and org policy"
+  section with curl-level operator workflows for all four — inviting a
+  user (through to first login), offboarding (finding a `membership_id`
+  via `GET /organizations/members`, then revoking it), provisioning/
+  revoking an API key, and reading/writing per-org policy. All four are
+  ordinary authenticated HTTP calls (an already-logged-in `org_admin`'s
+  bearer token), unlike "Onboarding a new customer" above it, which is
+  necessarily a direct-DB script (no authenticated caller exists yet for
+  a brand-new org).
+- **`docs/PERMISSIONS.md`**: notes that offboarding/API keys/org-policy
+  all reuse the existing `manage_users` action — **no new `Action` was
+  added across any of steps 1-6**. Retitled to disambiguate against
+  `docs/SECURITY.md`'s different (v1-numbering) "Phase 4"/"Phase 7"
+  references — this file's "Phase 4"/"Phase 5" are always
+  `MASTER-BUILD-PROMPT-V2.md`'s. "Not yet built" list updated: API key
+  provisioning is off it (built); SSO/SCIM/impersonation/break-glass are
+  on it, named explicitly as the deferred follow-up pass this phase's
+  own scoping decision (top of this file) already called out, not folded
+  into a vague "later."
+- **`docs/SECURITY.md`**: five control-matrix changes. Two rows updated
+  in place — MFA's row now cites the real `POST /auth/login` endpoint
+  that closed the "mechanism with zero production callers" gap
+  `MASTER-BUILD-PROMPT-V2.md`'s own Phase 5 audit amendment named (true
+  through step 3, only now documented here); automatic logoff's row
+  covers the `session_timeout_seconds` override. Three new rows:
+  immediate access revocation (offboarding, §164.308(a)(3)(ii)(C)), API
+  key authentication (§164.312(d)), and the per-org IP allowlist
+  (§164.312(a)(1)) — each citing its actual test coverage, including the
+  IP-allowlist row's disclosed environment limitation (below). Added
+  SSO/SCIM/impersonation/break-glass as a named "not yet built" gap
+  alongside the pre-existing OIDC row, same reasoning as the
+  `PERMISSIONS.md` update above.
+
+**A real environment limitation, disclosed rather than worked around
+(discovered writing step 6's tests, documented here in step 7)**:
+Starlette's `TestClient` (this whole suite's HTTP-level harness) always
+presents the literal string `"testclient"` as `request.client.host` —
+never a real IP, no supported override in the installed version
+(0.41.3). `tests/api/test_org_policy.py` can therefore only prove the
+IP-allowlist's *rejection* path over a live HTTP request; the *match*
+path is proven only at the pure-function level
+(`tests/security/test_ip_allowlist.py`). Named in both `docs/SECURITY.md`
+and this file rather than left as a silent coverage gap.
+
+### Full local gate as of step 7 / Phase 5 complete (`e892c52`)
+
+Unchanged from step 6 (docs-only commit, re-verified rather than
+assumed): `ruff check .` clean, `mypy --strict .` clean (193 files, only
+the 2 pre-existing unrelated alembic 0004 JSONB errors — present since
+before Phase 4, not this session's doing), `pytest -q` 682 passed / 64
+skipped, `domain/variance.py` 100% coverage gate, `python -m evals.run`
+GATE PASSED. No new migration this step — `alembic upgrade head --sql`
 still ends at 0009, verified when step 5 added it.
 **Every RLS policy/`SECURITY DEFINER` function added across steps 1, 2,
 and 5 (including `get_api_key_by_hash`) is written and offline-verified
 only — never run against a real Postgres in this environment** (same
 disclosed gap as Phase 4's RLS work; F-22's local Postgres is still
-unclaimed, see "Traps" below).
+unclaimed, see "Traps" below). **Do not consider Phase 5's RLS/
+`SECURITY DEFINER` additions confirmed until they run against a real
+Postgres**, same standard the original 12-phase build held itself to
+before Phase 10's CI run retroactively confirmed its own equivalent
+gaps (`docs/PHASES.md`).
 
 ## Traps for someone resuming cold
 
@@ -374,23 +430,44 @@ unclaimed, see "Traps" below).
   assumption the SQL is correct.
 - **Migrations 0007/0008/0009 are additive on top of 0001, not edits to
   it** — 0001's schema is sealed (same convention 0002-0006 already
-  established for Phase 4). Any further Phase 5 schema work (step 6)
-  should be a new `0010_...` migration, not an edit to 0007/0008/0009.
+  established for Phase 4). Phase 5 ended at migration `0009`; any V2
+  Phase 6 schema work should be a new `0010_...` migration.
+- **Phase 5 added no new `Action`** — offboarding, API keys, and
+  per-org policy all reuse `Action.MANAGE_USERS`. If Phase 6 (security
+  and PHI controls) needs a new permission boundary, check
+  `docs/PERMISSIONS.md`'s action matrix first; don't assume one needs
+  adding without checking whether an existing action already covers it,
+  the way step 4 verified `org_authoring_update` already covered
+  offboarding before concluding no new RLS policy was needed.
 
 ## Next steps
 
-1. **Step 7/7 — Docs.** `docs/RUNBOOK.md` (invite/offboard/API-key/
-   per-org-policy operator workflows), `docs/PERMISSIONS.md` if the
-   action set changed (check whether it did — step 6 didn't add a new
-   `Action`, `GET`/`PUT /org-policy` reuse `Action.MANAGE_USERS`),
-   `docs/SECURITY.md` control-matrix entries for the new controls
-   (session timeout override, IP allowlist enforcement point). This is
-   the last step in Phase 5 — after it, the whole phase's gate
-   ("offboarding test proves instant session death") is already
-   satisfied by step 4, so step 7 is documentation-only, not a new gate.
-2. **If picking this up much later**, re-verify the full local gate
-   before trusting anything — it was green as of `591358b`, but confirm
+Phase 5 is complete. Per `docs/MASTER-BUILD-PROMPT-V2.md`'s "PART 3 —
+GAP REGISTER", **V2 Phase 6 (security and PHI controls) is next** —
+AES-256 at rest (largely already true from Wave 3's F-20 KMS work, but
+re-check against Phase 6's actual prompt text before assuming full
+overlap, especially **per-org encryption keys (BYOK-ready)**, which
+nothing built so far provides), TLS 1.2+, KEK rotation without
+re-encryption (already built, Phase 4), MFA mandatory (already built,
+Phase 5), PHI redaction *installed structurally at the logging bootstrap*
+(check whether the existing `PHIRedactionFilter` wiring already meets
+this bar or is still the one-`addFilter`-call gap `docs/SECURITY.md`'s
+"Not yet built" section may still describe), rate limiting *wired* (per
+org — `docs/SECURITY.md`'s control matrix already flags rate limiting
+and account lockout as built-but-unwired MEDIUM findings from the
+original build; confirm current status before assuming either way), and
+data residency configurable per organization (nothing built for this
+yet). **Do not start Phase 6 without first reading its full prompt in
+`docs/MASTER-BUILD-PROMPT-V2.md` and re-verifying what Wave 3/Phase 4
+already closed** — this phase overlaps significantly with prior work in
+a way Phase 5 didn't, so the real remaining scope needs to be scoped
+freshly, not assumed from this summary.
+
+1. **If picking this up much later**, re-verify the full local gate
+   before trusting anything — it was green as of `e892c52`, but confirm
    it still is.
-3. **If the F-22 Postgres password becomes available**, run Phase 4 and
-   5's live-DB suites for real before trusting any of steps 1-6's
-   RLS/function code beyond what's offline-verified.
+2. **If the F-22 Postgres password becomes available**, run Phase 4 and
+   5's live-DB suites for real before trusting any of Phase 5's
+   RLS/function code beyond what's offline-verified — this is
+   independent of and should happen before Phase 6, since Phase 6 may
+   itself add more RLS-adjacent work worth verifying together.
