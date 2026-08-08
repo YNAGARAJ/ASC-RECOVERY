@@ -14,6 +14,7 @@ from packets.prompt import (
     ACTUAL_ALLOWED_TOKEN,
     CLAIM_REFERENCE_TOKEN,
     DATE_OF_SERVICE_TOKEN,
+    DIAGNOSIS_CODES_TOKEN,
     EXPECTED_ALLOWED_TOKEN,
     MEMBER_ID_TOKEN,
     PATIENT_TOKEN,
@@ -133,3 +134,69 @@ def test_render_final_text_substitutes_every_placeholder() -> None:
         "expected 100.00, paid 50.00, shortfall 50.00."
     )
     assert "{{" not in rendered
+
+
+# --- Phase 9: diagnosis codes / rendering provider / units ---------------------
+
+
+def test_diagnosis_codes_absent_by_default_produces_no_dangling_prompt_lines() -> None:
+    """An 835-only claim (no 837 ever ingested) must draft byte-for-byte
+    the same way it did before Phase 9 -- no "Diagnosis code(s): " line
+    with nothing after it, no dependency on 837 data that doesn't exist."""
+    built = build_prompt(_make_input("JANE DOE", "MBR-1"), DEFAULT_TEMPLATE)
+
+    assert "Diagnosis code(s)" not in built.text
+    assert "Rendering provider" not in built.text
+    assert "Units billed" not in built.text
+    assert DIAGNOSIS_CODES_TOKEN not in built.text
+
+
+def test_diagnosis_codes_are_never_literal_text_in_the_prompt() -> None:
+    """Diagnosis codes are PHI (health condition information tied to this
+    specific claim), same reasoning F-13 (docs/audit/REGISTER.md)
+    already established for claim reference/date of service --
+    placeholder-only, never a literal value the LLM sees."""
+    data = PromptInput(
+        payer_claim_control_number=_CLAIM_REFERENCE,
+        procedure_code="99213",
+        date_of_service=_DATE_OF_SERVICE,
+        expected_allowed="100.00",
+        actual_allowed="50.00",
+        shortfall="50.00",
+        root_cause="MPPR_NOT_APPLIED",
+        evidence="99213: expected 100.00, actual 50.00, shortfall 50.00",
+        patient_name="JANE DOE",
+        patient_member_id="MBR-1",
+        diagnosis_codes=("E11.9", "I10"),
+    )
+    built = build_prompt(data, DEFAULT_TEMPLATE)
+
+    assert "E11.9" not in built.text
+    assert "I10" not in built.text
+    assert DIAGNOSIS_CODES_TOKEN in built.text
+    assert "Diagnosis code(s)" in built.text
+    assert built.placeholders[DIAGNOSIS_CODES_TOKEN] == "E11.9, I10"
+
+
+def test_rendering_provider_and_units_appear_as_literal_text_when_present() -> None:
+    """Neither is PHI (provider identity / a bare quantity, not a patient
+    identifier) -- written directly into the prompt text, same treatment
+    procedure_code already gets, not placeholder-substituted."""
+    data = PromptInput(
+        payer_claim_control_number=_CLAIM_REFERENCE,
+        procedure_code="99213",
+        date_of_service=_DATE_OF_SERVICE,
+        expected_allowed="100.00",
+        actual_allowed="50.00",
+        shortfall="50.00",
+        root_cause="MPPR_NOT_APPLIED",
+        evidence="99213: expected 100.00, actual 50.00, shortfall 50.00",
+        patient_name="JANE DOE",
+        patient_member_id="MBR-1",
+        rendering_provider_name="DR. JANE SMITH",
+        units="2",
+    )
+    built = build_prompt(data, DEFAULT_TEMPLATE)
+
+    assert "DR. JANE SMITH" in built.text
+    assert "Units billed: 2" in built.text

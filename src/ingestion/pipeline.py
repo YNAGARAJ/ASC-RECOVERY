@@ -7,6 +7,7 @@ ingestion.plan) -> apply (ingestion.apply).
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -21,17 +22,48 @@ from db import repository
 from db.models import Finding as FindingModel
 from domain.contract import ContractVersion
 from domain.money import Money
-from domain.x835 import ClaimStatus, parse_835
+from domain.x835 import (
+    ISA_ELEMENT_SEP_INDEX,
+    ISA_MIN_LENGTH,
+    ISA_TERMINATOR_INDEX,
+    ClaimStatus,
+    parse_835,
+)
+from domain.x837 import parse_837
 from ingestion.apply import ContractVersionIds, IngestionOutcome, apply_ingestion_plan
 from ingestion.plan import PriorFinding, build_ingestion_plan, payer_key
 from ingestion.virus_scan import VirusScanner
 from observability.metrics import Instruments, noop_instruments, record_ingestion_outcome
 from security.encryption import EnvelopeEncryptor
+from security.phi_columns import encrypt_phi_field
 
 
 @dataclass(frozen=True, slots=True)
 class DuplicateOutcome:
     remittance_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateClaimFileOutcome:
+    claim_file_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimFileOutcome:
+    """Phase 9 (`docs/MASTER-BUILD-PROMPT-V2.md`): the outcome of
+    ingesting an 837 claim file -- deliberately not `IngestionOutcome`
+    (no claims/findings are ever *created* by an 837, only enriched;
+    `remittance_id` would be a category error, there's no remittance
+    involved at all). `claims_enriched`/`claims_unmatched` mirror
+    `IngestionOutcome`'s "never silently invisible" principle -- an 837
+    claim that couldn't be matched to an existing 835-created claim is
+    counted, not dropped without a trace."""
+
+    claim_file_id: uuid.UUID
+    status: str
+    claims_enriched: int
+    claims_unmatched: int
+    quarantine_reason: str | None = None
 
 
 def _quarantine_new_remittance(
@@ -72,7 +104,7 @@ def ingest_file(
     instruments: Instruments | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
-) -> IngestionOutcome | DuplicateOutcome:
+) -> IngestionOutcome | DuplicateOutcome | ClaimFileOutcome | DuplicateClaimFileOutcome:
     """Thin tracing/metrics wrapper around `_ingest_file_impl` -- callers
     that don't pass `tracer`/`instruments` (every test written before
     Phase 8) get no-ops at negligible cost, so instrumentation is
@@ -82,7 +114,11 @@ def ingest_file(
     tests/ingestion/conftest.py's `make_test_encryptor` for the test-side
     default). `on_progress`/`should_cancel` (Phase 7, `src/jobs/runner.py`)
     are passed straight through to `ingestion.apply.apply_ingestion_plan`,
-    whose own docstring covers them -- both default to `None`/no-op."""
+    whose own docstring covers them -- both default to `None`/no-op;
+    unused on the 837 path (Phase 9), which has no per-line loop long
+    enough to need either. `_ingest_file_impl` dispatches to the 835 or
+    837 path by peeking at the transaction-set-identifier element before
+    either parser runs -- see `_detect_transaction_set`."""
     resolved_tracer = tracer if tracer is not None else NoOpTracer()
     resolved_instruments = instruments if instruments is not None else noop_instruments()
     started = time.perf_counter()
@@ -114,12 +150,86 @@ def ingest_file(
                 dollars_detected=outcome.dollars_detected,
                 findings_created=outcome.findings_created,
             )
+        elif isinstance(outcome, ClaimFileOutcome):
+            span.set_attribute("outcome_status", outcome.status)
+            span.set_attribute("claims_enriched", outcome.claims_enriched)
+            span.set_attribute("claims_unmatched", outcome.claims_unmatched)
         else:
             span.set_attribute("outcome_status", "duplicate")
         return outcome
 
 
+def _detect_transaction_set(content: bytes) -> str | None:
+    """Peeks at the ST segment's own transaction-set-identifier element
+    (ST01: `"835"` or `"837"`) directly off the raw bytes, before any
+    dedup/virus-scan/table-specific handling -- both the 835 and 837
+    paths need this decided before they know which table (`remittances`
+    vs `claim_files`) tracks this file's idempotency/quarantine status.
+    Reads the ISA header for delimiters the same fixed-width way
+    `domain.x835.parse_835`/`domain.x837.parse_837` each independently
+    do once they actually run. Returns `None` for anything that doesn't
+    even look like a parseable X12 envelope (missing/short ISA, bad
+    UTF-8, no ST segment) -- callers treat `None` and anything other
+    than the literal `"837"` identically: fall through to the existing
+    835 path, whose own parser/quarantine handling already covers a
+    genuinely malformed file exactly as it did before this function
+    existed. This function's only job is a narrow, additive "is this
+    specifically an 837" check, never a replacement for 835's own error
+    handling."""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if len(text) < ISA_MIN_LENGTH or not text.startswith("ISA"):
+        return None
+    element_sep = text[ISA_ELEMENT_SEP_INDEX]
+    terminator = text[ISA_TERMINATOR_INDEX]
+    for chunk in text[ISA_MIN_LENGTH:].split(terminator):
+        chunk = chunk.strip("\r\n")
+        if not chunk:
+            continue
+        elements = chunk.split(element_sep)
+        if elements[0] == "ST":
+            return elements[1] if len(elements) > 1 else None
+    return None
+
+
 def _ingest_file_impl(
+    session: Session,
+    facility_id: uuid.UUID,
+    *,
+    content: bytes,
+    source: str,
+    uploaded_by: str,
+    scanner: VirusScanner,
+    encryptor: EnvelopeEncryptor,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> IngestionOutcome | DuplicateOutcome | ClaimFileOutcome | DuplicateClaimFileOutcome:
+    if _detect_transaction_set(content) == "837":
+        return _ingest_837_impl(
+            session,
+            facility_id,
+            content=content,
+            source=source,
+            uploaded_by=uploaded_by,
+            scanner=scanner,
+            encryptor=encryptor,
+        )
+    return _ingest_835_impl(
+        session,
+        facility_id,
+        content=content,
+        source=source,
+        uploaded_by=uploaded_by,
+        scanner=scanner,
+        encryptor=encryptor,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+    )
+
+
+def _ingest_835_impl(
     session: Session,
     facility_id: uuid.UUID,
     *,
@@ -217,6 +327,155 @@ def _ingest_file_impl(
         org_kms_key_id=org_kms_key_id,
         on_progress=on_progress,
         should_cancel=should_cancel,
+    )
+
+
+def _quarantine_new_claim_file(
+    session: Session, facility_id: uuid.UUID, claim_file_id: uuid.UUID, *, actor: str, reason: str
+) -> ClaimFileOutcome:
+    repository.update_claim_file_status(
+        session, facility_id, claim_file_id, status="quarantined", quarantine_reason=reason
+    )
+    repository.write_audit_log(
+        session,
+        facility_id,
+        actor=actor,
+        action="claim_file_quarantined",
+        resource_type="claim_file",
+        resource_id=str(claim_file_id),
+        phi_accessed=False,
+    )
+    return ClaimFileOutcome(
+        claim_file_id=claim_file_id,
+        status="quarantined",
+        claims_enriched=0,
+        claims_unmatched=0,
+        quarantine_reason=reason,
+    )
+
+
+def _ingest_837_impl(
+    session: Session,
+    facility_id: uuid.UUID,
+    *,
+    content: bytes,
+    source: str,
+    uploaded_by: str,
+    scanner: VirusScanner,
+    encryptor: EnvelopeEncryptor,
+) -> ClaimFileOutcome | DuplicateClaimFileOutcome:
+    """837 is enrichment, not a parallel pricing/finding pipeline (see
+    `domain.x837`'s own module docstring) -- an 837 claim only ever
+    attaches diagnosis codes/rendering provider to a claim an 835 already
+    created, correlated by `patient_control_number`. A claim that can't
+    be matched is skipped, not a whole-file quarantine -- the reverse of
+    `ingestion.plan`'s unmatched-reversal handling (F-01,
+    docs/audit/REGISTER.md): a missing 835 counterpart is an expected,
+    recoverable ordering situation (the 837 arrived first, or its 835
+    never will), not evidence of a financial-integrity bug the way a
+    reversal that can't net against anything is."""
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    claim_file, is_new = repository.record_claim_file_if_new(
+        session, facility_id, file_hash, source=source, uploaded_by=uploaded_by
+    )
+    if not is_new:
+        return DuplicateClaimFileOutcome(claim_file_id=claim_file.id)
+
+    scan_result = scanner.scan(content)
+    if not scan_result.clean:
+        return _quarantine_new_claim_file(
+            session,
+            facility_id,
+            claim_file.id,
+            actor=uploaded_by,
+            reason=f"virus scan flagged this file: {scan_result.detail}",
+        )
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return _quarantine_new_claim_file(
+            session,
+            facility_id,
+            claim_file.id,
+            actor=uploaded_by,
+            reason=f"could not decode file as UTF-8: {exc}",
+        )
+
+    parse_result = parse_837(text)
+    total_claims = sum(len(txn.claims) for txn in parse_result.transactions)
+    if total_claims == 0:
+        reason = (
+            f"no usable claims parsed: {parse_result.errors[0].reason}"
+            if parse_result.errors
+            else "no claims could be parsed from this file and no diagnostic was recorded"
+        )
+        return _quarantine_new_claim_file(
+            session, facility_id, claim_file.id, actor=uploaded_by, reason=reason
+        )
+
+    # Same org_kms_key_id resolution ingestion.apply's 835 path uses --
+    # diagnosis codes are PHI (health condition data), encrypted with the
+    # same per-org key an org's other PHI columns use (Phase 6).
+    org_id = repository.get_org_id_for_facility(session, facility_id)
+    org_kms_key_id = (
+        repository.get_organization_kms_key_id(session, org_id) if org_id is not None else None
+    )
+
+    claims_enriched = 0
+    claims_unmatched = 0
+    for txn in parse_result.transactions:
+        for claim837 in txn.claims:
+            matches = repository.get_claims_by_patient_control_number(
+                session, facility_id, claim837.patient_control_number
+            )
+            if not matches:
+                claims_unmatched += 1
+                continue
+            diagnosis_codes_encrypted = (
+                encrypt_phi_field(
+                    encryptor, json.dumps(list(claim837.diagnosis_codes)), kek_id=org_kms_key_id
+                )
+                if claim837.diagnosis_codes
+                else None
+            )
+            rendering_provider_name = (
+                claim837.rendering_provider.name
+                if claim837.rendering_provider is not None
+                else None
+            )
+            for claim_row in matches:
+                repository.enrich_claim_from_837(
+                    session,
+                    claim_row.id,
+                    diagnosis_codes_encrypted=diagnosis_codes_encrypted,
+                    rendering_provider_name=rendering_provider_name,
+                )
+                claims_enriched += 1
+
+    repository.update_claim_file_status(
+        session,
+        facility_id,
+        claim_file.id,
+        status="ingested",
+        claims_enriched=claims_enriched,
+        claims_unmatched=claims_unmatched,
+    )
+    repository.write_audit_log(
+        session,
+        facility_id,
+        actor=uploaded_by,
+        action="claim_file_ingested",
+        resource_type="claim_file",
+        resource_id=str(claim_file.id),
+        phi_accessed=claims_enriched > 0,
+    )
+    return ClaimFileOutcome(
+        claim_file_id=claim_file.id,
+        status="ingested",
+        claims_enriched=claims_enriched,
+        claims_unmatched=claims_unmatched,
     )
 
 

@@ -21,18 +21,20 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ingestion.apply import IngestionOutcome
-from ingestion.pipeline import DuplicateOutcome
+from ingestion.pipeline import ClaimFileOutcome, DuplicateClaimFileOutcome, DuplicateOutcome
 from ingestion.sources import IncomingFile, IngestionSource
+
+PollableOutcome = IngestionOutcome | DuplicateOutcome | ClaimFileOutcome | DuplicateClaimFileOutcome
 
 
 @dataclass(frozen=True, slots=True)
 class PolledOutcome:
     file_name: str
-    outcome: IngestionOutcome | DuplicateOutcome
+    outcome: PollableOutcome
 
 
 def poll_and_ingest(
     source: IngestionSource,
-    ingest_one: Callable[[IncomingFile], IngestionOutcome | DuplicateOutcome],
+    ingest_one: Callable[[IncomingFile], PollableOutcome],
 ) -> tuple[PolledOutcome, ...]:
     return tuple(PolledOutcome(file_name=f.name, outcome=ingest_one(f)) for f in source.poll())

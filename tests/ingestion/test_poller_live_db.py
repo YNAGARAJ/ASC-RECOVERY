@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.access import access_session
 from ingestion.apply import IngestionOutcome
 from ingestion.pipeline import DuplicateOutcome, ingest_file
-from ingestion.poller import poll_and_ingest
+from ingestion.poller import PollableOutcome, poll_and_ingest
 from ingestion.sources import IncomingFile, IngestionSource
 from ingestion.virus_scan import EicarAwareScanner
 from tests.domain.fixtures_x835 import minimal_valid_835
@@ -39,7 +39,7 @@ def test_poll_and_ingest_against_real_postgres(
         (IncomingFile(name="remit.835", content=minimal_valid_835().encode("utf-8"), source="s3"),)
     )
 
-    def ingest_one(file: IncomingFile) -> IngestionOutcome | DuplicateOutcome:
+    def ingest_one(file: IncomingFile) -> PollableOutcome:
         with access_session(app_session_factory, user_id) as session:
             return ingest_file(
                 session,
@@ -71,7 +71,7 @@ def test_polling_the_same_file_twice_is_a_duplicate_the_second_time(
     scanner = EicarAwareScanner()
     content = minimal_valid_835().encode("utf-8")
 
-    def ingest_one(file: IncomingFile) -> IngestionOutcome | DuplicateOutcome:
+    def ingest_one(file: IncomingFile) -> PollableOutcome:
         with access_session(app_session_factory, user_id) as session:
             return ingest_file(
                 session,

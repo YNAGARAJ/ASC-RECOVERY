@@ -123,6 +123,14 @@ def _apply_claim(
             claim.patient.id_code if claim.patient is not None else None,
             kek_id=org_kms_key_id,
         ),
+        # Phase 9 (docs/MASTER-BUILD-PROMPT-V2.md): already parsed off
+        # every 835 (domain.x835.Claim835.rendering_provider, from
+        # NM1*82) but previously dropped before persistence -- not PHI,
+        # so no encryption needed. An 837, if one arrives later, may
+        # overwrite this via db.repository.enrich_claim_from_837.
+        rendering_provider_name=(
+            claim.rendering_provider.name if claim.rendering_provider is not None else None
+        ),
     )
     repository.write_audit_log(
         session,
@@ -148,6 +156,10 @@ def _apply_claim(
             allowed=service_line.allowed.as_decimal(),
             paid_computed=service_line.paid_computed.as_decimal(),
             service_date=service_line.service_date,
+            # Phase 9: already parsed off every 835 (SVC05) but
+            # previously dropped before persistence -- see
+            # domain.x835.ServiceLine835.units's own docstring.
+            units=service_line.units,
         )
         service_line_ids[line_index] = line_row.id
         for adjustment in service_line.adjustments:

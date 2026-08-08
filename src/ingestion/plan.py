@@ -231,6 +231,30 @@ def _quarantine_reason(errors: Sequence[ParseIssue]) -> str:
     return reason
 
 
+def _unmatched_reversal_control_numbers(
+    transactions: Sequence[TransactionIngestionPlan],
+) -> list[str]:
+    """F-01 (docs/audit/REGISTER.md, the audit's one CRITICAL finding):
+    a reversal claim's `findings` is empty if and only if no prior
+    findings were found for its control number (`_plan_claim`'s reversal
+    branch calls `_reverse_finding` once per prior, and a genuinely
+    zero-variance original claim still has a `CORRECT_NO_VARIANCE`
+    finding row per `domain.variance.evaluate_claim`'s own unconditional
+    per-line `Finding` -- so an empty tuple here can only mean the
+    original claim was never found, never that it was found and
+    correct). Silently ingesting such a reversal is exactly the
+    "silently doing nothing is worse than being wrong noisily" failure
+    the amendment names -- the whole file quarantines instead."""
+    return sorted(
+        {
+            claim_plan.claim.payer_claim_control_number
+            for txn in transactions
+            for claim_plan in txn.claims
+            if claim_plan.is_reversal and not claim_plan.findings
+        }
+    )
+
+
 def build_ingestion_plan(
     parse_result: ParseResult,
     *,
@@ -249,6 +273,18 @@ def build_ingestion_plan(
         _plan_transaction(txn, contract_versions_by_payer, prior_findings_by_control_number)
         for txn in parse_result.transactions
     )
+
+    unmatched = _unmatched_reversal_control_numbers(transactions)
+    if unmatched:
+        return FileIngestionPlan(
+            quarantine_reason=(
+                "reversal claim(s) found no matching prior finding(s) to net against "
+                f"-- payer claim control number(s): {', '.join(unmatched)}"
+            ),
+            transactions=(),
+            parse_errors=parse_result.errors,
+        )
+
     return FileIngestionPlan(
         quarantine_reason=None,
         transactions=transactions,

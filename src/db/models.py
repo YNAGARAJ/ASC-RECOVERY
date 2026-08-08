@@ -314,6 +314,44 @@ class Remittance(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ClaimFile(Base):
+    """Phase 9 (`docs/MASTER-BUILD-PROMPT-V2.md`): tracks ingested 837
+    claim files -- deliberately a separate table from `remittances`, not
+    a shared one with a type discriminator, since an 837 isn't a
+    remittance (no payment, no BPR/PLB, nothing to reconcile) and giving
+    it its own table keeps that semantic distinction real in the schema,
+    not just in code. Same shape/idempotency pattern as `Remittance`
+    (`file_hash` unique per facility, `status`/`quarantine_reason` for
+    the same quarantine-on-parse-failure/virus-hit handling). An 837's
+    own content is never PHI-encrypted at the file-tracking level any
+    more than a remittance's raw bytes are -- what gets encrypted is the
+    diagnosis codes it enriches an existing claim with
+    (`claims.diagnosis_codes_encrypted`), not this row."""
+
+    __tablename__ = "claim_files"
+    __table_args__ = (
+        UniqueConstraint("facility_id", "file_hash", name="uq_claim_file_facility_file_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("facilities.id"), nullable=False
+    )
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
+    uploaded_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claims_enriched: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    claims_unmatched: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Claim(Base):
     __tablename__ = "claims"
 
@@ -342,6 +380,23 @@ class Claim(Base):
     # encryption-at-rest, enforced in the repository query layer.
     patient_name_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     patient_member_id_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Phase 9: rendering provider is business/operational data (who
+    # performed the service), not a patient identifier -- plain text,
+    # same "not every claim-adjacent field is PHI" precedent
+    # patient_control_number/payer_claim_control_number already set on
+    # this same table. Populated from the 835's own NM1*82 first (already
+    # parsed by domain.x835 today, previously dropped before persistence
+    # -- see ingestion/apply.py), an 837's NM1*82 overwrites when present
+    # (the claim-submission side, typically more authoritative).
+    rendering_provider_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Diagnosis codes ARE PHI (health condition information tied to a
+    # specific patient's claim) -- AES-256-GCM envelope-encrypted before
+    # this column is ever written, exactly like patient_name_encrypted/
+    # patient_member_id_encrypted above (security/phi_columns.py). A JSON
+    # array of code strings, serialized to plaintext before encryption.
+    # 837-only source -- the 835 doesn't carry diagnosis data at all,
+    # correctly, per the X12 spec (that's claim-submission-side data).
+    diagnosis_codes_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
@@ -373,6 +428,10 @@ class ServiceLine(Base):
     allowed: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     paid_computed: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     service_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Phase 9: already parsed off every 835 today (domain.x835
+    # .ServiceLine835.units, from SVC05) but previously dropped before
+    # persistence -- not 837-sourced, the 835 already has it.
+    units: Mapped[Decimal | None] = mapped_column(Numeric(9, 2), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

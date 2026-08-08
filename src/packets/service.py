@@ -59,8 +59,14 @@ def generate_packet_draft(
     # for certain will legitimately appear in the draft -- F-14
     # (docs/audit/REGISTER.md) added bare-integer detection to
     # extract_currency_figures, so without this it would flag the
-    # procedure code itself as a hallucinated currency figure.
-    exclude = frozenset({data.procedure_code})
+    # procedure code itself as a hallucinated currency figure. Diagnosis
+    # codes (Phase 9) join it for the same reason -- an ICD-10 code like
+    # "E11.9" contains a decimal point of its own, which
+    # extract_currency_figures' masking-based exclude handles correctly
+    # even though the code as a whole isn't what the regex would match
+    # (see that module's own docstring on why masking, not fragment
+    # filtering, is what actually closes this).
+    exclude = frozenset({data.procedure_code, *data.diagnosis_codes})
     rejections: list[RejectedAttempt] = []
 
     for attempt in range(1, max_attempts + 1):

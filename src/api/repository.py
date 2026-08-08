@@ -16,6 +16,7 @@ Every dataclass here carries money as `str`, never `float`
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -1403,6 +1404,24 @@ class PostgresRepository:
                 ),
                 patient_member_id=decrypt_phi_field(
                     self._encryptor, detail.claim.patient_member_id_encrypted
+                ),
+                # Phase 9 (docs/MASTER-BUILD-PROMPT-V2.md): all default to
+                # "no 837 was ever ingested for this claim" via
+                # PromptInput's own field defaults when absent -- diagnosis
+                # codes are PHI, decrypted the same way patient name/
+                # member id above are; rendering provider/units are not,
+                # already parsed off the 835 today (ingestion/apply.py).
+                diagnosis_codes=tuple(
+                    json.loads(
+                        decrypt_phi_field(self._encryptor, detail.claim.diagnosis_codes_encrypted)
+                        or "[]"
+                    )
+                ),
+                rendering_provider_name=detail.claim.rendering_provider_name,
+                units=(
+                    str(detail.service_line.units)
+                    if detail.service_line.units is not None
+                    else None
                 ),
             )
 

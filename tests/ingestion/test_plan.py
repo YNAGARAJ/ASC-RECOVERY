@@ -160,6 +160,50 @@ def test_reversal_service_line_id_is_independent_of_the_reversal_claims_own_line
     assert reversal_finding.service_line_id == original_service_line_id
 
 
+def test_unmatched_reversal_quarantines_the_file() -> None:
+    """F-01's second, previously-unfixed requirement (docs/audit/
+    REGISTER.md): a reversal claim whose control number matches zero
+    prior findings must never silently ingest as if it had nothing to
+    net -- that's structurally indistinguishable from a legitimately
+    zero-variance original claim (which still gets a CORRECT_NO_VARIANCE
+    finding row, never an empty tuple). The whole file quarantines with
+    a diagnostic naming the unmatched control number, the same "fail
+    loudly or quarantine" the amendment offers as the two valid choices."""
+    reversal_result = parse_835(reversal_835())
+    plan = build_ingestion_plan(
+        reversal_result,
+        contract_versions_by_payer={},
+        prior_findings_by_control_number={},  # nothing matches PAYERCTRL0001
+    )
+    assert plan.quarantine_reason is not None
+    assert "PAYERCTRL0001" in plan.quarantine_reason
+    assert plan.transactions == ()
+
+
+def test_reversal_with_matching_priors_does_not_quarantine() -> None:
+    """The other side of the same check: a reversal that DOES find prior
+    findings to net against must ingest normally, not quarantine -- the
+    new check in build_ingestion_plan must not fire on the ordinary,
+    successful path."""
+    reversal_result = parse_835(reversal_835())
+    prior = PriorFinding(
+        line_index=0,
+        procedure_code="99213",
+        expected_allowed=Money("50.00"),
+        actual_allowed=Money("300.00"),
+        shortfall=Money("250.00"),
+        root_cause="UNDETERMINED_VARIANCE",
+        service_line_id=uuid.uuid4(),
+    )
+    plan = build_ingestion_plan(
+        reversal_result,
+        contract_versions_by_payer={},
+        prior_findings_by_control_number={"PAYERCTRL0001": (prior,)},
+    )
+    assert plan.quarantine_reason is None
+    assert len(plan.transactions) == 1
+
+
 def test_same_content_produces_an_identical_plan() -> None:
     """Pure proxy for 'same file ingested 3x -> identical totals': the plan
     layer has no hidden state, so parsing and planning the same bytes twice

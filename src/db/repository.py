@@ -37,6 +37,7 @@ from db.models import Adjustment as AdjustmentModel
 from db.models import ApiKey as ApiKeyModel
 from db.models import AuditLog as AuditLogModel
 from db.models import Claim as ClaimModel
+from db.models import ClaimFile as ClaimFileModel
 from db.models import Contract as ContractModel
 from db.models import ContractVersion as ContractVersionModel
 from db.models import Facility as FacilityModel
@@ -935,6 +936,122 @@ def record_remittance_if_new(
     return existing, False
 
 
+# --- 837 claim files (Phase 9, `docs/MASTER-BUILD-PROMPT-V2.md`) -----------------
+#
+# A separate table/idempotency track from remittances -- see
+# db/models.py's ClaimFile docstring for why. 837s are enrichment-only:
+# they never create claims/findings, only attach diagnosis codes/
+# rendering provider to a claim an 835 already created.
+
+
+def record_claim_file_if_new(
+    session: Session,
+    facility_id: uuid.UUID,
+    file_hash: str,
+    *,
+    source: str,
+    uploaded_by: str,
+) -> tuple[ClaimFileModel, bool]:
+    """Same `ON CONFLICT DO NOTHING RETURNING id` idiom as
+    `record_remittance_if_new` -- `is_new is False` means this exact 837
+    file was already ingested for this facility."""
+    stmt = (
+        pg_insert(ClaimFileModel)
+        .values(
+            facility_id=facility_id,
+            file_hash=file_hash,
+            source=source,
+            uploaded_by=uploaded_by,
+            status="received",
+        )
+        .on_conflict_do_nothing(index_elements=["facility_id", "file_hash"])
+        .returning(ClaimFileModel.id)
+    )
+    inserted_id = session.execute(stmt).scalar_one_or_none()
+    if inserted_id is not None:
+        row = session.get(ClaimFileModel, inserted_id)
+        if row is None:
+            raise RuntimeError(
+                f"claim file {inserted_id} was just inserted but cannot be re-read "
+                "in the same transaction -- this should never happen"
+            )
+        return row, True
+
+    existing = session.execute(
+        select(ClaimFileModel).where(
+            ClaimFileModel.facility_id == facility_id, ClaimFileModel.file_hash == file_hash
+        )
+    ).scalar_one()
+    return existing, False
+
+
+def update_claim_file_status(
+    session: Session,
+    facility_id: uuid.UUID,
+    claim_file_id: uuid.UUID,
+    *,
+    status: str,
+    quarantine_reason: str | None = None,
+    claims_enriched: int = 0,
+    claims_unmatched: int = 0,
+) -> ClaimFileModel:
+    row = session.execute(
+        select(ClaimFileModel).where(
+            ClaimFileModel.facility_id == facility_id, ClaimFileModel.id == claim_file_id
+        )
+    ).scalar_one()
+    row.status = status
+    row.quarantine_reason = quarantine_reason
+    row.claims_enriched = claims_enriched
+    row.claims_unmatched = claims_unmatched
+    session.flush()
+    return row
+
+
+def get_claims_by_patient_control_number(
+    session: Session, facility_id: uuid.UUID, patient_control_number: str
+) -> list[ClaimModel]:
+    """Correlation lookup for 837 enrichment -- keyed by `CLM01`/`CLP01`,
+    the submitter's own claim identifier shared by an 837 and the 835
+    that pays it, never `payer_claim_control_number` (payer-assigned,
+    only exists post-adjudication). Returns every matching claim, not
+    just one -- if the same control number legitimately recurs, the
+    same diagnosis/provider data applies to all of them."""
+    return list(
+        session.execute(
+            select(ClaimModel).where(
+                ClaimModel.facility_id == facility_id,
+                ClaimModel.patient_control_number == patient_control_number,
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+def enrich_claim_from_837(
+    session: Session,
+    claim_id: uuid.UUID,
+    *,
+    diagnosis_codes_encrypted: str | None,
+    rendering_provider_name: str | None,
+) -> None:
+    """`diagnosis_codes_encrypted` is caller-supplied, already-encrypted
+    (security.phi_columns) -- this layer only ever persists opaque
+    strings, never plaintext PHI, same convention as create_claim's own
+    PHI columns. `rendering_provider_name` overwrites unconditionally
+    when the 837 has one -- the claim-submission side is typically more
+    authoritative than whatever the 835 echoed back, if anything."""
+    values: dict[str, object] = {}
+    if diagnosis_codes_encrypted is not None:
+        values["diagnosis_codes_encrypted"] = diagnosis_codes_encrypted
+    if rendering_provider_name is not None:
+        values["rendering_provider_name"] = rendering_provider_name
+    if not values:
+        return
+    session.execute(update(ClaimModel).where(ClaimModel.id == claim_id).values(**values))
+
+
 # --- Claims and findings ---------------------------------------------------------
 
 
@@ -952,10 +1069,15 @@ def create_claim(
     patient_responsibility: Decimal,
     patient_name_encrypted: str | None = None,
     patient_member_id_encrypted: str | None = None,
+    rendering_provider_name: str | None = None,
 ) -> ClaimModel:
     # Callers pass already-encrypted values (security.phi_columns) -- this
     # layer only ever persists opaque strings, never plaintext PHI. See
     # ingestion.apply for the encryption call site.
+    # rendering_provider_name is NOT PHI (business/operational data, not
+    # a patient identifier -- see db/models.py's Claim docstring) and is
+    # never encrypted; may be overwritten later by an 837's own NM1*82
+    # via enrich_claim_from_837 (Phase 9).
     claim = ClaimModel(
         facility_id=facility_id,
         remittance_id=remittance_id,
@@ -968,6 +1090,7 @@ def create_claim(
         patient_responsibility=patient_responsibility,
         patient_name_encrypted=patient_name_encrypted,
         patient_member_id_encrypted=patient_member_id_encrypted,
+        rendering_provider_name=rendering_provider_name,
     )
     session.add(claim)
     session.flush()
@@ -987,6 +1110,7 @@ def create_service_line(
     allowed: Decimal,
     paid_computed: Decimal,
     service_date: date | None,
+    units: Decimal | None = None,
 ) -> ServiceLineModel:
     line = ServiceLineModel(
         facility_id=facility_id,
@@ -999,6 +1123,7 @@ def create_service_line(
         allowed=allowed,
         paid_computed=paid_computed,
         service_date=service_date,
+        units=units,
     )
     session.add(line)
     session.flush()

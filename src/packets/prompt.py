@@ -50,6 +50,15 @@ DATE_OF_SERVICE_TOKEN = "{{DATE_OF_SERVICE}}"  # nosec B105
 EXPECTED_ALLOWED_TOKEN = "{{EXPECTED_ALLOWED}}"  # nosec B105
 ACTUAL_ALLOWED_TOKEN = "{{ACTUAL_ALLOWED}}"  # nosec B105
 SHORTFALL_TOKEN = "{{SHORTFALL}}"  # nosec B105
+# Phase 9 (docs/MASTER-BUILD-PROMPT-V2.md): diagnosis codes are PHI --
+# health condition information tied to this specific claim/patient, same
+# reasoning F-13 (docs/audit/REGISTER.md) already established for claim
+# reference/date of service -- so this is placeholder-only too, never a
+# literal value in the prompt text. Rendering provider and units are NOT
+# PHI (provider/operational data, not a patient identifier or a
+# patient's own health data) and are written as literal text, same as
+# procedure_code already is.
+DIAGNOSIS_CODES_TOKEN = "{{DIAGNOSIS_CODES}}"  # nosec B105
 
 # F-15 (docs/audit/REGISTER.md): the exact label each dollar token must
 # appear immediately after -- see required_figure_lines().
@@ -84,6 +93,12 @@ class PromptInput:
     evidence: str
     patient_name: str | None
     patient_member_id: str | None
+    # Phase 9: all default to "no 837 was ever ingested for this claim"
+    # (empty/None) -- an 835-only claim must keep drafting exactly as it
+    # did before this phase, never a required dependency on 837 data.
+    diagnosis_codes: tuple[str, ...] = ()
+    rendering_provider_name: str | None = None
+    units: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +116,21 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
         EXPECTED_ALLOWED_TOKEN: data.expected_allowed,
         ACTUAL_ALLOWED_TOKEN: data.actual_allowed,
         SHORTFALL_TOKEN: data.shortfall,
+        DIAGNOSIS_CODES_TOKEN: ", ".join(data.diagnosis_codes),
     }
+
+    # Phase 9: optional supporting lines, present only when an 837
+    # actually enriched this claim -- an 835-only claim's prompt text is
+    # byte-for-byte what it was before this phase, no dangling "Rendering
+    # provider: " line with nothing after it.
+    optional_lines = ""
+    if data.diagnosis_codes:
+        optional_lines += f"Diagnosis code(s): {DIAGNOSIS_CODES_TOKEN}\n"
+    if data.rendering_provider_name:
+        optional_lines += f"Rendering provider: {data.rendering_provider_name}\n"
+    if data.units:
+        optional_lines += f"Units billed: {data.units}\n"
+
     text = (
         f"Draft the body of a professional insurance appeal letter, in the "
         f"style of a letter opening with {template.salutation!r} and closing "
@@ -109,6 +138,7 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
         f"Claim reference: {CLAIM_REFERENCE_TOKEN}\n"
         f"Procedure code: {data.procedure_code}\n"
         f"Date of service: {DATE_OF_SERVICE_TOKEN}\n"
+        f"{optional_lines}"
         f"Reason for underpayment: {data.root_cause}\n"
         f"Supporting evidence: {data.evidence}\n\n"
         "IMPORTANT -- do not write any dollar amount as digits, and do not "
@@ -124,6 +154,12 @@ def build_prompt(data: PromptInput, template: PacketTemplate) -> BuiltPrompt:
         f"Refer to the patient only as {PATIENT_TOKEN} and, if a member "
         f"id is needed, only as {MEMBER_ID_TOKEN} -- never write or "
         "invent a patient name or member id yourself."
+        + (
+            f" Refer to any diagnosis codes only as {DIAGNOSIS_CODES_TOKEN} "
+            "-- never write or invent a diagnosis code yourself."
+            if data.diagnosis_codes
+            else ""
+        )
     )
     return BuiltPrompt(text=text, placeholders=placeholders)
 

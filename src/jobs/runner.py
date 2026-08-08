@@ -32,7 +32,12 @@ from db import repository
 from db.access import access_session
 from db.models import Job as JobModel
 from ingestion.apply import IngestionOutcome, JobCancelledError
-from ingestion.pipeline import DuplicateOutcome, ingest_file
+from ingestion.pipeline import (
+    ClaimFileOutcome,
+    DuplicateClaimFileOutcome,
+    DuplicateOutcome,
+    ingest_file,
+)
 from ingestion.virus_scan import VirusScanner
 from jobs.payload import parse_ingestion_payload
 from observability.alert_state import IngestionOutcomeTracker
@@ -112,10 +117,20 @@ def run_ingestion_job(
             on_progress=on_progress,
             should_cancel=should_cancel,
         )
-        result: dict[str, object] = (
-            {"status": "duplicate", "remittance_id": str(outcome.remittance_id)}
-            if isinstance(outcome, DuplicateOutcome)
-            else {
+        result: dict[str, object]
+        if isinstance(outcome, DuplicateOutcome):
+            result = {"status": "duplicate", "remittance_id": str(outcome.remittance_id)}
+        elif isinstance(outcome, DuplicateClaimFileOutcome):
+            result = {"status": "duplicate", "claim_file_id": str(outcome.claim_file_id)}
+        elif isinstance(outcome, ClaimFileOutcome):
+            result = {
+                "status": outcome.status,
+                "claim_file_id": str(outcome.claim_file_id),
+                "claims_enriched": outcome.claims_enriched,
+                "claims_unmatched": outcome.claims_unmatched,
+            }
+        else:
+            result = {
                 "status": outcome.status,
                 "remittance_id": str(outcome.remittance_id),
                 "claims_created": outcome.claims_created,
@@ -123,7 +138,6 @@ def run_ingestion_job(
                 "reconciliation_mismatches": outcome.reconciliation_mismatches,
                 "dollars_detected": str(outcome.dollars_detected),
             }
-        )
         repository.write_audit_log(
             session,
             job.facility_id,
@@ -131,7 +145,8 @@ def run_ingestion_job(
             action="job_completed",
             resource_type="job",
             resource_id=str(job.id),
-            phi_accessed=isinstance(outcome, IngestionOutcome),
+            phi_accessed=isinstance(outcome, IngestionOutcome)
+            or (isinstance(outcome, ClaimFileOutcome) and outcome.claims_enriched > 0),
         )
 
     # F-11 (docs/audit/REGISTER.md): pure in-memory bookkeeping, not a DB

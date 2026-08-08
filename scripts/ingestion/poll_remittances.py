@@ -58,9 +58,13 @@ from typing import Any
 
 from db.access import access_session
 from db.base import make_engine, make_session_factory
-from ingestion.apply import IngestionOutcome
-from ingestion.pipeline import DuplicateOutcome, ingest_file
-from ingestion.poller import PolledOutcome, poll_and_ingest
+from ingestion.pipeline import (
+    ClaimFileOutcome,
+    DuplicateClaimFileOutcome,
+    DuplicateOutcome,
+    ingest_file,
+)
+from ingestion.poller import PollableOutcome, PolledOutcome, poll_and_ingest
 from ingestion.sources import IncomingFile, IngestionSource, S3PollSource, SFTPPollSource
 from ingestion.virus_scan import EicarAwareScanner
 from security.encryption import EnvelopeEncryptor
@@ -151,6 +155,13 @@ def _report(results: tuple[PolledOutcome, ...]) -> None:
         outcome = result.outcome
         if isinstance(outcome, DuplicateOutcome):
             print(f"{result.file_name}: duplicate (remittance {outcome.remittance_id})")
+        elif isinstance(outcome, DuplicateClaimFileOutcome):
+            print(f"{result.file_name}: duplicate (claim file {outcome.claim_file_id})")
+        elif isinstance(outcome, ClaimFileOutcome):
+            print(
+                f"{result.file_name}: {outcome.status} (837 claim file, "
+                f"enriched={outcome.claims_enriched}, unmatched={outcome.claims_unmatched})"
+            )
         else:
             print(
                 f"{result.file_name}: {outcome.status} "
@@ -179,7 +190,7 @@ def main() -> int:
     session_factory = make_session_factory(make_engine(database_url))
     scanner = EicarAwareScanner()
 
-    def ingest_one(file: IncomingFile) -> IngestionOutcome | DuplicateOutcome:
+    def ingest_one(file: IncomingFile) -> PollableOutcome:
         with access_session(session_factory, user_id) as session:
             return ingest_file(
                 session,

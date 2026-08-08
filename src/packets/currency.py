@@ -19,6 +19,19 @@ know for certain will legitimately appear via `exclude`, so the exact
 string of `PromptInput.procedure_code` is never treated as currency, but
 nothing else gets a free pass.
 
+`exclude` masks out whole matching substrings from `text` before the
+regex ever runs, rather than filtering individually matched fragments
+after the fact (Phase 9, `docs/MASTER-BUILD-PROMPT-V2.md`) -- needed
+once a second known-safe, deterministically-injected value could contain
+an *internal* decimal point of its own (an ICD-10 diagnosis code like
+`E11.9`): the bare-integer alternative's `\b` boundary matches right
+after the `.`, so `extract_currency_figures` on unmasked text would
+still find a spurious `9` even with `"E11.9"` naively added to `exclude`
+-- the matched fragment is `"9"`, never the whole code, so exact-fragment
+filtering can't catch it. Masking the *known-safe strings themselves*
+out of the text first sidesteps this regardless of what a future
+excluded value happens to look like.
+
 Comparison is by parsed `Decimal` value, not by string, so `$50`, `50.00`,
 and `$1,234.56` all normalize correctly -- `Decimal("50") ==
 Decimal("50.00")` in Python, so formatting differences in the LLM's prose
@@ -39,11 +52,13 @@ _CURRENCY_PATTERN = re.compile(
 
 
 def extract_currency_figures(text: str, *, exclude: frozenset[str] = frozenset()) -> list[Decimal]:
+    masked = text
+    for safe in exclude:
+        if safe:
+            masked = masked.replace(safe, "")
     figures: list[Decimal] = []
-    for match in _CURRENCY_PATTERN.finditer(text):
+    for match in _CURRENCY_PATTERN.finditer(masked):
         raw = match.group().strip()
-        if raw in exclude:
-            continue
         cleaned = raw.replace("$", "").replace(",", "")
         try:
             figures.append(Decimal(cleaned))
