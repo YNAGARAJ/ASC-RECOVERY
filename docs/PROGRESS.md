@@ -1044,6 +1044,173 @@ phase since 4 (F-22's local-Postgres handoff, still unclaimed) — every
 DB-backed test this phase added is offline-verified/skip-without-a-
 database only.
 
+## Phase: MASTER-BUILD-PROMPT-V2.md Phase 9 (ingestion pipeline) — COMPLETE
+
+User said "yes, proceed with Phase 9." Two research agents audited the
+actual code before any implementation, per this session's established
+discipline. Findings: **every checklist item except 837 claim file
+ingestion already existed and was tested** — sources behind a port,
+content-hash idempotency, quarantine with diagnostics, partial-batch
+tolerance, virus scan, BPR/PLB reconciliation, reversal netting,
+per-file audit, and running through Phase 7's job queue were all real,
+already-built code. The phase's own gate ("same file 3× gives identical
+totals · injected BPR mismatch is caught") was already satisfied by
+existing tests, no new work needed there. Two real, distinct items
+remained: F-01's audit amendment (the register's one CRITICAL finding)
+was only half-closed despite a "FIXED" marker, and 837 ingestion was
+100% unbuilt. Scoped via `AskUserQuestion`: user chose to build both
+this session.
+
+### Part 1 — F-01: unmatched reversal now quarantines
+
+Re-verifying F-01 (mirroring how Phase 8 re-verified F-16 and found a
+real, second gap under a "FIXED" marker) found the same pattern again:
+the amendment's first requirement — match a reversing finding to the
+*original* claim's service line, never the reversal claim's own line
+positions, including when the reversal reports fewer lines than the
+original — was genuinely fixed and tested, both at the plan layer and
+end-to-end against Postgres (`tests/db/test_reversal_netting.py`'s
+fewer-lines-than-original/`sum(shortfall)==0` proof). The amendment's
+**second** requirement — "never let a reversing finding be silently
+dropped — an unmatched reversal must fail loudly or quarantine the
+file" — was never implemented: a reversal claim whose control number
+matched zero prior findings silently produced `findings=()` and
+ingested successfully, structurally indistinguishable from a
+legitimately zero-variance original claim.
+
+Closed: `ingestion/plan.py::build_ingestion_plan` now scans every claim
+post-planning for `is_reversal and not findings` (an unambiguous signal
+— `_reverse_finding` runs once per prior, and a genuinely zero-variance
+original claim still gets a `CORRECT_NO_VARIANCE` finding row, so an
+empty tuple can only mean the original was never found at all). Any
+match quarantines the whole file, naming the unmatched control
+number(s) in the diagnostic — reusing the exact same `quarantine_reason`
+mechanism `apply_ingestion_plan` already checks first, no new "fail
+loudly" exception machinery needed. `docs/audit/REGISTER.md`'s F-01 row
+updated with the full re-verification note, same pattern as Phase 8's
+F-16 entry.
+
+### Part 2 — 837 claim file ingestion
+
+New `domain/x837.py` — a hand-rolled 837P parser reusing `x835.py`'s
+exact ISA-header/segment/element-splitting approach (no third-party X12
+library in this project) but duplicated, not imported, same "second,
+independent producer" convention `evals/generator.py` already
+established. Deliberately narrow: only `CLM` (patient control number,
+for correlation), `HI` (diagnosis code pointers), and `NM1` entity code
+`82` (rendering provider) are parsed — no HL/SBR hierarchy tracking,
+since 837 is **enrichment, not a parallel pricing/finding pipeline**. A
+claim's dollar findings are still driven entirely by its 835; 837 data
+only ever attaches to an already-ingested claim, correlated by
+`patient_control_number` (`CLM01`/`CLP01`, the *submitter's* claim
+identifier shared by both — deliberately not `payer_claim_control_number`,
+which the payer only assigns post-adjudication and therefore never
+appears on the claim-submission-side 837 at all).
+
+- **New DB**: `claim_files` table (parallel to, not sharing with,
+  `remittances` — an 837 isn't a remittance, no BPR/PLB/reconciliation
+  concept applies), same `facility_access` RLS policy shape every table
+  since 0001 has. `claims.diagnosis_codes_encrypted` (PHI — health
+  condition data tied to a specific claim — envelope-encrypted with the
+  exact same `security/phi_columns.py` machinery `patient_name_encrypted`
+  already uses, including per-org BYOK). `claims.rendering_provider_name`
+  and `service_lines.units` (not PHI — provider identity and a bare
+  quantity, not patient identifiers) were **already parsed off every 835
+  today** (`domain.x835.Claim835.rendering_provider`,
+  `ServiceLine835.units`) but silently dropped before persistence —
+  fixed in `ingestion/apply.py` alongside the 837 work, no 837 file
+  needed for that half. Migration `0014_claim_files_and_837_enrichment.py`
+  follows 0013's guarded/offline pattern for the new columns and 0012's
+  pattern for the new table.
+- **Dispatch**: `ingestion/pipeline.py::_ingest_file_impl` now peeks at
+  the `ST01` transaction-set-identifier element (`_detect_transaction_set`,
+  reading just the ISA header + first ST segment) before either parser
+  runs, routing `"837"` to a new `_ingest_837_impl` and everything else
+  — including anything undetectable/malformed — to the renamed
+  `_ingest_835_impl` (a pure extract-function rename of the previous
+  `_ingest_file_impl` body, zero behavior change to the well-tested
+  existing path). An 837 arrives through the exact same upload/SFTP/S3
+  sources and the same `ingest_remittance` job type as an 835 — only the
+  parse+apply step branches, `src/jobs/runner.py` needed no new handler.
+  New `ClaimFileOutcome`/`DuplicateClaimFileOutcome` outcome types
+  rippled (as expected, caught by a whole-repo `mypy --strict .` sweep,
+  not by targeted file-level checks) into `ingestion/poller.py`'s
+  `PollableOutcome` type alias and `scripts/ingestion/poll_remittances.py`'s
+  `ingest_one`/`_report`.
+- **Unmatched-claim handling is the deliberate inverse of Part 1**: an
+  837 claim whose `(facility_id, patient_control_number)` matches no
+  existing claim is skipped for *that claim only*, counted in
+  `claims_unmatched`, never a whole-file quarantine — a missing 835
+  counterpart is an expected, recoverable ordering situation (the 837
+  arrived first, or its 835 never will), not evidence of a
+  financial-integrity bug the way an unmatched reversal is.
+- **Packet integration**: `packets/prompt.py::PromptInput` gained
+  `diagnosis_codes`/`rendering_provider_name`/`units`, all defaulting to
+  empty/`None` so an 835-only claim drafts byte-for-byte as it did
+  before this phase. Diagnosis codes are placeholder-substituted
+  (`DIAGNOSIS_CODES_TOKEN`), never literal text in the prompt sent to
+  the LLM — same F-13 PHI treatment claim reference/date of service
+  already get; rendering provider/units are literal text, same as
+  `procedure_code` already is, since neither is PHI. Wired into the one
+  real call site, `api/repository.py::PostgresRepository.generate_packet`
+  — `db.repository.FindingDetail` already joins the `claims`/
+  `service_lines` rows the new columns live on, so no new query was
+  needed, only three new `PromptInput(...)` keyword arguments.
+- **Real bug found and fixed along the way**: `packets/currency.py`'s
+  hallucination-detection regex (CLAUDE.md's "no LLM ever computes or
+  restates a dollar amount" boundary) could false-positive on an ICD-10
+  diagnosis code's own internal decimal point — `"E11.9"` produces a
+  spurious `Decimal("9")` match (the bare-integer alternative's `\b`
+  boundary matches right after the `.`), which would have caused
+  `validate_currency` to reject an otherwise-valid packet draft as
+  containing a "hallucinated" figure, forever, for any claim with an
+  837-sourced diagnosis code. Caught by empirically testing the regex,
+  not by reasoning about it — a first-pass hand-analysis concluded (
+  wrongly) that letter-digit adjacency would prevent a match. Fixed by
+  changing `extract_currency_figures`'s `exclude` semantics from
+  filtering matched fragments after the fact to masking known-safe
+  substrings out of the text before the regex ever runs — verified
+  against all pre-existing `tests/packets/test_currency.py` cases
+  (unchanged) plus the new diagnosis-code case.
+
+### Deliberately deferred, named not silently dropped
+
+837I (institutional) claim segments (`SV2`, institutional-specific
+`NM1` loops) — only 837P's `SV1`-adjacent professional-claim grammar
+subset this phase actually needs (`CLM`/`HI`/`NM1` entity `82`) was
+built, since ASC billing is overwhelmingly professional-claim-shaped and
+none of the deferred segments feed anything this phase's enrichment-only
+architecture consumes. Per-service-line diagnosis pointers (SV1's own
+composite element referencing which `HI` index applies to which line) —
+diagnosis codes are treated as claim-level enrichment only, matching the
+new `claims.diagnosis_codes_encrypted` column's own granularity, not a
+new per-line column. HL/SBR hierarchical-level tracking (submitter/
+subscriber identity) — unneeded since correlation is by
+`patient_control_number` alone, already scoped by `facility_id`/RLS.
+
+### Full local gate as of this commit — Phase 9 complete
+
+`ruff check .` clean, `mypy --strict .` clean except 4 pre-existing-
+category errors (216 files checked, same documented SQLAlchemy-stub gap
+as every phase since — migration 0014 uses plain `sa.String`/`sa.Text`/
+`sa.Numeric`, not `JSONB()`, so it adds none). `pytest -q` 722 passed /
+89 skipped, `domain/variance.py` 100% coverage gate, `python -m
+evals.run` GATE PASSED (560 cases, recall 100%, precision 100%, dollar
+accuracy 100% — unchanged from Phase 8, confirming 837 adds no
+golden-set category, by design: it's enrichment, not a pricing/finding
+path), `bandit -r . -x ./tests,./evals` clean (one real finding caught
+mid-phase and fixed: migration 0014's own `CREATE POLICY` statement
+f-string-interpolated a hardcoded table-name constant into SQL text,
+triggering B608 even though nothing user-controlled was involved —
+fixed by hardcoding the literal table name directly, matching every
+prior migration's own `CREATE POLICY` convention, which never
+interpolated the table name via f-string in the first place). Offline
+SQL generation verified both directions through migration 0014. **Not
+independently re-verified against a live Postgres** — same disclosed
+ceiling as every phase since 4 (F-22's local-Postgres handoff, still
+unclaimed) — every DB-backed test this phase added is
+offline-verified/skip-without-a-database only.
+
 ## Traps for someone resuming cold
 
 - **Everything Phase 4's checkpoint already flagged still applies**: the
@@ -1161,49 +1328,84 @@ database only.
   table (`contracts` already had one, from migration 0004) — copy 0013's
   guarded/offline pattern for the next one, not 0004's (same shape, but
   0013 is the more recent, directly-analogous example).
+- **A "FIXED" marker in `docs/audit/REGISTER.md` names what got fixed,
+  not necessarily the finding's entire scope** — this is now the second
+  time in two phases (F-16 in Phase 8, F-01 in Phase 9) that
+  re-verifying an already-"FIXED" finding against its own full text
+  found a real, second gap the fix commit never touched. Before trusting
+  any register entry as fully closed, re-read the finding's complete
+  original text (not just the "FIXED" line) and check whether every
+  sentence of it is actually satisfied, not just the most obvious one.
+- **`ingestion/plan.py::build_ingestion_plan`'s unmatched-reversal check
+  and `ingestion/pipeline.py::_ingest_837_impl`'s unmatched-claim
+  handling are deliberately opposite policies** — one quarantines the
+  whole file, the other skips just the one claim and keeps going. Don't
+  "fix" one to match the other later without re-reading why: a reversal
+  with nothing to net against signals a financial-integrity problem (the
+  system would otherwise silently under-report what it already told a
+  customer they could recover); an 837 with no matching 835 yet signals
+  ordinary file-arrival ordering, nothing has gone wrong.
+- **Any new `PromptInput` field that carries caller-controlled or
+  injected text must be checked against `packets/currency.py`'s
+  hallucination regex before assuming it's safe** — `extract_currency_
+  figures`'s bare-integer alternative matches on a `\b` word boundary,
+  which a period, comma, or almost any non-alphanumeric character
+  creates even *inside* an otherwise-safe string (`"E11.9"` → spurious
+  `Decimal("9")`). `exclude` now masks known-safe substrings out of the
+  text before matching (not fragment-filtering after), which handles
+  this correctly going forward — but verify empirically
+  (`extract_currency_figures(text, exclude=...)`, actually run it) for
+  any new value shape, don't reason about the regex by inspection alone;
+  a first-pass hand-analysis this phase concluded wrongly that
+  letter-digit adjacency alone would prevent a match.
+- **`domain/x837.py` is deliberately narrow (837P only, `CLM`/`HI`/`NM1`
+  entity `82`, no HL/SBR hierarchy, no per-line diagnosis pointers)** —
+  before extending it (837I institutional segments, per-service-line
+  diagnosis correlation, billing/subscriber provider identity), re-read
+  this phase's "Deliberately deferred" section above for why each of
+  those was left out, and whether the reason still holds.
 
 ## Next steps
 
-Phase 8 is complete (gate scope: lesser-of + stop-loss/outlier pricing).
-Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order, **Phase 9 (ingestion
-pipeline) is next**. Read that phase's prompt before assuming it's
-unbuilt — it's very likely another Phase-6-shaped situation: "sources
-behind a port: upload, SFTP poll, S3-compatible drop, clearinghouse API;
-idempotency by content hash; quarantine invalid files with a readable
-diagnostic; partial-batch tolerance; virus scan; BPR-to-claims
-reconciliation including PLB; reversal and takeback netting; full audit
-per file; runs as a Phase 7 job" describes almost exactly what already
-exists in `src/ingestion/` (`sources.py`, `plan.py`, `apply.py`,
-`pipeline.py`) and `src/jobs/` (Phase 7, this session's own earlier
-work) — audit the actual code against the actual prompt line by line
-before planning as if starting from zero, the same discipline that
-saved most of Phase 6's session. The one item that reads as genuinely
-new: **"Also ingest 837 claim files where available — the 835 alone
-lacks diagnosis codes, units and rendering provider, all of which the
-appeal packet needs."** No 837 parser exists anywhere in this codebase
-(`domain/x835.py` is 835-only) — that's very likely real, unbuilt scope.
-**Audit amendment (register F-01, the audit's one CRITICAL)**: re-verify
-whether the existing reversal-netting test already covers a reversal
-claim reporting *fewer* lines than the original it reverses (asserting
-`sum(shortfall) == 0` afterward) — F-01 is marked FIXED in
-`docs/audit/REGISTER.md`, but confirm what "fixed" actually covers
-before trusting it covers this specific case, same as Phase 8 found a
-real, second gap hiding behind F-16's "FIXED" marker.
+Phase 9 is complete (F-01's remaining gap closed, 837 claim file
+ingestion built). Per `docs/MASTER-BUILD-PROMPT-V2.md`'s phase order,
+**Phase 10 (API layer) is next**. Read that phase's prompt before
+assuming it's unbuilt — it is very likely another Phase-6/9-shaped
+situation: "FastAPI. Every endpoint resolves access through Phase 4 —
+no endpoint queries directly. OpenAPI generated. Pagination everywhere.
+No PHI in URLs or query strings. Structured errors that never echo PHI.
+Request ID propagated into every log line and audit entry... Authorization
+test matrix: every role × every endpoint × own-facility, other-facility-
+same-org, other-org. Every cell asserted" describes almost exactly what
+already exists (`tests/api/test_authz_matrix.py`, `security/redaction.py`,
+`api/auth.py`'s Phase-4 access resolution used by every route built
+across Phases 4-9) — audit line by line before planning as if starting
+from zero. The one item that reads as genuinely new: **"API versioning
+strategy with a deprecation policy."** No versioning scheme (URL prefix,
+header, or otherwise) exists anywhere in this codebase's routes today —
+that's very likely real, unbuilt scope, and worth scoping down given how
+large "a full deprecation policy" can get, the same discipline Phase 8
+applied to its own oversized checklist. **Gate**: full authz matrix
+green (already true) · no parameter manipulation crosses a facility
+boundary (already true, per Phase 4's `test_tenant_param_absence.py`-
+style structural enforcement — verify this specific claim before
+assuming it, same as every other "already built" claim this session).
 
 1. **If picking this up much later**, re-verify the full local gate
    before trusting anything — confirm the current commit's status
    before trusting it.
-2. **If the F-22 Postgres password becomes available**, run Phases 4-8's
+2. **If the F-22 Postgres password becomes available**, run Phases 4-9's
    live-DB suites for real before trusting any of their
    RLS/function code beyond what's offline-verified — this now includes
-   migrations 0010-0013 and every BYOK/data-residency/job-queue/contract-
-   pricing DB test (`tests/db/test_organization_kms_key.py`,
+   migrations 0010-0014 and every BYOK/data-residency/job-queue/contract-
+   pricing/837-ingestion DB test (`tests/db/test_organization_kms_key.py`,
    `tests/ingestion/test_apply_org_kms_key.py`,
    `tests/db/test_org_policy.py`'s data-residency tests,
    `tests/db/test_jobs_queue.py`, `tests/jobs/test_runner_live_db.py`,
    `tests/ingestion/test_apply_progress_cancel.py`,
-   `tests/db/test_effective_dated_pricing.py`'s new lesser-of/stop-loss
-   round-trip test, `tests/api/test_contracts_live_db.py`), never run
-   against a real Postgres in this environment. Doing this before
-   starting Phase 9's own DB-backed work would mean verifying one large
-   batch together instead of several small ones.
+   `tests/db/test_effective_dated_pricing.py`'s lesser-of/stop-loss
+   round-trip test, `tests/api/test_contracts_live_db.py`,
+   `tests/ingestion/test_837_live_db.py`), never run against a real
+   Postgres in this environment. Doing this before starting Phase 10's
+   own DB-backed work would mean verifying one large batch together
+   instead of several small ones.
